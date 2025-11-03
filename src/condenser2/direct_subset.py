@@ -1,23 +1,24 @@
-import uuid, sys
-import config_reader, result_tabulator
+import sys
 import time
-from subset import Subset
-from psql_database_creator import PsqlDatabaseCreator
-from mysql_database_creator import MySqlDatabaseCreator
-from db_connect import DbConnect
-from subset_utils import print_progress
-import database_helper
 
-def db_creator(db_type, source, dest):
-    if db_type == 'postgres':
+from condenser2 import config_reader, database_helper, result_tabulator
+from condenser2.db_connect import DbConnect
+from condenser2.mysql_database_creator import MySqlDatabaseCreator
+from condenser2.psql_database_creator import PsqlDatabaseCreator
+from condenser2.subset import Subset
+from condenser2.subset_utils import print_progress
+
+
+def db_creator(db_type: str, source: DbConnect, dest: DbConnect):
+    if db_type == "postgres":
         return PsqlDatabaseCreator(source, dest, False)
-    elif db_type == 'mysql':
+    elif db_type == "mysql":
         return MySqlDatabaseCreator(source, dest)
     else:
-        raise ValueError('unknown db_type ' + db_type)
+        raise ValueError("unknown db_type " + db_type)
 
 
-if __name__ == '__main__':
+def run_subset():
     if "--stdin" in sys.argv:
         config_reader.initialize(sys.stdin)
     else:
@@ -25,7 +26,9 @@ if __name__ == '__main__':
 
     db_type = config_reader.get_db_type()
     source_dbc = DbConnect(db_type, config_reader.get_source_db_connection_info())
-    destination_dbc = DbConnect(db_type, config_reader.get_destination_db_connection_info())
+    destination_dbc = DbConnect(
+        db_type, config_reader.get_destination_db_connection_info()
+    )
 
     database = db_creator(db_type, source_dbc, destination_dbc)
     database.teardown()
@@ -45,10 +48,11 @@ if __name__ == '__main__':
         print("Beginning pre constraint SQL calls")
         start_time = time.time()
         for idx, sql in enumerate(config_reader.get_pre_constraint_sql()):
-            print_progress(sql, idx+1, len(config_reader.get_pre_constraint_sql()))
+            print_progress(sql, idx + 1, len(config_reader.get_pre_constraint_sql()))
             db_helper.run_query(sql, destination_dbc.get_db_connection())
-        print("Completed pre constraint SQL calls in {}s".format(time.time()-start_time))
-        
+        print(
+            "Completed pre constraint SQL calls in {}s".format(time.time() - start_time)
+        )
 
         print("Adding database constraints")
         if "--no-constraints" not in sys.argv:
@@ -57,12 +61,13 @@ if __name__ == '__main__':
         print("Beginning post subset SQL calls")
         start_time = time.time()
         for idx, sql in enumerate(config_reader.get_post_subset_sql()):
-            print_progress(sql, idx+1, len(config_reader.get_post_subset_sql()))
+            print_progress(sql, idx + 1, len(config_reader.get_post_subset_sql()))
             db_helper.run_query(sql, destination_dbc.get_db_connection())
-        print("Completed post subset SQL calls in {}s".format(time.time()-start_time))
+        print("Completed post subset SQL calls in {}s".format(time.time() - start_time))
 
         result_tabulator.tabulate(source_dbc, destination_dbc, all_tables)
     finally:
         subsetter.unprep_temp_dbs()
 
-
+if __name__ == "__main__":
+    run_subset()

@@ -12,32 +12,34 @@ You can find more details about how we built this [here](https://www.tonic.ai/bl
 
 Our open-source tool can subset databases up to 10GB, but it will struggle with larger databases. Our premium database subsetter can, among other things (graphical UI, job scheduling, fancy algorithms), subset multi-TB databases with ease. If you're interested find us at [hello@tonic.ai](mailto:hello@tonic.ai).
 
-# Installation
+## Installation
 
-Five steps to install, assuming Python 3.5+:
+Five steps to install, assuming Python 3.10+:
 
-1. Download the required Python modules. You can use [`pip`](https://pypi.org/project/pip/) for easy installation. The required modules are `toposort`, `psycopg2-binary`, and `mysql-connector-python`.
-```
-$ pip install toposort
-$ pip install psycopg2-binary
-$ pip install mysql-connector-python
-```
+1. Install [astral-uv](https://docs.astral.sh/uv/getting-started/installation/)
+
 2. Install Postgres and/or MySQL database tools. For Postgres we need `pg_dump` and `psql` tools; they need to be on your `$PATH` or point to them with `$POSTGRES_PATH`. For MySQL we need `mysqldump` and `mysql`, they can be on your `$PATH` or point to them with `$MYSQL_PATH`.
-3. Download this repo. You can clone the repo or Download it as a zip. Scroll up, it's the green button that says "Clone or download".
-4. Setup your configuration and save it in `config.json`. The provided `config.json.example` has the skeleton of what you need to provide: source and destination database connection details, as well as subsetting goals in `initial_targets`. Here's an example that will collect 10% of a table named `public.target_table`.
-```
-"initial_targets": [
-    {
-        "table": "public.target_table",
-        "percent": 10
-    }
-]
-```
-There may be more required configuration depending on your database, but simple databases should be easy. See the Config section for more details, and `config.json.example_all` for all of the options in a single config file.
 
-5. Run! `$ python direct_subset.py`
+3. Clone this project locally.
 
-# Config
+4. Install the project.
+
+5. Setup your configuration and save it in `config.json`. The provided `config.json.example` has the skeleton of what you need to provide: source and destination database connection details, as well as subsetting goals in `initial_targets`. Here's an example that will collect 10% of a table named `public.target_table`.
+
+    ```
+    "initial_targets": [
+        {
+            "table": "public.target_table",
+            "percent": 10
+        }
+    ]
+    ```
+
+    There may be more required configuration depending on your database, but simple databases should be easy. See the Config section for more details, and `config.json.example_all` for all of the options in a single config file.
+
+6. Run! `$ uv run python direct_subset.py`
+
+## Config
 
 Configuration must exist in `config.json`. There is an example configuration provided in `example-config.json`. Most of the configuration is straightforward: source and destination DB connection details and subsetting settings. There are three fields that desire some additional attention.
 
@@ -75,12 +77,12 @@ Below we describe the use of all configuration parameters, but the best place to
 
 `post_subset_sql`: An array of SQL commands that will be issued on the destination database after subsetting is complete, and after the database constraints have been applied. Useful to perform additional adhoc tasks after subsetting.
 
-# Running
+## Running
 
 Almost all the configuration is in the `config.json` file, so running is as simple as
 
 ```
-$ python direct_subset.py
+$ uv run python direct_subset.py
 ```
 
 Two commandline arguements are supported:
@@ -88,7 +90,3 @@ Two commandline arguements are supported:
 `-v`: Verbose output. Useful for performance debugging. Lists almost every query made, and it's speed.
 
 `--no-constraints`: For Postgres this will not add constraints found in the source database to the destination database. This option has no effect for MySQL.
-
-# Requirements
-
-Reference the requirements.txt file for a list of required python packages.  Also, please note that Python 3.5+ is required.
