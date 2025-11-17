@@ -10,7 +10,7 @@ from condenser2 import config_reader
 
 
 class DbConnect:
-    def __init__(self, db_type, connection_info):
+    def __init__(self, db_type: str, connection_info: dict[str, str]):
         requiredKeys = ["user_name", "host", "db_name", "port"]
 
         for r in requiredKeys:

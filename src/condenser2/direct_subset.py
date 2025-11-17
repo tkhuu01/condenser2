@@ -18,7 +18,7 @@ def db_creator(db_type: str, source: DbConnect, dest: DbConnect):
         raise ValueError("unknown db_type " + db_type)
 
 
-def run_subset():
+def run():
     if "--stdin" in sys.argv:
         config_reader.initialize(sys.stdin)
     else:
@@ -69,5 +69,6 @@ def run_subset():
     finally:
         subsetter.unprep_temp_dbs()
 
+
 if __name__ == "__main__":
-    run_subset()
+    run()

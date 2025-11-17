@@ -12,7 +12,7 @@ dependencies = [
 
 
 [project.scripts]
-subset = "condenser2.direct_subset:run_subset"
+subset = "condenser2.direct_subset:run"
 
 [dependency-groups]
 dev = [

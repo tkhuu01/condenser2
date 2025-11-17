@@ -22,7 +22,7 @@ Five steps to install, assuming Python 3.10+:
 
 3. Clone this project locally.
 
-4. Install the project.
+4. Install the project with `uv sync --frozen`
 
 5. Setup your configuration and save it in `config.json`. The provided `config.json.example` has the skeleton of what you need to provide: source and destination database connection details, as well as subsetting goals in `initial_targets`. Here's an example that will collect 10% of a table named `public.target_table`.
 
@@ -37,7 +37,7 @@ Five steps to install, assuming Python 3.10+:
 
     There may be more required configuration depending on your database, but simple databases should be easy. See the Config section for more details, and `config.json.example_all` for all of the options in a single config file.
 
-6. Run! `$ uv run python direct_subset.py`
+6. Run! `$ uv run subset`
 
 ## Config
 
@@ -82,7 +82,7 @@ Below we describe the use of all configuration parameters, but the best place to
 Almost all the configuration is in the `config.json` file, so running is as simple as
 
 ```
-$ uv run python direct_subset.py
+$ uv run subset
 ```
 
 Two commandline arguements are supported:

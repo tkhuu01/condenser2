@@ -4,6 +4,14 @@ import sys
 
 _config: dict = {}
 
+LOCAL_HOST = {
+    "user_name": "postgres",
+    "host": "localhost",
+    "password": "postgres",
+    "db_name": "postgres",
+    "port": 5432,
+}
+
 
 def initialize(file_like=None):
     global _config
@@ -15,11 +23,6 @@ def initialize(file_like=None):
             _config = json.load(fp)
     else:
         _config = json.load(file_like)
-
-    if "desired_result" in _config:
-        raise ValueError(
-            "desired_result is a key in the old config spec. Check the README.md and example-config.json for the latest configuration parameters."
-        )
 
 
 DependencyBreak = collections.namedtuple(
@@ -70,7 +73,8 @@ def get_source_db_connection_info():
 
 
 def get_destination_db_connection_info():
-    return _config["destination_db_connection_info"]
+    destination = _config.get("destination_db_connection_info")
+    return destination if destination else LOCAL_HOST
 
 
 def get_excluded_tables():

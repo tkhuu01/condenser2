@@ -88,15 +88,14 @@ def copy_rows(source, destination, query, destination_table):
 
 def create_id_temp_table(conn, number_of_columns):
     temp_table = temp_db + "." + str(uuid.uuid4())
-    cursor = conn.cursor()
-    column_defs = ",\n".join(
-        ["    col" + str(aye) + "  text" for aye in range(number_of_columns)]
-    )
-    q = "CREATE TABLE {} (\n {} \n)".format(
-        fully_qualified_table(temp_table), column_defs
-    )
-    cursor.execute(q)
-    cursor.close()
+    with conn.cursor() as cursor:
+        column_defs = ",\n".join(
+            ["    col" + str(aye) + "  text" for aye in range(number_of_columns)]
+        )
+        q = "CREATE TABLE {} (\n {} \n)".format(
+            fully_qualified_table(temp_table), column_defs
+        )
+        cursor.execute(q)
     return temp_table
 
 

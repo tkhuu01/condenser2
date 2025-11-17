@@ -40,7 +40,7 @@ def copy_rows(source, destination, query, destination_table):
     )
 
     non_generated_columns = [
-        (dt[0], dt[1]) for i, dt in enumerate(datatypes) if dt[2] != "s"
+        (dt[0], dt[1]) for _, dt in enumerate(datatypes) if dt[2] != "s"
     ]
     generated_columns_positions = [i for i, dt in enumerate(datatypes) if "s" in dt[2]]
     always_generated_id = any([dt[3] == "a" for dt in datatypes])
