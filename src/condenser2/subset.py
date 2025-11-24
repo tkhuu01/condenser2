@@ -2,6 +2,7 @@ import time
 import uuid
 
 from condenser2 import config_reader, database_helper
+from condenser2.db_connect import DbConnect
 from condenser2.subset_utils import (
     columns_joined,
     columns_to_copy,
@@ -38,7 +39,13 @@ from condenser2.topo_orderer import get_topological_order_by_tables
 
 
 class Subset:
-    def __init__(self, source_dbc, destination_dbc, all_tables, clean_previous=True):
+    def __init__(
+        self,
+        source_dbc: DbConnect,
+        destination_dbc: DbConnect,
+        all_tables: list[str],
+        clean_previous=True,
+    ):
         self.__source_conn = source_dbc.get_db_connection(read_repeatable=True)
         self.__destination_conn = destination_dbc.get_db_connection()
 
@@ -212,8 +219,7 @@ class Subset:
                     mysql_db_name_hack(kc["target_table"], self.__destination_conn)
                 )
                 query = "SELECT {} FROM {}".format(
-                    columns_joined(kc["target_columns"]),
-                    qualified_table
+                    columns_joined(kc["target_columns"]), qualified_table
                 )
                 dest_cursor.execute(query)
                 fetch_row_count = 100000
@@ -229,13 +235,16 @@ class Subset:
                     if len(ids) == 0:
                         break
                     ids_to_query = ",".join(ids)
-                    q = "SELECT * FROM {} WHERE {} IN ({}) AND {} LIMIT {}".format(
+                    q = "SELECT * FROM {} WHERE {} IN ({}) AND {}".format(
                         fully_qualified_table(target),
                         columns_tupled(kc["target_columns"]),
                         ids_to_query,
                         " AND ".join(upstream_filters),
-                        config_reader.get_max_rows_per_table(),
                     )
+                    if config_reader.get_max_rows_per_table() is not None:
+                        q = (q + " LIMIT {}").format(
+                            config_reader.get_max_rows_per_table()
+                        )
                     self.__db_helper.copy_rows(
                         self.__source_conn, self.__destination_conn, q, target
                     )
@@ -259,6 +268,7 @@ class Subset:
         if len(referencing_tables) > 0:
             pk_columns = referencing_tables[0]["target_columns"]
         else:
+            print("Nothing to do in downstream subset")
             return
 
         temp_table = self.__db_helper.create_id_temp_table(

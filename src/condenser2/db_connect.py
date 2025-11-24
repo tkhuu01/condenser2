@@ -9,41 +9,6 @@ import psycopg2
 from condenser2 import config_reader
 
 
-class DbConnect:
-    def __init__(self, db_type: str, connection_info: dict[str, str]):
-        requiredKeys = ["user_name", "host", "db_name", "port"]
-
-        for r in requiredKeys:
-            if r not in connection_info.keys():
-                raise Exception(
-                    "Missing required key in database connection info: " + r
-                )
-        if "password" not in connection_info.keys():
-            connection_info["password"] = getpass.getpass(
-                "Enter password for {0} on host {1}: ".format(
-                    connection_info["user_name"], connection_info["host"]
-                )
-            )
-
-        self.user = connection_info["user_name"]
-        self.password = connection_info["password"]
-        self.host = connection_info["host"]
-        self.port = connection_info["port"]
-        self.db_name = connection_info["db_name"]
-        self.ssl_mode = (
-            connection_info["ssl_mode"] if "ssl_mode" in connection_info else None
-        )
-        self.__db_type = db_type.lower()
-
-    def get_db_connection(self, read_repeatable=False):
-        if self.__db_type == "postgres":
-            return PsqlConnection(self, read_repeatable)
-        elif self.__db_type == "mysql":
-            return MySqlConnection(self, read_repeatable)
-        else:
-            raise ValueError("unknown db_type " + self.__db_type)
-
-
 class DbConnection:
     def __init__(self, connection):
         self.connection = connection
@@ -135,3 +100,40 @@ class MySqlConnection(DbConnection):
 
     def cursor(self, name=None, withhold=False):
         return LoggingCursor(self.connection.cursor())
+
+
+class DbConnect:
+    def __init__(self, db_type: str, connection_info: dict[str, str]):
+        requiredKeys = ["user_name", "host", "db_name", "port"]
+
+        for r in requiredKeys:
+            if r not in connection_info.keys():
+                raise Exception(
+                    "Missing required key in database connection info: " + r
+                )
+        if "password" not in connection_info.keys():
+            connection_info["password"] = getpass.getpass(
+                "Enter password for {0} on host {1}: ".format(
+                    connection_info["user_name"], connection_info["host"]
+                )
+            )
+
+        self.user = connection_info["user_name"]
+        self.password = connection_info["password"]
+        self.host = connection_info["host"]
+        self.port = connection_info["port"]
+        self.db_name = connection_info["db_name"]
+        self.ssl_mode = (
+            connection_info["ssl_mode"] if "ssl_mode" in connection_info else None
+        )
+        self.__db_type = db_type.lower()
+
+    def get_db_connection(
+        self, read_repeatable=False
+    ) -> PsqlConnection | MySqlConnection:
+        if self.__db_type == "postgres":
+            return PsqlConnection(self, read_repeatable)
+        elif self.__db_type == "mysql":
+            return MySqlConnection(self, read_repeatable)
+        else:
+            raise ValueError("unknown db_type " + self.__db_type)

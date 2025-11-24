@@ -60,38 +60,43 @@ def copy_rows(source, destination, query, destination_table):
 
     cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
     cursor = source.cursor(name=cursor_name)
-    cursor.execute(query)
+    try:
+        cursor.execute(query)
 
-    fetch_row_count = 100000
-    while True:
-        rows = cursor.fetchmany(fetch_row_count)
-        if len(rows) == 0:
-            break
+        fetch_row_count = 100000
+        while True:
+            rows = cursor.fetchmany(fetch_row_count)
+            if len(rows) == 0:
+                break
 
-        # using the inner_cursor means we don't log all the noise
-        destination_cursor = destination.cursor().inner_cursor
+            # using the inner_cursor means we don't log all the noise
+            destination_cursor = destination.cursor().inner_cursor
 
-        insert_query = "INSERT INTO {} {} VALUES %s".format(
-            fully_qualified_table(destination_table), columns
-        )
-        if always_generated_id:
-            insert_query = "INSERT INTO {} {} OVERRIDING SYSTEM VALUE VALUES %s".format(
+            insert_query = "INSERT INTO {} {} VALUES %s".format(
                 fully_qualified_table(destination_table), columns
             )
+            if always_generated_id:
+                insert_query = (
+                    "INSERT INTO {} {} OVERRIDING SYSTEM VALUE VALUES %s".format(
+                        fully_qualified_table(destination_table), columns
+                    )
+                )
 
-        updated_rows = [
-            tuple(
-                val for i, val in enumerate(row) if i not in generated_columns_positions
-            )
-            for row in rows
-        ]
+            updated_rows = [
+                tuple(
+                    val
+                    for i, val in enumerate(row)
+                    if i not in generated_columns_positions
+                )
+                for row in rows
+            ]
 
-        execute_values(destination_cursor, insert_query, updated_rows, template)
+            execute_values(destination_cursor, insert_query, updated_rows, template)
 
-        destination_cursor.close()
-
-    cursor.close()
-    destination.commit()
+            destination_cursor.close()
+    finally:
+        cursor.close()
+        destination.commit()
 
 
 def source_db_temp_table(target_table):
