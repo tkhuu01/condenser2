@@ -164,7 +164,10 @@ def get_unredacted_fk_relationships(tables, conn):
     cur = conn.cursor()
 
     q = """
-    SELECT fk_nsp.nspname || '.' || fk_table AS fk_table, array_agg(fk_att.attname ORDER BY fk_att.attnum) AS fk_columns, tar_nsp.nspname || '.' || target_table AS target_table, array_agg(tar_att.attname ORDER BY fk_att.attnum) AS target_columns
+        SELECT fk_nsp.nspname || '.' || fk_table AS fk_table,
+        array_agg(fk_att.attname ORDER BY fk_att.attnum) AS fk_columns,
+        tar_nsp.nspname || '.' || target_table AS target_table,
+        array_agg(tar_att.attname ORDER BY fk_att.attnum) AS target_columns
     FROM (
         SELECT
             fk.oid AS fk_table_id,
@@ -185,10 +188,14 @@ def get_unredacted_fk_relationships(tables, conn):
         JOIN pg_class tar ON con.confrelid = tar.oid
         WHERE con.contype = 'f'
     ) sub
-    JOIN pg_attribute fk_att ON fk_att.attrelid = fk_table_id AND fk_att.attnum = fk_column_id
-    JOIN pg_attribute tar_att ON tar_att.attrelid = target_table_id AND tar_att.attnum = target_column_id
-    JOIN pg_namespace fk_nsp ON fk_schema_id = fk_nsp.oid
-    JOIN pg_namespace tar_nsp ON target_schema_id = tar_nsp.oid
+    JOIN pg_attribute fk_att 
+      ON fk_att.attrelid = fk_table_id AND fk_att.attnum = fk_column_id
+    JOIN pg_attribute tar_att 
+      ON tar_att.attrelid = target_table_id AND tar_att.attnum = target_column_id
+    JOIN pg_namespace fk_nsp 
+      ON fk_schema_id = fk_nsp.oid
+    JOIN pg_namespace tar_nsp
+      ON target_schema_id = tar_nsp.oid
     GROUP BY 1, 3, sub.constraint_nsp, sub.constraint_name;
     """
 
@@ -293,7 +300,12 @@ def get_table_columns(table, schema, conn):
 def list_all_user_schemas(conn):
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname NOT LIKE 'pg\_%' and nspname != 'information_schema';"
+            """
+            SELECT nspname
+              FROM pg_catalog.pg_namespace
+             WHERE nspname NOT LIKE 'pg\_%'
+               AND nspname != 'information_schema';
+            """
         )
         return [r[0] for r in cur.fetchall()]
 
@@ -301,10 +313,14 @@ def list_all_user_schemas(conn):
 def list_all_tables(db_connect):
     conn = db_connect.get_db_connection()
     with conn.cursor() as cur:
-        cur.execute("""SELECT concat(concat(nsp.nspname,'.'),cls.relname)
-                        FROM pg_class cls
-                        JOIN pg_namespace nsp ON nsp.oid = cls.relnamespace
-                        WHERE nsp.nspname NOT IN ('information_schema', 'pg_catalog') AND cls.relkind = 'r';""")
+        cur.execute("""
+            SELECT concat(concat(nsp.nspname,'.'),cls.relname)
+              FROM pg_class cls
+              JOIN pg_namespace nsp
+                ON nsp.oid = cls.relnamespace
+             WHERE nsp.nspname NOT IN ('information_schema', 'pg_catalog')
+               AND cls.relkind = 'r';
+        """)
         return [r[0] for r in cur.fetchall()]
 
 
@@ -315,15 +331,16 @@ def get_table_datatypes(table, schema, conn):
         table_clause = "cl.relname = '{}' AND ns.nspname = '{}'".format(table, schema)
     with conn.cursor() as cur:
         cur.execute(
-            """SELECT att.attname, ty.typname, att.attgenerated, att.attidentity
-                        FROM pg_attribute att
-                        JOIN pg_class cl ON cl.oid = att.attrelid
-                        JOIN pg_type ty ON ty.oid = att.atttypid
-                        JOIN pg_namespace ns ON ns.oid = cl.relnamespace
-                        WHERE {} AND att.attnum > 0 AND
-                        NOT att.attisdropped
-                        ORDER BY att.attnum;
-                    """.format(table_clause)
+            """
+            SELECT att.attname, ty.typname, att.attgenerated, att.attidentity
+              FROM pg_attribute att
+              JOIN pg_class cl ON cl.oid = att.attrelid
+              JOIN pg_type ty ON ty.oid = att.atttypid
+              JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+             WHERE {} AND att.attnum > 0 AND
+               NOT att.attisdropped
+             ORDER BY att.attnum;
+        """.format(table_clause)
         )
 
         return [(r[0], r[1], r[2], r[3]) for r in cur.fetchall()]

@@ -44,7 +44,7 @@ class Subset:
         source_dbc: DbConnect,
         destination_dbc: DbConnect,
         all_tables: list[str],
-        clean_previous=True,
+        # clean_previous=True,
     ):
         self.__source_conn = source_dbc.get_db_connection(read_repeatable=True)
         self.__destination_conn = destination_dbc.get_db_connection()
