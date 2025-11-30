@@ -1,5 +1,6 @@
 import uuid
 
+from psycopg2 import sql
 from psycopg2.extras import (
     execute_values,
     register_default_json,
@@ -7,6 +8,7 @@ from psycopg2.extras import (
 )
 
 from condenser2 import config_reader
+from condenser2.db_connect import PsqlConnection
 from condenser2.subset_utils import (
     columns_joined,
     columns_tupled,
@@ -229,6 +231,43 @@ def run_query(query, conn, commit=True):
         cur.execute(query)
         if commit:
             conn.commit()
+
+
+def update_sequence_numbering(conn: PsqlConnection, tables: list[str]):
+    with conn.cursor() as cur:
+        for full_table in tables:
+            schema_ = schema_name(full_table)
+            if schema_ is None:
+                schema_ = "public"
+            table_ = table_name(full_table)
+            col_seq_query = """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name   = %s
+                  AND (
+                        column_default LIKE 'nextval(%%'
+                        OR is_identity = 'YES'
+                  )
+            """
+            cur.execute(col_seq_query, (schema_, table_))
+            cols = [row[0] for row in cur.fetchall()]
+            if not cols:
+                continue
+            for col in cols:
+                seq_update_query = sql.SQL("""
+                    SELECT setval(
+                        pg_get_serial_sequence({tbl}, {col}),
+                        COALESCE(MAX({col}), 0) + 1,
+                        false
+                    )
+                    FROM {tbl}
+                """).format(
+                    col=sql.Identifier(col),
+                    tbl=sql.Identifier(schema_, table_),
+                )
+                cur.execute(seq_update_query)
+        conn.commit()
 
 
 def get_table_count_estimate(table_name, schema, conn):

@@ -2,14 +2,16 @@ import sys
 import time
 
 from condenser2 import config_reader, database_helper, result_tabulator
-from condenser2.db_connect import DbConnect
+from condenser2.db_connect import DbConnect, MySqlConnection, PsqlConnection
 from condenser2.mysql_database_creator import MySqlDatabaseCreator
 from condenser2.psql_database_creator import PsqlDatabaseCreator
 from condenser2.subset import Subset
 from condenser2.subset_utils import print_progress
 
 
-def db_creator(db_type: str, source: DbConnect, dest: DbConnect):
+def db_creator(
+    db_type: str, source: DbConnect, dest: DbConnect
+) -> PsqlDatabaseCreator | MySqlDatabaseCreator:
     if db_type == "postgres":
         return PsqlDatabaseCreator(source, dest, False)
     elif db_type == "mysql":
@@ -18,7 +20,7 @@ def db_creator(db_type: str, source: DbConnect, dest: DbConnect):
         raise ValueError("unknown db_type " + db_type)
 
 
-def run():
+def main():
     if "--stdin" in sys.argv:
         config_reader.initialize(sys.stdin)
     else:
@@ -65,10 +67,23 @@ def run():
             db_helper.run_query(sql, destination_dbc.get_db_connection())
         print("Completed post subset SQL calls in {}s".format(time.time() - start_time))
 
+        print("Resetting sequence numbering")
+        all_tables_no_pg = [table for table in all_tables if "pgbench" not in table]
+        dest_conn = destination_dbc.get_db_connection()
+        if db_type == "postgres":
+            assert isinstance(dest_conn, PsqlConnection)
+            db_helper.update_sequence_numbering(dest_conn, all_tables_no_pg)
+        elif db_type == "mysql":
+            # TODO update sequencing for mysql
+            assert isinstance(dest_conn, MySqlConnection)
+            # db_helper.update_sequence_numbering(
+            #    dest_conn, all_tables_no_pg
+            # )
+
         result_tabulator.tabulate(source_dbc, destination_dbc, all_tables)
     finally:
         subsetter.unprep_temp_dbs()
 
 
 if __name__ == "__main__":
-    run()
+    main()

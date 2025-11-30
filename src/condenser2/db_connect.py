@@ -1,7 +1,7 @@
-import datetime
 import getpass
 import sys
 import time
+from datetime import datetime
 
 import mysql.connector
 import psycopg2
@@ -24,16 +24,12 @@ class LoggingCursor:
     def __init__(self, cursor):
         self.inner_cursor = cursor
 
-    def execute(self, query):
+    def execute(self, query, params=None):
         start_time = time.time()
         if config_reader.verbose_logging():
-            print(
-                "Beginning query @ {}:\n\t{}".format(
-                    str(datetime.datetime.now()), query
-                )
-            )
+            print("Beginning query @ {}:\n\t{}".format(str(datetime.now()), query))
             sys.stdout.flush()
-        retval = self.inner_cursor.execute(query)
+        retval = self.inner_cursor.execute(query, params)
         if config_reader.verbose_logging():
             print("\tQuery completed in {}s".format(time.time() - start_time))
             sys.stdout.flush()

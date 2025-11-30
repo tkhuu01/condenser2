@@ -1,6 +1,7 @@
 import uuid
 
 from condenser2 import config_reader
+from condenser2.db_connect import MySqlConnection
 from condenser2.subset_utils import (
     columns_joined,
     columns_tupled,
@@ -215,6 +216,10 @@ def run_query(query, conn, commit=True):
             conn.commit()
     finally:
         cur.close()
+
+
+def update_sequence_numbering(conn: MySqlConnection, tables: list[str]):
+    pass
 
 
 def get_table_count_estimate(table_name, schema, conn):
