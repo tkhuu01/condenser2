@@ -1,10 +1,11 @@
 [project]
 name = "condenser2"
 version = "0.1.0"
-description = "Condenser with some modifications"
+description = "Condenser2"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "faker==38.2.0",
     "mysql-connector-python==9.5.0",
     "psycopg[binary]==3.2.13",
     "toposort==1.10",
