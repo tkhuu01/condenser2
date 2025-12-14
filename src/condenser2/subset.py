@@ -20,22 +20,22 @@ from condenser2.subset_utils import (
 )
 from condenser2.topo_orderer import get_topological_order_by_tables
 
-#
-# A QUICK NOTE ON DEFINITIONS:
-#
-# Foreign key relationships form a graph. We make sure all subsetting happens on DAGs.
-# Nodes in the DAG are tables, and FKs point from the table with a FK column to the table
-# with the PK column. In other words, tables with FKs are upstream of tables with PKs.
-#
-# Sometimes we'll refer to tables as downstream or 'target' tables, because they are
-# targeted by foreign keys. We will also use upstream or 'fk' tables, because they
-# have foreign keys.
-#
-# Generally speaking, tables downstream of other tables have their membership defined
-# by the requirements of their upstream tables. And tables upstream can be more flexible
-# about their membership vis-a-vis the downstream tables (i.e. upstream tables can decide
-# to include more or less).
-#
+"""
+A QUICK NOTE ON DEFINITIONS:
+
+Foreign key relationships form a graph. We make sure all subsetting happens on DAGs.
+Nodes in the DAG are tables, and FKs point from the table with a FK column to the table
+with the PK column. In other words, tables with FKs are upstream of tables with PKs.
+
+Sometimes we'll refer to tables as downstream or 'target' tables, because they are
+targeted by foreign keys. We will also use upstream or 'fk' tables, because they
+have foreign keys.
+
+Generally speaking, tables downstream of other tables have their membership defined
+by the requirements of their upstream tables. And tables upstream can be more flexible
+about their membership vis-a-vis the downstream tables (i.e. upstream tables can decide
+to include more or less).
+"""
 
 
 class Subset:
@@ -257,10 +257,13 @@ class Subset:
         passthrough_tables = config_reader.get_passthrough_tables()
         return list(set(passthrough_tables))
 
-    # Table A -> Table B and Table A has the column b_id.  So we SELECT b_id from table_a from our destination
-    # database.  And we take those b_ids and run `select * from table b where id in (those list of ids)` then insert
-    # that result set into table b of the destination database
     def subset_downstream(self, table, relationships):
+        """
+        Table A -> Table B and Table A has the column b_id.  So we SELECT b_id
+        from table_a from our destination database.  And we take those b_ids
+        and run `select * from table b where id in (those list of ids)` then
+        insert that result set into table b of the destination database
+        """
         referencing_tables = self.__db_helper.get_redacted_table_references(
             table, self.__all_tables, self.__source_conn
         )

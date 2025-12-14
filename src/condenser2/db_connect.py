@@ -4,7 +4,7 @@ import time
 from datetime import datetime
 
 import mysql.connector
-import psycopg2
+import psycopg
 
 from condenser2 import config_reader
 
@@ -49,26 +49,20 @@ class LoggingCursor:
 # method across MySQL and Postgres. This one is for Postgres
 class PsqlConnection(DbConnection):
     def __init__(self, connect, read_repeatable):
-        connection_string = (
-            "dbname='{0}' user='{1}' password='{2}' host={3} port={4}".format(
-                connect.db_name,
-                connect.user,
-                connect.password,
-                connect.host,
-                connect.port,
-            )
+        connection_args = dict(
+            dbname=connect.db_name,
+            user=connect.user,
+            password=connect.password,
+            host=connect.host,
+            port=connect.port,
         )
 
         if connect.ssl_mode:
-            connection_string = connection_string + " sslmode={0}".format(
-                connect.ssl_mode
-            )
+            connection_args["sslmode"] = connect.ssl_mode
 
-        DbConnection.__init__(self, psycopg2.connect(connection_string))
+        DbConnection.__init__(self, psycopg.connect(**connection_args))
         if read_repeatable:
-            self.connection.isolation_level = (
-                psycopg2.extensions.ISOLATION_LEVEL_REPEATABLE_READ
-            )
+            self.connection.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
 
     def cursor(self, name=None, withhold=False):
         return LoggingCursor(self.connection.cursor(name=name, withhold=withhold))

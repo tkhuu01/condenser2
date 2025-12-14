@@ -26,16 +26,19 @@ def tabulate(source_dbc, destination_dbc, tables):
         source_conn.close()
         dest_conn.close()
 
+    print("--===============================================================--")
+    results = "Table name: {}, Source row count: {}, Dest row count: {}, Subset ratio: {:.3f}"
     print(
         "\n".join(
             [
-                "{}, {}, {}, {}".format(
+                results.format(
                     x[0], x[1], x[2], x[2] / x[1] if x[1] > 0 else 0
                 )
                 for x in row_counts
             ]
         )
     )
+    print("--===============================================================--")
 
 
 def schema_name(table):

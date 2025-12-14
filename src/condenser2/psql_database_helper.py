@@ -1,11 +1,7 @@
 import uuid
 
-from psycopg2 import sql
-from psycopg2.extras import (
-    execute_values,
-    register_default_json,
-    register_default_jsonb,
-)
+from psycopg import sql
+from psycopg.types.json import set_json_loads
 
 from condenser2 import config_reader
 from condenser2.db_connect import PsqlConnection
@@ -19,8 +15,7 @@ from condenser2.subset_utils import (
     table_name,
 )
 
-register_default_json(loads=lambda x: str(x))
-register_default_jsonb(loads=lambda x: str(x))
+set_json_loads(lambda s: s)
 
 
 def prep_temp_dbs(_, __):
@@ -65,24 +60,21 @@ def copy_rows(source, destination, query, destination_table):
     try:
         cursor.execute(query)
 
+        # using the inner_cursor means we don't log all the noise
+        destination_cursor = destination.cursor().inner_cursor
+        insert_query = "INSERT INTO {} {} VALUES {}".format(
+            fully_qualified_table(destination_table), columns, template
+        )
+        if always_generated_id:
+            insert_query = "INSERT INTO {} {} OVERRIDING SYSTEM VALUE VALUES {}".format(
+                fully_qualified_table(destination_table), columns, template
+            )
+
         fetch_row_count = 100000
         while True:
             rows = cursor.fetchmany(fetch_row_count)
             if len(rows) == 0:
                 break
-
-            # using the inner_cursor means we don't log all the noise
-            destination_cursor = destination.cursor().inner_cursor
-
-            insert_query = "INSERT INTO {} {} VALUES %s".format(
-                fully_qualified_table(destination_table), columns
-            )
-            if always_generated_id:
-                insert_query = (
-                    "INSERT INTO {} {} OVERRIDING SYSTEM VALUE VALUES %s".format(
-                        fully_qualified_table(destination_table), columns
-                    )
-                )
 
             updated_rows = [
                 tuple(
@@ -93,9 +85,9 @@ def copy_rows(source, destination, query, destination_table):
                 for row in rows
             ]
 
-            execute_values(destination_cursor, insert_query, updated_rows, template)
+            destination_cursor.executemany(insert_query, updated_rows)
 
-            destination_cursor.close()
+        destination_cursor.close()
     finally:
         cursor.close()
         destination.commit()
@@ -274,15 +266,17 @@ def update_sequence_numbering(conn: PsqlConnection, tables: list[str]):
                     tbl=sql.Identifier(schema_, table_),
                 )
                 cur.execute(seq_update_query)
-        conn.commit()
+    conn.commit()
 
 
 def get_table_count_estimate(table_name, schema, conn):
     with conn.cursor() as cur:
         cur.execute(
-            'SELECT reltuples::BIGINT AS count FROM pg_class WHERE oid=\'"{}"."{}"\'::regclass'.format(
-                schema, table_name
-            )
+            """
+            SELECT reltuples::BIGINT AS count
+              FROM pg_class
+             WHERE oid=\'"{}"."{}"\'::regclass
+             """.format(schema, table_name)
         )
         return cur.fetchone()[0]
 
@@ -290,9 +284,13 @@ def get_table_count_estimate(table_name, schema, conn):
 def get_table_columns(table, schema, conn):
     with conn.cursor() as cur:
         cur.execute(
-            'SELECT attname FROM pg_attribute WHERE attrelid=\'"{}"."{}"\'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum;'.format(
-                schema, table
-            )
+            """
+            SELECT attname
+              FROM pg_attribute
+             WHERE attrelid=\'"{}"."{}"\'::regclass
+               AND attnum > 0
+               AND NOT attisdropped
+             ORDER BY attnum;""".format(schema, table)
         )
         return [r[0] for r in cur.fetchall()]
 
@@ -332,7 +330,11 @@ def get_table_datatypes(table, schema, conn):
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT att.attname, ty.typname, att.attgenerated, att.attidentity
+            SELECT
+                att.attname,
+                ty.typname,
+                att.attgenerated,
+                att.attidentity
               FROM pg_attribute att
               JOIN pg_class cl ON cl.oid = att.attrelid
               JOIN pg_type ty ON ty.oid = att.atttypid
