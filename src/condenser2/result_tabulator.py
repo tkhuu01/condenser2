@@ -27,13 +27,13 @@ def tabulate(source_dbc, destination_dbc, tables):
         dest_conn.close()
 
     print("--===============================================================--")
-    results = "Table name: {}, Source row count: {}, Dest row count: {}, Subset ratio: {:.3f}"
+    results = (
+        "Table name: {}, Source row count: {}, Dest row count: {}, Subset ratio: {:.3f}"
+    )
     print(
         "\n".join(
             [
-                results.format(
-                    x[0], x[1], x[2], x[2] / x[1] if x[1] > 0 else 0
-                )
+                results.format(x[0], x[1], x[2], x[2] / x[1] if x[1] > 0 else 0)
                 for x in row_counts
             ]
         )

@@ -1,11 +1,10 @@
 # Condenser2
 
-Condenser2 is a fork of TonicAI's Condenser with additional fixes and features.
+Condenser2 is a fork of Tonic's Condenser with additional fixes and features.
 
 * Fixes the upstream subsetting code
 * Adds sequence numbering reset automatically after subsetting
-* Moves the project to astral's uv
-* Moves the project to psycopg3
+* Moves the project to astral's uv and to psycopg3
 
 Condenser is a config-driven database subsetting tool for Postgres and MySQL.
 

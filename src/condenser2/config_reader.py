@@ -147,7 +147,7 @@ def initialize(file_like=None):
         _config = json.load(file_like)
 
     print(_raw_dict_to_config(_config))
-    #raise Exception()
+    # raise Exception()
 
 
 DependencyBreak_ = collections.namedtuple(
