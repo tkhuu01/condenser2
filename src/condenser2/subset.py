@@ -13,6 +13,7 @@ from condenser2.subset_utils import (
     fully_qualified_table,
     mysql_db_name_hack,
     print_progress,
+    quoter,
     redact_relationships,
     schema_name,
     table_name,
@@ -219,6 +220,7 @@ class Subset:
 
             # First query the already subsetted table in the destination DB
             # Extract out the information needed and apply the needed filters
+            fetch_row_count = 100000
             for kc in relevant_key_constraints:
                 qualified_table = fully_qualified_table(
                     mysql_db_name_hack(kc["target_table"], self.__destination_conn)
@@ -226,37 +228,50 @@ class Subset:
                 query = "SELECT {} FROM {}".format(
                     columns_joined(kc["target_columns"]), qualified_table
                 )
-                dest_cursor.execute(query)
-                fetch_row_count = 100000
-                while True:
-                    rows = dest_cursor.fetchmany(fetch_row_count)
-                    if len(rows) == 0:
-                        break
-                    ids = [
-                        "(" + ",".join(["'" + str(c) + "'" for c in row]) + ")"
-                        for row in rows
-                        if all([c is not None for c in row])
-                    ]
-                    if len(ids) == 0:
-                        break
-                    ids_to_query = ",".join(ids)
-                    q = "SELECT * FROM {} WHERE {} IN ({})".format(
-                        fully_qualified_table(target),
-                        columns_tupled(kc["target_columns"]),
-                        ids_to_query,
-                    )
 
-                    if upstream_filters:
-                        q += " AND {}".format(
-                            " AND ".join(upstream_filters),
-                        )
-                    if config_reader.get_max_rows_per_table() is not None:
-                        q += (" LIMIT {}").format(
-                            config_reader.get_max_rows_per_table()
-                        )
-                    self.__db_helper.copy_rows(
-                        self.__source_conn, self.__destination_conn, q, target
+                # Stream FK values from destination into a temp table on source,
+                # then do a single JOIN query instead of N large IN-clause queries
+                id_temp = self.__db_helper.create_id_temp_table(
+                    self.__source_conn, len(kc["target_columns"])
+                )
+                insert_q = 'INSERT INTO "{}" VALUES ({})'.format(
+                    id_temp, ",".join(["%s"] * len(kc["target_columns"]))
+                )
+                src_insert_cur = self.__source_conn.cursor()
+                try:
+                    dest_cursor.execute(query)
+                    while True:
+                        rows = dest_cursor.fetchmany(fetch_row_count)
+                        if not rows:
+                            break
+                        valid_rows = [row for row in rows if all(c is not None for c in row)]
+                        if valid_rows:
+                            src_insert_cur.executemany(insert_q, valid_rows)
+                    self.__source_conn.commit()
+                finally:
+                    src_insert_cur.close()
+
+                join_conditions = " AND ".join([
+                    '{}.{} = "{}".col{}'.format(
+                        fully_qualified_table(target), quoter(col), id_temp, i
                     )
+                    for i, col in enumerate(kc["target_columns"])
+                ])
+                q = 'SELECT {}.* FROM {} JOIN "{}" ON {}'.format(
+                    fully_qualified_table(target),
+                    fully_qualified_table(target),
+                    id_temp,
+                    join_conditions,
+                )
+                if upstream_filters:
+                    q += " AND {}".format(
+                        " AND ".join(upstream_filters),
+                    )
+                if config_reader.get_max_rows_per_table() is not None:
+                    q += " LIMIT {}".format(config_reader.get_max_rows_per_table())
+                self.__db_helper.copy_rows(
+                    self.__source_conn, self.__destination_conn, q, target
+                )
         finally:
             dest_cursor.close()
 
