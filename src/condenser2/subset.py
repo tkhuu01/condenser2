@@ -244,19 +244,23 @@ class Subset:
                         rows = dest_cursor.fetchmany(fetch_row_count)
                         if not rows:
                             break
-                        valid_rows = [row for row in rows if all(c is not None for c in row)]
+                        valid_rows = [
+                            row for row in rows if all(c is not None for c in row)
+                        ]
                         if valid_rows:
                             src_insert_cur.executemany(insert_q, valid_rows)
                     self.__source_conn.commit()
                 finally:
                     src_insert_cur.close()
 
-                join_conditions = " AND ".join([
-                    '{}.{} = "{}".col{}'.format(
-                        fully_qualified_table(target), quoter(col), id_temp, i
-                    )
-                    for i, col in enumerate(kc["target_columns"])
-                ])
+                join_conditions = " AND ".join(
+                    [
+                        '{}.{} = "{}".col{}'.format(
+                            fully_qualified_table(target), quoter(col), id_temp, i
+                        )
+                        for i, col in enumerate(kc["target_columns"])
+                    ]
+                )
                 q = 'SELECT {}.* FROM {} JOIN "{}" ON {}'.format(
                     fully_qualified_table(target),
                     fully_qualified_table(target),
@@ -323,39 +327,53 @@ class Subset:
 
         columns_query = columns_to_copy(table, relationships, self.__source_conn)
 
+        # Stream IDs from destination temp table into a source temp table,
+        # then do a single JOIN query instead of N large IN-clause queries
+        src_id_temp = self.__db_helper.create_id_temp_table(
+            self.__source_conn, len(pk_columns)
+        )
+        insert_q = 'INSERT INTO "{}" VALUES ({})'.format(
+            src_id_temp, ",".join(["%s"] * len(pk_columns))
+        )
+
         cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
         cursor = self.__destination_conn.cursor(name=cursor_name, withhold=True)
-        cursor_query = "SELECT DISTINCT * FROM {}".format(
-            fully_qualified_table(temp_table)
-        )
-        cursor.execute(cursor_query)
-        fetch_row_count = 100000
-        while True:
-            rows = cursor.fetchmany(fetch_row_count)
-            if len(rows) == 0:
-                break
+        src_insert_cur = self.__source_conn.cursor()
+        try:
+            cursor_query = "SELECT DISTINCT * FROM {}".format(
+                fully_qualified_table(temp_table)
+            )
+            cursor.execute(cursor_query)
+            fetch_row_count = 100000
+            while True:
+                rows = cursor.fetchmany(fetch_row_count)
+                if not rows:
+                    break
+                valid_rows = [row for row in rows if all(c is not None for c in row)]
+                if valid_rows:
+                    src_insert_cur.executemany(insert_q, valid_rows)
+            self.__source_conn.commit()
+        finally:
+            src_insert_cur.close()
+            cursor.close()
 
-            ids = [
-                "(" + ",".join(["'" + str(c) + "'" for c in row]) + ")"
-                for row in rows
-                if all([c is not None for c in row])
+        join_conditions = " AND ".join(
+            [
+                '{}.{} = "{}".col{}'.format(
+                    fully_qualified_table(table), quoter(col), src_id_temp, i
+                )
+                for i, col in enumerate(pk_columns)
             ]
-
-            if len(ids) == 0:
-                break
-
-            ids_to_query = ",".join(ids)
-            q = "SELECT {} FROM {} WHERE {} IN ({})".format(
-                columns_query,
-                fully_qualified_table(table),
-                columns_tupled(pk_columns),
-                ids_to_query,
-            )
-            self.__db_helper.copy_rows(
-                self.__source_conn,
-                self.__destination_conn,
-                q,
-                mysql_db_name_hack(table, self.__destination_conn),
-            )
-
-        cursor.close()
+        )
+        q = 'SELECT {} FROM {} JOIN "{}" ON {}'.format(
+            columns_query,
+            fully_qualified_table(table),
+            src_id_temp,
+            join_conditions,
+        )
+        self.__db_helper.copy_rows(
+            self.__source_conn,
+            self.__destination_conn,
+            q,
+            mysql_db_name_hack(table, self.__destination_conn),
+        )
