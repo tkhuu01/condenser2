@@ -157,17 +157,17 @@ class Subset:
             if config_reader.get_max_rows_per_table() is not None:
                 q += " LIMIT {}".format(config_reader.get_max_rows_per_table())
             self.__db_helper.copy_rows(
-                self.__source_conn, self.__destination_conn, q, mysql_db_name_hack(table, self.__destination_conn)
+                self.__source_conn,
+                self.__destination_conn,
+                q,
+                mysql_db_name_hack(table, self.__destination_conn),
             )
         finally:
             self.close_connections()
 
     def __copy_tables_concurrent(self, tables, max_workers=4):
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {
-                pool.submit(self.__copy_table_worker, t): t
-                for t in tables
-            }
+            futures = {pool.submit(self.__copy_table_worker, t): t for t in tables}
             for idx, future in enumerate(as_completed(futures)):
                 table = futures[future]
                 print_progress(table, idx + 1, len(tables))
