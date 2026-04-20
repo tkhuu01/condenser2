@@ -218,6 +218,14 @@ class Subset:
             # Additional filters to apply upstream
             upstream_filters = upstream_filter_match(target, table_columns)
 
+            # Datatypes for casting varchar temp columns to proper types in JOIN
+            target_datatypes = {
+                col: typ
+                for col, typ, _, _ in self.__db_helper.get_table_datatypes(
+                    table_name(target), schema_name(target), self.__source_conn
+                )
+            }
+
             # First query the already subsetted table in the destination DB
             # Extract out the information needed and apply the needed filters
             fetch_row_count = 100000
@@ -255,8 +263,12 @@ class Subset:
 
                 join_conditions = " AND ".join(
                     [
-                        '{}.{} = "{}".col{}'.format(
-                            fully_qualified_table(target), quoter(col), id_temp, i
+                        '{}.{} = "{}".col{}::{}'.format(
+                            fully_qualified_table(target),
+                            quoter(col),
+                            id_temp,
+                            i,
+                            target_datatypes[col],
                         )
                         for i, col in enumerate(kc["target_columns"])
                     ]
@@ -273,6 +285,7 @@ class Subset:
                     )
                 if config_reader.get_max_rows_per_table() is not None:
                     q += " LIMIT {}".format(config_reader.get_max_rows_per_table())
+                print(q)
                 self.__db_helper.copy_rows(
                     self.__source_conn, self.__destination_conn, q, target
                 )
@@ -327,6 +340,14 @@ class Subset:
 
         columns_query = columns_to_copy(table, relationships, self.__source_conn)
 
+        # Datatypes for casting varchar temp columns to proper types in JOIN
+        downstream_datatypes = {
+            col: typ
+            for col, typ, _, _ in self.__db_helper.get_table_datatypes(
+                table_name(table), schema_name(table), self.__source_conn
+            )
+        }
+
         # Stream IDs from destination temp table into a source temp table,
         # then do a single JOIN query instead of N large IN-clause queries
         src_id_temp = self.__db_helper.create_id_temp_table(
@@ -359,8 +380,12 @@ class Subset:
 
         join_conditions = " AND ".join(
             [
-                '{}.{} = "{}".col{}'.format(
-                    fully_qualified_table(table), quoter(col), src_id_temp, i
+                '{}.{} = "{}".col{}::{}'.format(
+                    fully_qualified_table(table),
+                    quoter(col),
+                    src_id_temp,
+                    i,
+                    downstream_datatypes[col],
                 )
                 for i, col in enumerate(pk_columns)
             ]

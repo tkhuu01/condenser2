@@ -40,7 +40,6 @@ def copy_rows(source, destination, query, destination_table):
         (dt[0], dt[1]) for _, dt in enumerate(datatypes) if dt[2] != "s"
     ]
     generated_columns_positions = {i for i, dt in enumerate(datatypes) if "s" in dt[2]}
-    print(generated_columns_positions)
     always_generated_id = any([dt[3] == "a" for dt in datatypes])
 
     def template_piece(dt):
@@ -122,7 +121,7 @@ def source_db_temp_table(target_table):
     return "tonic_subset_" + schema_name(target_table) + "_" + table_name(target_table)
 
 
-def create_id_temp_table(conn, number_of_columns):
+def create_id_temp_table(conn, number_of_columns: int) -> str:
     table_name = "tonic_subset_" + str(uuid.uuid4())
     column_defs = ",\n".join(
         ["    col" + str(aye) + "  varchar" for aye in range(number_of_columns)]

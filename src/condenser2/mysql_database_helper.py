@@ -238,6 +238,25 @@ def get_table_count_estimate(table_name, schema, conn):
         cur.close()
 
 
+def get_table_datatypes(table, schema, conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name, data_type, generation_expression, extra
+              FROM information_schema.columns
+             WHERE table_schema = '{}'
+               AND table_name = '{}'
+             ORDER BY ordinal_position
+            """.format(schema, table)
+        )
+        results = []
+        for r in cur.fetchall():
+            generated = "s" if r[2] else ""
+            identity = "a" if "auto_increment" in (r[3] or "") else ""
+            results.append((r[0], r[1], generated, identity))
+        return results
+
+
 def get_table_columns(table, schema, conn):
     cur = conn.cursor()
     try:
