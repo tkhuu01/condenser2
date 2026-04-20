@@ -1,5 +1,6 @@
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from condenser2 import config_reader, database_helper
 from condenser2.db_connect import DbConnect
@@ -102,20 +103,11 @@ class Subset:
                 processed_tables.add(t)
         print("Greedy subsettings completed in {}s".format(time.time() - start_time))
 
-        # process pass-through tables, you need this before subset_downstream, so you can get all required downstream rows
-        print("Beginning pass-through tables: " + str(passthrough_tables))
+        # process pass-through tables concurrently, you need this before subset_downstream,
+        # so you can get all required downstream rows
+        print("Beginning pass-through tables (concurrent): " + str(passthrough_tables))
         start_time = time.time()
-        for idx, t in enumerate(passthrough_tables):
-            print_progress(t, idx + 1, len(passthrough_tables))
-            q = "SELECT * FROM {}".format(fully_qualified_table(t))
-            if config_reader.get_max_rows_per_table() is not None:
-                q += "LIMIT {}".format(config_reader.get_max_rows_per_table())
-            self.__db_helper.copy_rows(
-                self.__source_conn,
-                self.__destination_conn,
-                q,
-                mysql_db_name_hack(t, self.__destination_conn),
-            )
+        self.__copy_tables_concurrent(passthrough_tables)
         print("Pass-through completed in {}s".format(time.time() - start_time))
 
         # use subset_downstream to get all supporting rows according to existing needs
@@ -158,6 +150,28 @@ class Subset:
     def close_connections(self):
         self.__source_conn.close()
         self.__destination_conn.close()
+
+    def __copy_table_worker(self, table):
+        try:
+            q = "SELECT * FROM {}".format(fully_qualified_table(table))
+            if config_reader.get_max_rows_per_table() is not None:
+                q += " LIMIT {}".format(config_reader.get_max_rows_per_table())
+            self.__db_helper.copy_rows(
+                self.__source_conn, self.__destination_conn, q, mysql_db_name_hack(table, self.__destination_conn)
+            )
+        finally:
+            self.close_connections()
+
+    def __copy_tables_concurrent(self, tables, max_workers=4):
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(self.__copy_table_worker, t): t
+                for t in tables
+            }
+            for idx, future in enumerate(as_completed(futures)):
+                table = futures[future]
+                print_progress(table, idx + 1, len(tables))
+                future.result()  # raises if the worker failed
 
     def __subset_direct(self, target, relationships):
         t = target["table"]
