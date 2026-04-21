@@ -17,6 +17,7 @@ subset = "condenser2.direct_subset:main"
 
 [dependency-groups]
 dev = [
+    "pytest>=8",
     "ruff>=0.14.3",
 ]
 

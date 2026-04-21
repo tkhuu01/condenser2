@@ -1,0 +1,30 @@
+{
+    "db_type": "postgres",
+    "source_db_connection_info": {
+        "user_name": "test",
+        "password": "test",
+        "host": "localhost",
+        "db_name": "condenser_test_source",
+        "port": "5432"
+    },
+    "destination_db_connection_info": {
+        "user_name": "test",
+        "password": "test",
+        "host": "localhost",
+        "db_name": "condenser_test_dest",
+        "port": "5432"
+    },
+    "initial_targets": [
+        {"table": "sales.customers", "where": "created_at >= '2025-01-01'"}
+    ],
+    "passthrough_tables": ["public.regions"],
+    "excluded_tables": [],
+    "dependency_breaks": [
+        {"fk_table": "sales.customers", "target_table": "sales.orders"}
+    ],
+    "fk_augmentation": [],
+    "upstream_filters": [],
+    "keep_disconnected_tables": true,
+    "pre_constraint_sql": [],
+    "post_subset_sql": []
+}
