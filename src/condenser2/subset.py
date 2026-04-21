@@ -154,6 +154,10 @@ class Subset:
     def unprep_temp_dbs(self):
         self.__db_helper.unprep_temp_dbs(self.__source_conn, self.__destination_conn)
 
+    def close_connections(self):
+        self.__source_conn.close()
+        self.__destination_conn.close()
+
     def __subset_direct(self, target, relationships):
         t = target["table"]
         columns_query = columns_to_copy(t, relationships, self.__source_conn)
