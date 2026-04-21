@@ -75,8 +75,10 @@ def compute_downstream_tables(passthrough_tables, disconnected_tables, order):
         reversed(
             list(
                 filter(
-                    lambda table: table not in passthrough_tables
-                    and table not in disconnected_tables,
+                    lambda table: (
+                        table not in passthrough_tables
+                        and table not in disconnected_tables
+                    ),
                     downstream_tables,
                 )
             )

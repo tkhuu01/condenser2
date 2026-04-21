@@ -191,8 +191,9 @@ class Subset:
         redacted_relationships = redact_relationships(relationships)
         relevant_key_constraints = list(
             filter(
-                lambda r: r["target_table"] in processed_tables
-                and r["fk_table"] == target,
+                lambda r: (
+                    r["target_table"] in processed_tables and r["fk_table"] == target
+                ),
                 redacted_relationships,
             )
         )
