@@ -1,3 +1,4 @@
+import argparse
 import sys
 import time
 
@@ -20,17 +21,47 @@ def db_creator(
         raise ValueError("unknown db_type " + db_type)
 
 
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Condenser2 database subsetter")
+    parser.add_argument(
+        "--stdin", action="store_true", help="Read config from stdin"
+    )
+    parser.add_argument(
+        "-y", "--yes", action="store_true", help="Skip destination confirmation prompt"
+    )
+    parser.add_argument(
+        "--no-constraints", action="store_true", help="Skip adding constraints"
+    )
+    return parser.parse_args()
+
+
+def _confirm_destination(dest_info):
+    print(
+        f"\nDestination: {dest_info.host}:{dest_info.port}/{dest_info.db_name}"
+        f" (user: {dest_info.user_name})"
+    )
+    response = input("Proceed with subsetting into this destination? [y/N] ")
+    if response.lower() not in ("y", "yes"):
+        print("Aborted.")
+        sys.exit(1)
+
+
 def main():
-    if "--stdin" in sys.argv:
+    args = _parse_args()
+
+    if args.stdin:
         config_reader.initialize(sys.stdin)
     else:
         config_reader.initialize()
 
     db_type = config_reader.get_db_type()
     source_dbc = DbConnect(db_type, config_reader.get_source_db_connection_info())
-    destination_dbc = DbConnect(
-        db_type, config_reader.get_destination_db_connection_info()
-    )
+
+    dest_info = config_reader.get_destination_db_connection_info()
+    if not args.yes:
+        _confirm_destination(dest_info)
+
+    destination_dbc = DbConnect(db_type, dest_info)
 
     database = db_creator(db_type, source_dbc, destination_dbc)
     database.teardown()
@@ -57,7 +88,7 @@ def main():
         )
 
         print("Adding database constraints")
-        if "--no-constraints" not in sys.argv:
+        if not args.no_constraints:
             database.add_constraints()
 
         print("Beginning post subset SQL calls")

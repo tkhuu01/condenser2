@@ -296,7 +296,6 @@ class Subset:
                     )
                 if config_reader.get_max_rows_per_table() is not None:
                     q += " LIMIT {}".format(config_reader.get_max_rows_per_table())
-                print(q)
                 self.__db_helper.copy_rows(
                     self.__source_conn, self.__destination_conn, q, target
                 )
