@@ -6,8 +6,3 @@ services:
       POSTGRES_PASSWORD: test
     ports:
       - "5432:5432"
-    healthcheck:
-      test: pg_isready -U test
-      interval: 10s
-      timeout: 5s
-      retries: 5
