@@ -154,6 +154,10 @@ class Subset:
     def unprep_temp_dbs(self):
         self.__db_helper.unprep_temp_dbs(self.__source_conn, self.__destination_conn)
 
+    def close_connections(self):
+        self.__source_conn.close()
+        self.__destination_conn.close()
+
     def __subset_direct(self, target, relationships):
         t = target["table"]
         columns_query = columns_to_copy(t, relationships, self.__source_conn)
@@ -191,8 +195,9 @@ class Subset:
         redacted_relationships = redact_relationships(relationships)
         relevant_key_constraints = list(
             filter(
-                lambda r: r["target_table"] in processed_tables
-                and r["fk_table"] == target,
+                lambda r: (
+                    r["target_table"] in processed_tables and r["fk_table"] == target
+                ),
                 redacted_relationships,
             )
         )
@@ -235,14 +240,18 @@ class Subset:
                     if len(ids) == 0:
                         break
                     ids_to_query = ",".join(ids)
-                    q = "SELECT * FROM {} WHERE {} IN ({}) AND {}".format(
+                    q = "SELECT * FROM {} WHERE {} IN ({})".format(
                         fully_qualified_table(target),
                         columns_tupled(kc["target_columns"]),
                         ids_to_query,
-                        " AND ".join(upstream_filters),
                     )
+
+                    if upstream_filters:
+                        q += " AND {}".format(
+                            " AND ".join(upstream_filters),
+                        )
                     if config_reader.get_max_rows_per_table() is not None:
-                        q = (q + " LIMIT {}").format(
+                        q += (" LIMIT {}").format(
                             config_reader.get_max_rows_per_table()
                         )
                     self.__db_helper.copy_rows(
