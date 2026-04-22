@@ -1,5 +1,6 @@
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from condenser2 import config_reader, database_helper
 from condenser2.db_connect import DbConnect
@@ -13,6 +14,7 @@ from condenser2.subset_utils import (
     fully_qualified_table,
     mysql_db_name_hack,
     print_progress,
+    quoter,
     redact_relationships,
     schema_name,
     table_name,
@@ -101,20 +103,11 @@ class Subset:
                 processed_tables.add(t)
         print("Greedy subsettings completed in {}s".format(time.time() - start_time))
 
-        # process pass-through tables, you need this before subset_downstream, so you can get all required downstream rows
-        print("Beginning pass-through tables: " + str(passthrough_tables))
+        # process pass-through tables concurrently, you need this before subset_downstream,
+        # so you can get all required downstream rows
+        print("Beginning pass-through tables (concurrent): " + str(passthrough_tables))
         start_time = time.time()
-        for idx, t in enumerate(passthrough_tables):
-            print_progress(t, idx + 1, len(passthrough_tables))
-            q = "SELECT * FROM {}".format(fully_qualified_table(t))
-            if config_reader.get_max_rows_per_table() is not None:
-                q += "LIMIT {}".format(config_reader.get_max_rows_per_table())
-            self.__db_helper.copy_rows(
-                self.__source_conn,
-                self.__destination_conn,
-                q,
-                mysql_db_name_hack(t, self.__destination_conn),
-            )
+        self.__copy_tables_concurrent(passthrough_tables)
         print("Pass-through completed in {}s".format(time.time() - start_time))
 
         # use subset_downstream to get all supporting rows according to existing needs
@@ -157,6 +150,25 @@ class Subset:
     def close_connections(self):
         self.__source_conn.close()
         self.__destination_conn.close()
+
+    def __copy_table_worker(self, table):
+        q = "SELECT * FROM {}".format(fully_qualified_table(table))
+        if config_reader.get_max_rows_per_table() is not None:
+            q += " LIMIT {}".format(config_reader.get_max_rows_per_table())
+        self.__db_helper.copy_rows(
+            self.__source_conn,
+            self.__destination_conn,
+            q,
+            mysql_db_name_hack(table, self.__destination_conn),
+        )
+
+    def __copy_tables_concurrent(self, tables, max_workers=4):
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(self.__copy_table_worker, t): t for t in tables}
+            for idx, future in enumerate(as_completed(futures)):
+                table = futures[future]
+                print_progress(table, idx + 1, len(tables))
+                future.result()  # raises if the worker failed
 
     def __subset_direct(self, target, relationships):
         t = target["table"]
@@ -217,8 +229,17 @@ class Subset:
             # Additional filters to apply upstream
             upstream_filters = upstream_filter_match(target, table_columns)
 
+            # Datatypes for casting varchar temp columns to proper types in JOIN
+            target_datatypes = {
+                col: typ
+                for col, typ, _, _ in self.__db_helper.get_table_datatypes(
+                    table_name(target), schema_name(target), self.__source_conn
+                )
+            }
+
             # First query the already subsetted table in the destination DB
             # Extract out the information needed and apply the needed filters
+            fetch_row_count = 100000
             for kc in relevant_key_constraints:
                 qualified_table = fully_qualified_table(
                     mysql_db_name_hack(kc["target_table"], self.__destination_conn)
@@ -226,37 +247,59 @@ class Subset:
                 query = "SELECT {} FROM {}".format(
                     columns_joined(kc["target_columns"]), qualified_table
                 )
-                dest_cursor.execute(query)
-                fetch_row_count = 100000
-                while True:
-                    rows = dest_cursor.fetchmany(fetch_row_count)
-                    if len(rows) == 0:
-                        break
-                    ids = [
-                        "(" + ",".join(["'" + str(c) + "'" for c in row]) + ")"
-                        for row in rows
-                        if all([c is not None for c in row])
-                    ]
-                    if len(ids) == 0:
-                        break
-                    ids_to_query = ",".join(ids)
-                    q = "SELECT * FROM {} WHERE {} IN ({})".format(
-                        fully_qualified_table(target),
-                        columns_tupled(kc["target_columns"]),
-                        ids_to_query,
-                    )
 
-                    if upstream_filters:
-                        q += " AND {}".format(
-                            " AND ".join(upstream_filters),
+                # Stream FK values from destination into a temp table on source,
+                # then do a single JOIN query instead of N large IN-clause queries
+                id_temp = self.__db_helper.create_id_temp_table(
+                    self.__source_conn, len(kc["target_columns"])
+                )
+                insert_q = 'INSERT INTO "{}" VALUES ({})'.format(
+                    id_temp, ",".join(["%s"] * len(kc["target_columns"]))
+                )
+                src_insert_cur = self.__source_conn.cursor()
+                try:
+                    dest_cursor.execute(query)
+                    while True:
+                        rows = dest_cursor.fetchmany(fetch_row_count)
+                        if not rows:
+                            break
+                        valid_rows = [
+                            row for row in rows if all(c is not None for c in row)
+                        ]
+                        if valid_rows:
+                            src_insert_cur.executemany(insert_q, valid_rows)
+                    self.__source_conn.commit()
+                finally:
+                    src_insert_cur.close()
+
+                join_conditions = " AND ".join(
+                    [
+                        '{}.{} = "{}".col{}::{}'.format(
+                            fully_qualified_table(target),
+                            quoter(col),
+                            id_temp,
+                            i,
+                            target_datatypes[col],
                         )
-                    if config_reader.get_max_rows_per_table() is not None:
-                        q += (" LIMIT {}").format(
-                            config_reader.get_max_rows_per_table()
-                        )
-                    self.__db_helper.copy_rows(
-                        self.__source_conn, self.__destination_conn, q, target
+                        for i, col in enumerate(kc["target_columns"])
+                    ]
+                )
+                q = 'SELECT {}.* FROM {} JOIN "{}" ON {}'.format(
+                    fully_qualified_table(target),
+                    fully_qualified_table(target),
+                    id_temp,
+                    join_conditions,
+                )
+                if upstream_filters:
+                    q += " AND {}".format(
+                        " AND ".join(upstream_filters),
                     )
+                if config_reader.get_max_rows_per_table() is not None:
+                    q += " LIMIT {}".format(config_reader.get_max_rows_per_table())
+                print(q)
+                self.__db_helper.copy_rows(
+                    self.__source_conn, self.__destination_conn, q, target
+                )
         finally:
             dest_cursor.close()
 
@@ -308,39 +351,65 @@ class Subset:
 
         columns_query = columns_to_copy(table, relationships, self.__source_conn)
 
+        # Datatypes for casting varchar temp columns to proper types in JOIN
+        downstream_datatypes = {
+            col: typ
+            for col, typ, _, _ in self.__db_helper.get_table_datatypes(
+                table_name(table), schema_name(table), self.__source_conn
+            )
+        }
+
+        # Stream IDs from destination temp table into a source temp table,
+        # then do a single JOIN query instead of N large IN-clause queries
+        src_id_temp = self.__db_helper.create_id_temp_table(
+            self.__source_conn, len(pk_columns)
+        )
+        insert_q = 'INSERT INTO "{}" VALUES ({})'.format(
+            src_id_temp, ",".join(["%s"] * len(pk_columns))
+        )
+
         cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
         cursor = self.__destination_conn.cursor(name=cursor_name, withhold=True)
-        cursor_query = "SELECT DISTINCT * FROM {}".format(
-            fully_qualified_table(temp_table)
-        )
-        cursor.execute(cursor_query)
-        fetch_row_count = 100000
-        while True:
-            rows = cursor.fetchmany(fetch_row_count)
-            if len(rows) == 0:
-                break
+        src_insert_cur = self.__source_conn.cursor()
+        try:
+            cursor_query = "SELECT DISTINCT * FROM {}".format(
+                fully_qualified_table(temp_table)
+            )
+            cursor.execute(cursor_query)
+            fetch_row_count = 100000
+            while True:
+                rows = cursor.fetchmany(fetch_row_count)
+                if not rows:
+                    break
+                valid_rows = [row for row in rows if all(c is not None for c in row)]
+                if valid_rows:
+                    src_insert_cur.executemany(insert_q, valid_rows)
+            self.__source_conn.commit()
+        finally:
+            src_insert_cur.close()
+            cursor.close()
 
-            ids = [
-                "(" + ",".join(["'" + str(c) + "'" for c in row]) + ")"
-                for row in rows
-                if all([c is not None for c in row])
+        join_conditions = " AND ".join(
+            [
+                '{}.{} = "{}".col{}::{}'.format(
+                    fully_qualified_table(table),
+                    quoter(col),
+                    src_id_temp,
+                    i,
+                    downstream_datatypes[col],
+                )
+                for i, col in enumerate(pk_columns)
             ]
-
-            if len(ids) == 0:
-                break
-
-            ids_to_query = ",".join(ids)
-            q = "SELECT {} FROM {} WHERE {} IN ({})".format(
-                columns_query,
-                fully_qualified_table(table),
-                columns_tupled(pk_columns),
-                ids_to_query,
-            )
-            self.__db_helper.copy_rows(
-                self.__source_conn,
-                self.__destination_conn,
-                q,
-                mysql_db_name_hack(table, self.__destination_conn),
-            )
-
-        cursor.close()
+        )
+        q = 'SELECT {} FROM {} JOIN "{}" ON {}'.format(
+            columns_query,
+            fully_qualified_table(table),
+            src_id_temp,
+            join_conditions,
+        )
+        self.__db_helper.copy_rows(
+            self.__source_conn,
+            self.__destination_conn,
+            q,
+            mysql_db_name_hack(table, self.__destination_conn),
+        )

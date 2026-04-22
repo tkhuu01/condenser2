@@ -81,8 +81,12 @@ def main():
             # )
 
         result_tabulator.tabulate(source_dbc, destination_dbc, all_tables)
+    except KeyboardInterrupt:
+        print("\nInterrupted — closing connections...")
+        raise
     finally:
         subsetter.unprep_temp_dbs()
+        subsetter.close_connections()
 
 
 if __name__ == "__main__":

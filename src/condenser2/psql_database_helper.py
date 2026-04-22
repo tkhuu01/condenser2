@@ -39,7 +39,7 @@ def copy_rows(source, destination, query, destination_table):
     non_generated_columns = [
         (dt[0], dt[1]) for _, dt in enumerate(datatypes) if dt[2] != "s"
     ]
-    generated_columns_positions = [i for i, dt in enumerate(datatypes) if "s" in dt[2]]
+    generated_columns_positions = {i for i, dt in enumerate(datatypes) if "s" in dt[2]}
     always_generated_id = any([dt[3] == "a" for dt in datatypes])
 
     def template_piece(dt):
@@ -76,11 +76,11 @@ def copy_rows(source, destination, query, destination_table):
 
     cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
     cursor = source.cursor(name=cursor_name)
+    # using the inner_cursor means we don't log all the noise
+    destination_cursor = destination.cursor().inner_cursor
     try:
         cursor.execute(query)
 
-        # using the inner_cursor means we don't log all the noise
-        destination_cursor = destination.cursor().inner_cursor
         insert_query = "INSERT INTO {} {} VALUES {}".format(
             fully_qualified_table(destination_table), columns, template
         )
@@ -111,8 +111,8 @@ def copy_rows(source, destination, query, destination_table):
 
             destination_cursor.executemany(insert_query, updated_rows)
 
-        destination_cursor.close()
     finally:
+        destination_cursor.close()
         cursor.close()
         destination.commit()
 
@@ -121,15 +121,14 @@ def source_db_temp_table(target_table):
     return "tonic_subset_" + schema_name(target_table) + "_" + table_name(target_table)
 
 
-def create_id_temp_table(conn, number_of_columns):
+def create_id_temp_table(conn, number_of_columns: int) -> str:
     table_name = "tonic_subset_" + str(uuid.uuid4())
-    cursor = conn.cursor()
     column_defs = ",\n".join(
         ["    col" + str(aye) + "  varchar" for aye in range(number_of_columns)]
     )
     q = 'CREATE TEMPORARY TABLE "{}" (\n {} \n)'.format(table_name, column_defs)
-    cursor.execute(q)
-    cursor.close()
+    with conn.cursor() as cursor:
+        cursor.execute(q)
     return table_name
 
 
@@ -177,8 +176,6 @@ def get_redacted_table_references(table_name, tables, conn):
 
 
 def get_unredacted_fk_relationships(tables, conn):
-    cur = conn.cursor()
-
     q = """
         SELECT fk_nsp.nspname || '.' || fk_table AS fk_table,
         array_agg(fk_att.attname ORDER BY fk_att.attnum) AS fk_columns,
@@ -204,31 +201,30 @@ def get_unredacted_fk_relationships(tables, conn):
         JOIN pg_class tar ON con.confrelid = tar.oid
         WHERE con.contype = 'f'
     ) sub
-    JOIN pg_attribute fk_att 
+    JOIN pg_attribute fk_att
       ON fk_att.attrelid = fk_table_id AND fk_att.attnum = fk_column_id
-    JOIN pg_attribute tar_att 
+    JOIN pg_attribute tar_att
       ON tar_att.attrelid = target_table_id AND tar_att.attnum = target_column_id
-    JOIN pg_namespace fk_nsp 
+    JOIN pg_namespace fk_nsp
       ON fk_schema_id = fk_nsp.oid
     JOIN pg_namespace tar_nsp
       ON target_schema_id = tar_nsp.oid
     GROUP BY 1, 3, sub.constraint_nsp, sub.constraint_name;
     """
 
-    cur.execute(q)
-
     relationships = list()
 
-    for row in cur.fetchall():
-        d = dict()
-        d["fk_table"] = row[0]
-        d["fk_columns"] = row[1]
-        d["target_table"] = row[2]
-        d["target_columns"] = row[3]
+    with conn.cursor() as cur:
+        cur.execute(q)
+        for row in cur.fetchall():
+            d = dict()
+            d["fk_table"] = row[0]
+            d["fk_columns"] = row[1]
+            d["target_table"] = row[2]
+            d["target_columns"] = row[3]
 
-        if d["fk_table"] in tables and d["target_table"] in tables:
-            relationships.append(d)
-    cur.close()
+            if d["fk_table"] in tables and d["target_table"] in tables:
+                relationships.append(d)
 
     for augment in config_reader.get_fk_augmentation():
         not_present = True
@@ -292,7 +288,7 @@ def update_sequence_numbering(conn: PsqlConnection, tables: list[str]):
                     tbl_id=sql.Identifier(schema_, table_),
                 )
                 cur.execute(seq_update_query)
-    conn.commit()
+        conn.commit()
 
 
 def get_table_count_estimate(table_name, schema, conn):
