@@ -1,7 +1,7 @@
 import uuid
 
 from psycopg import sql
-from psycopg.types.json import set_json_loads
+from psycopg.types.json import Json, set_json_loads
 
 from condenser2 import config_reader
 from condenser2.db_connect import PsqlConnection
@@ -55,6 +55,25 @@ def copy_rows(source, destination, query, destination_table):
     )
     columns = '("' + '","'.join([dt[0] for dt in non_generated_columns]) + '")'
 
+    json_positions = {
+        i for i, dt in enumerate(non_generated_columns) if dt[1] in ("json", "jsonb")
+    }
+
+    def _adapt_json(val):
+        if val is None:
+            return None
+        if isinstance(val, bytes):
+            val = val.decode("utf-8")
+        return Json(val)
+
+    def _adapt_row(row):
+        if json_positions:
+            return tuple(
+                _adapt_json(val) if i in json_positions else val
+                for i, val in enumerate(row)
+            )
+        return row
+
     cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
     cursor = source.cursor(name=cursor_name)
     try:
@@ -73,17 +92,19 @@ def copy_rows(source, destination, query, destination_table):
         fetch_row_count = 100000
         while True:
             rows = cursor.fetchmany(fetch_row_count)
-            if len(rows) == 0:
+            if not rows:
                 break
 
-            updated_rows = [
-                tuple(
-                    val
-                    for i, val in enumerate(row)
-                    if i not in generated_columns_positions
+            if generated_columns_positions:
+                updated_rows = (
+                    _adapt_row(tuple(
+                        val for i, val in enumerate(row)
+                        if i not in generated_columns_positions
+                    ))
+                    for row in rows
                 )
-                for row in rows
-            ]
+            else:
+                updated_rows = (_adapt_row(row) for row in rows)
 
             destination_cursor.executemany(insert_query, updated_rows)
 
@@ -256,14 +277,16 @@ def update_sequence_numbering(conn: PsqlConnection, tables: list[str]):
             for col in cols:
                 seq_update_query = sql.SQL("""
                     SELECT setval(
-                        pg_get_serial_sequence({tbl}, {col}),
-                        COALESCE(MAX({col}), 0) + 1,
+                        pg_get_serial_sequence({tbl_lit}, {col_lit}),
+                        COALESCE(MAX({col_id}), 0) + 1,
                         false
                     )
-                    FROM {tbl}
+                    FROM {tbl_id}
                 """).format(
-                    col=sql.Identifier(col),
-                    tbl=sql.Identifier(schema_, table_),
+                    tbl_lit=sql.Literal(schema_ + "." + table_),
+                    col_lit=sql.Literal(col),
+                    col_id=sql.Identifier(col),
+                    tbl_id=sql.Identifier(schema_, table_),
                 )
                 cur.execute(seq_update_query)
     conn.commit()

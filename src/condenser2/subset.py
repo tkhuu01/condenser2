@@ -240,14 +240,18 @@ class Subset:
                     if len(ids) == 0:
                         break
                     ids_to_query = ",".join(ids)
-                    q = "SELECT * FROM {} WHERE {} IN ({}) AND {}".format(
+                    q = "SELECT * FROM {} WHERE {} IN ({})".format(
                         fully_qualified_table(target),
                         columns_tupled(kc["target_columns"]),
-                        ids_to_query,
-                        " AND ".join(upstream_filters),
+                        ids_to_query
                     )
+
+                    if upstream_filters:
+                        q += " AND {}".format(
+                            " AND ".join(upstream_filters),
+                        )
                     if config_reader.get_max_rows_per_table() is not None:
-                        q = (q + " LIMIT {}").format(
+                        q += (" LIMIT {}").format(
                             config_reader.get_max_rows_per_table()
                         )
                     self.__db_helper.copy_rows(
