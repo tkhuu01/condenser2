@@ -243,7 +243,7 @@ class Subset:
                     q = "SELECT * FROM {} WHERE {} IN ({})".format(
                         fully_qualified_table(target),
                         columns_tupled(kc["target_columns"]),
-                        ids_to_query
+                        ids_to_query,
                     )
 
                     if upstream_filters:

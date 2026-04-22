@@ -97,10 +97,13 @@ def copy_rows(source, destination, query, destination_table):
 
             if generated_columns_positions:
                 updated_rows = (
-                    _adapt_row(tuple(
-                        val for i, val in enumerate(row)
-                        if i not in generated_columns_positions
-                    ))
+                    _adapt_row(
+                        tuple(
+                            val
+                            for i, val in enumerate(row)
+                            if i not in generated_columns_positions
+                        )
+                    )
                     for row in rows
                 )
             else:
