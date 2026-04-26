@@ -259,12 +259,9 @@ class Subset:
 
                     cols = kc["target_columns"]
                     unnest_args = ", ".join(
-                        "%s::{}[]".format(target_datatypes[col])
-                        for col in cols
+                        "%s::{}[]".format(target_datatypes[col]) for col in cols
                     )
-                    join_cols = ", ".join(
-                        "col{}".format(i) for i in range(len(cols))
-                    )
+                    join_cols = ", ".join("col{}".format(i) for i in range(len(cols)))
                     join_conditions = " AND ".join(
                         "{}.{} = ids.col{}".format(
                             fully_qualified_table(target), quoter(col), i
@@ -288,13 +285,9 @@ class Subset:
                     if config_reader.get_max_rows_per_table() is not None:
                         q += " LIMIT {}".format(config_reader.get_max_rows_per_table())
 
-                    params = [
-                        [row[i] for row in valid_rows]
-                        for i in range(len(cols))
-                    ]
+                    params = [[row[i] for row in valid_rows] for i in range(len(cols))]
                     self.__db_helper.copy_rows(
-                        self.__source_conn, self.__destination_conn,
-                        q, target, params
+                        self.__source_conn, self.__destination_conn, q, target, params
                     )
         finally:
             dest_cursor.close()
@@ -372,12 +365,9 @@ class Subset:
                     continue
 
                 unnest_args = ", ".join(
-                    "%s::{}[]".format(downstream_datatypes[col])
-                    for col in pk_columns
+                    "%s::{}[]".format(downstream_datatypes[col]) for col in pk_columns
                 )
-                join_cols = ", ".join(
-                    "col{}".format(i) for i in range(len(pk_columns))
-                )
+                join_cols = ", ".join("col{}".format(i) for i in range(len(pk_columns)))
                 join_conditions = " AND ".join(
                     "{}.{} = ids.col{}".format(
                         fully_qualified_table(table), quoter(col), i
@@ -397,8 +387,7 @@ class Subset:
                 )
 
                 params = [
-                    [row[i] for row in valid_rows]
-                    for i in range(len(pk_columns))
+                    [row[i] for row in valid_rows] for i in range(len(pk_columns))
                 ]
                 self.__db_helper.copy_rows(
                     self.__source_conn,

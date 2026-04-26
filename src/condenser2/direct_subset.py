@@ -23,9 +23,7 @@ def db_creator(
 
 def _parse_args():
     parser = argparse.ArgumentParser(description="Condenser2 database subsetter")
-    parser.add_argument(
-        "--stdin", action="store_true", help="Read config from stdin"
-    )
+    parser.add_argument("--stdin", action="store_true", help="Read config from stdin")
     parser.add_argument(
         "-y", "--yes", action="store_true", help="Skip destination confirmation prompt"
     )
