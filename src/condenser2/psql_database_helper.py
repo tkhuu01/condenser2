@@ -31,7 +31,7 @@ def turn_off_constraints(connection):
     pass
 
 
-def copy_rows(source, destination, query, destination_table):
+def copy_rows(source, destination, query, destination_table, params=None):
     datatypes = get_table_datatypes(
         table_name(destination_table), schema_name(destination_table), destination
     )
@@ -79,7 +79,7 @@ def copy_rows(source, destination, query, destination_table):
     # using the inner_cursor means we don't log all the noise
     destination_cursor = destination.cursor().inner_cursor
     try:
-        cursor.execute(query)
+        cursor.execute(query, params)
 
         insert_query = "INSERT INTO {} {} VALUES {}".format(
             fully_qualified_table(destination_table), columns, template

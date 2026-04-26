@@ -48,11 +48,11 @@ def turn_off_constraints(connection):
         cur.close()
 
 
-def copy_rows(source, destination, query, destination_table):
+def copy_rows(source, destination, query, destination_table, params=None):
     cursor = source.cursor()
 
     try:
-        cursor.execute(query)
+        cursor.execute(query, params)
         fetch_row_count = 1000
         while True:
             rows = cursor.fetchmany(fetch_row_count)
