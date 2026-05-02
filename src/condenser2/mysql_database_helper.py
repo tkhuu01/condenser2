@@ -1,6 +1,7 @@
 import uuid
+from dataclasses import asdict
 
-from condenser2 import config_reader
+from condenser2.config_reader import get_config
 from condenser2.db_connect import MySqlConnection
 from condenser2.subset_utils import (
     columns_joined,
@@ -189,7 +190,9 @@ def get_unredacted_fk_relationships(tables, conn):
             relationships.append(d)
     cur.close()
 
-    for augment in config_reader.get_fk_augmentation():
+    config = get_config()
+    for fka in config.fk_augmentation:
+        augment = asdict(fka)
         not_present = True
         for r in relationships:
             not_present = not_present and not all(
@@ -277,7 +280,6 @@ def get_table_columns(table, schema, conn):
 def list_all_tables(db_connect):
     conn = db_connect.get_db_connection()
     cur = conn.cursor()
-    config_reader.get_source_db_connection_info()
     try:
         cur.execute(
             """

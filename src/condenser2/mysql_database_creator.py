@@ -1,6 +1,8 @@
 import os
 import subprocess
 
+from condenser2 import config_reader, db_connect
+
 
 class MySqlDatabaseCreator:
     def __init__(self, source_connect, destination_connect):
@@ -112,15 +114,14 @@ def connection_args(connect):
 
 # This is just for unit testing the creation and tear down processes
 if __name__ == "__main__":
-    import config_reader
-    import db_connect
-
     config_reader.initialize()
+
+    config = config_reader.get_config()
     src_connect = db_connect.DbConnect(
-        config_reader.get_source_db_connection_info(), "mysql"
+        config_reader.DbType.MYSQL, config.source_db_connection_info
     )
     dest_connect = db_connect.DbConnect(
-        config_reader.get_destination_db_connection_info(), "mysql"
+        config_reader.DbType.MYSQL, config.destination_db_connection_info
     )
     msdbc = MySqlDatabaseCreator(src_connect, dest_connect)
     msdbc.teardown()

@@ -2,7 +2,8 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from condenser2 import config_reader, database_helper
+from condenser2 import database_helper
+from condenser2.config_reader import DbType, InitialTarget, get_config
 from condenser2.db_connect import DbConnect
 from condenser2.subset_utils import (
     columns_joined,
@@ -56,6 +57,7 @@ class Subset:
         self.__db_helper = database_helper.get_specific_helper()
 
         self.__db_helper.turn_off_constraints(self.__destination_conn)
+        self.config = get_config()
 
     def run_middle_out(self):
         passthrough_tables = self.__get_passthrough_tables()
@@ -63,7 +65,7 @@ class Subset:
             self.__all_tables, self.__source_conn
         )
         disconnected_tables = compute_disconnected_tables(
-            config_reader.get_initial_target_tables(),
+            self.config.initial_target_tables,
             passthrough_tables,
             self.__all_tables,
             relationships,
@@ -77,19 +79,19 @@ class Subset:
         # start by subsetting the direct targets
         print(
             "Beginning subsetting with these direct targets: "
-            + str(config_reader.get_initial_target_tables())
+            + str(self.config.initial_target_tables)
         )
         start_time = time.time()
         processed_tables = set()
-        for idx, target in enumerate(config_reader.get_initial_targets()):
-            print_progress(target, idx + 1, len(config_reader.get_initial_targets()))
+        for idx, target in enumerate(self.config.initial_targets):
+            print_progress(target, idx + 1, len(self.config.initial_targets))
             self.__subset_direct(target, relationships)
-            processed_tables.add(target["table"])
+            processed_tables.add(target.table)
         print("Direct target tables completed in {}s".format(time.time() - start_time))
 
         # greedily grab rows with foreign keys to rows in the target strata
         upstream_tables = compute_upstream_tables(
-            config_reader.get_initial_target_tables(), order
+            self.config.initial_target_tables, order
         )
         print(
             "Beginning greedy upstream subsetting with these tables: "
@@ -124,7 +126,7 @@ class Subset:
             self.subset_downstream(t, relationships)
         print("Downstream subsetting completed in {}s".format(time.time() - start_time))
 
-        if config_reader.keep_disconnected_tables():
+        if self.config.keep_disconnected_tables:
             # get all the data for tables in disconnected components (i.e. pass those tables through)
             print("Beginning disconnected tables: " + str(disconnected_tables))
             start_time = time.time()
@@ -153,8 +155,8 @@ class Subset:
 
     def __copy_table_worker(self, table):
         q = "SELECT * FROM {}".format(fully_qualified_table(table))
-        if config_reader.get_max_rows_per_table() is not None:
-            q += " LIMIT {}".format(config_reader.get_max_rows_per_table())
+        if self.config.max_rows_per_table is not None:
+            q += " LIMIT {}".format(self.config.max_rows_per_table)
         self.__db_helper.copy_rows(
             self.__source_conn,
             self.__destination_conn,
@@ -170,25 +172,25 @@ class Subset:
                 print_progress(table, idx + 1, len(tables))
                 future.result()  # raises if the worker failed
 
-    def __subset_direct(self, target, relationships):
-        t = target["table"]
+    def __subset_direct(self, target: InitialTarget, relationships):
+        t = target.table
         columns_query = columns_to_copy(t, relationships, self.__source_conn)
-        if "where" in target:
+        if target.where is not None:
             q = "SELECT {} FROM {} WHERE {}".format(
-                columns_query, fully_qualified_table(t), target["where"]
+                columns_query, fully_qualified_table(t), target.where
             )
-        elif "percent" in target:
-            if config_reader.get_db_type() == "postgres":
+        elif target.percent is not None:
+            if self.config.db_type == DbType.POSTGRES:
                 q = "SELECT {} FROM {} WHERE random() < {}".format(
                     columns_query,
                     fully_qualified_table(t),
-                    float(target["percent"]) / 100,
+                    float(target.percent) / 100,
                 )
             else:
                 q = "SELECT {} FROM {} WHERE rand() < {}".format(
                     columns_query,
                     fully_qualified_table(t),
-                    float(target["percent"]) / 100,
+                    float(target.percent) / 100,
                 )
         else:
             raise ValueError(
@@ -282,8 +284,8 @@ class Subset:
                         q += " AND {}".format(
                             " AND ".join(upstream_filters),
                         )
-                    if config_reader.get_max_rows_per_table() is not None:
-                        q += " LIMIT {}".format(config_reader.get_max_rows_per_table())
+                    if self.config.max_rows_per_table is not None:
+                        q += " LIMIT {}".format(self.config.max_rows_per_table)
 
                     params = [[row[i] for row in valid_rows] for i in range(len(cols))]
                     self.__db_helper.copy_rows(
@@ -295,8 +297,7 @@ class Subset:
         return True
 
     def __get_passthrough_tables(self):
-        passthrough_tables = config_reader.get_passthrough_tables()
-        return list(set(passthrough_tables))
+        return list(set(self.config.passthrough_tables))
 
     def subset_downstream(self, table, relationships):
         """

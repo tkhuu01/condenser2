@@ -6,7 +6,7 @@ from datetime import datetime
 import mysql.connector
 import psycopg
 
-from condenser2 import config_reader
+from condenser2.config_reader import DbConnectInfo, DbType
 
 
 class DbConnection:
@@ -21,16 +21,17 @@ class DbConnection:
 
 
 class LoggingCursor:
-    def __init__(self, cursor):
+    def __init__(self, cursor, verbose=False):
         self.inner_cursor = cursor
+        self._verbose = verbose
 
     def execute(self, query, params=None):
         start_time = time.time()
-        if config_reader.verbose_logging():
+        if self._verbose:
             print("Beginning query @ {}:\n\t{}".format(str(datetime.now()), query))
             sys.stdout.flush()
         retval = self.inner_cursor.execute(query, params)
-        if config_reader.verbose_logging():
+        if self._verbose:
             print("\tQuery completed in {}s".format(time.time() - start_time))
             sys.stdout.flush()
         return retval
@@ -42,13 +43,13 @@ class LoggingCursor:
         return self.inner_cursor.__exit__(a, b, c)
 
     def __enter__(self):
-        return LoggingCursor(self.inner_cursor.__enter__())
+        return LoggingCursor(self.inner_cursor.__enter__(), self._verbose)
 
 
 # small wrapper to the connection class that gives us a common interface to the cursor()
 # method across MySQL and Postgres. This one is for Postgres
 class PsqlConnection(DbConnection):
-    def __init__(self, connect, read_repeatable):
+    def __init__(self, connect, read_repeatable, verbose=False):
         connection_args = dict(
             dbname=connect.db_name,
             user=connect.user,
@@ -61,17 +62,20 @@ class PsqlConnection(DbConnection):
             connection_args["sslmode"] = connect.ssl_mode
 
         DbConnection.__init__(self, psycopg.connect(**connection_args))
+        self._verbose = verbose
         if read_repeatable:
             self.connection.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
 
     def cursor(self, name=None, withhold=False):
-        return LoggingCursor(self.connection.cursor(name=name, withhold=withhold))
+        return LoggingCursor(
+            self.connection.cursor(name=name, withhold=withhold), self._verbose
+        )
 
 
 # small wrapper to the connection class that gives us a common interface to the cursor()
 # method across MySQL and Postgres. This one is for MySQL
 class MySqlConnection(DbConnection):
-    def __init__(self, connect, read_repeatable):
+    def __init__(self, connect, read_repeatable, verbose=False):
         DbConnection.__init__(
             self,
             mysql.connector.connect(
@@ -84,46 +88,39 @@ class MySqlConnection(DbConnection):
         )
 
         self.db_name = connect.db_name
+        self._verbose = verbose
 
         if read_repeatable:
             self.connection.start_transaction(isolation_level="REPEATABLE READ")
 
     def cursor(self, name=None, withhold=False):
-        return LoggingCursor(self.connection.cursor())
+        return LoggingCursor(self.connection.cursor(), self._verbose)
 
 
 class DbConnect:
-    def __init__(self, db_type: str, connection_info: dict[str, str]):
-        requiredKeys = ["user_name", "host", "db_name", "port"]
-
-        for r in requiredKeys:
-            if r not in connection_info.keys():
-                raise Exception(
-                    "Missing required key in database connection info: " + r
-                )
-        if "password" not in connection_info.keys():
-            connection_info["password"] = getpass.getpass(
+    def __init__(self, db_type: DbType, connection_info: DbConnectInfo, verbose=False):
+        if connection_info.password is None:
+            connection_info.password = getpass.getpass(
                 "Enter password for {0} on host {1}: ".format(
-                    connection_info["user_name"], connection_info["host"]
+                    connection_info.user_name, connection_info.host
                 )
             )
 
-        self.user = connection_info["user_name"]
-        self.password = connection_info["password"]
-        self.host = connection_info["host"]
-        self.port = connection_info["port"]
-        self.db_name = connection_info["db_name"]
-        self.ssl_mode = (
-            connection_info["ssl_mode"] if "ssl_mode" in connection_info else None
-        )
-        self.__db_type = db_type.lower()
+        self.user = connection_info.user_name
+        self.password = connection_info.password
+        self.host = connection_info.host
+        self.port = connection_info.port
+        self.db_name = connection_info.db_name
+        self.ssl_mode = connection_info.ssl_mode
+        self.__db_type = db_type
+        self._verbose = verbose
 
     def get_db_connection(
         self, read_repeatable=False
     ) -> PsqlConnection | MySqlConnection:
-        if self.__db_type == "postgres":
-            return PsqlConnection(self, read_repeatable)
-        elif self.__db_type == "mysql":
-            return MySqlConnection(self, read_repeatable)
+        if self.__db_type == DbType.POSTGRES:
+            return PsqlConnection(self, read_repeatable, self._verbose)
+        elif self.__db_type == DbType.MYSQL:
+            return MySqlConnection(self, read_repeatable, self._verbose)
         else:
             raise ValueError("unknown db_type " + self.__db_type)

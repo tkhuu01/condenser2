@@ -8,3 +8,7 @@ run = [
     "uv run ruff check --select I --fix src/",
     "uv run ruff check src/"
 ]
+
+[tasks.test]
+description = "Run integration tests"
+run = "uv run pytest tests/ -v"

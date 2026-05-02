@@ -1,8 +1,9 @@
-from condenser2 import config_reader
+from condenser2.config_reader import DbType, get_config
 
 
 def get_specific_helper():
-    if config_reader.get_db_type() == "postgres":
+    config = get_config()
+    if config.db_type == DbType.POSTGRES:
         from condenser2 import psql_database_helper
 
         return psql_database_helper

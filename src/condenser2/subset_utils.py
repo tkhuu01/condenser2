@@ -1,4 +1,5 @@
-from condenser2 import config_reader, database_helper
+from condenser2 import database_helper
+from condenser2.config_reader import DbType, get_config
 from condenser2.db_connect import MySqlConnection
 
 
@@ -6,11 +7,12 @@ from condenser2.db_connect import MySqlConnection
 # breaking a dependency cycle, then it will insert NULLs instead of that table's foreign keys
 # to the downstream dependency that breaks the cycle
 def columns_to_copy(table, relationships, conn):
+    config = get_config()
     target_breaks = set()
-    opportunists = config_reader.get_preserve_fk_opportunistically()
-    for dep_break in config_reader.get_dependency_breaks():
-        if dep_break.fk_table == table and dep_break not in opportunists:
-            target_breaks.add(dep_break.target_table)
+    opportunists = config.preserve_fk_opportunistically
+    for fk_table, target_table in config.dependency_break_set:
+        if fk_table == table and (fk_table, target_table) not in opportunists:
+            target_breaks.add(target_table)
 
     columns_to_null = set()
     for rel in relationships:
@@ -31,18 +33,20 @@ def columns_to_copy(table, relationships, conn):
 
 
 def upstream_filter_match(target, table_columns):
+    config = get_config()
     retval = []
-    filters = config_reader.get_upstream_filters()
+    filters = config.upstream_filters
     for filter in filters:
-        if "table" in filter and target == filter["table"]:
-            retval.append(filter["condition"])
-        if "column" in filter and filter["column"] in table_columns:
-            retval.append(filter["condition"])
+        if filter.table is not None and target == filter.table:
+            retval.append(filter.condition)
+        if filter.column is not None and filter.column in table_columns:
+            retval.append(filter.condition)
     return retval
 
 
 def redact_relationships(relationships):
-    breaks = config_reader.get_dependency_breaks()
+    config = get_config()
+    breaks = config.dependency_break_set
     retval = [
         r for r in relationships if (r["fk_table"], r["target_table"]) not in breaks
     ]
@@ -56,7 +60,7 @@ def find(f, seq):
             return item
 
 
-def compute_upstream_tables(target_tables, order):
+def compute_upstream_tables(target_tables: list[str], order):
     upstream_tables = []
     in_upstream = False
     for strata in order:
@@ -126,7 +130,8 @@ def columns_joined(columns):
 
 
 def quoter(id):
-    q = '"' if config_reader.get_db_type() == "postgres" else "`"
+    config = get_config()
+    q = '"' if config.db_type == DbType.POSTGRES else "`"
     return q + id + q
 
 

@@ -1,9 +1,10 @@
 import uuid
+from dataclasses import asdict
 
 from psycopg import sql
 from psycopg.types.json import Json, set_json_loads
 
-from condenser2 import config_reader
+from condenser2.config_reader import get_config
 from condenser2.db_connect import PsqlConnection
 from condenser2.subset_utils import (
     columns_joined,
@@ -226,7 +227,9 @@ def get_unredacted_fk_relationships(tables, conn):
             if d["fk_table"] in tables and d["target_table"] in tables:
                 relationships.append(d)
 
-    for augment in config_reader.get_fk_augmentation():
+    config = get_config()
+    for fka in config.fk_augmentation:
+        augment = asdict(fka)
         not_present = True
         for r in relationships:
             not_present = not_present and not all(

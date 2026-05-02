@@ -1,4 +1,3 @@
-import collections
 import json
 import sys
 from dataclasses import dataclass, field
@@ -25,15 +24,15 @@ class DbType(str, Enum):
     MYSQL = "mysql"
 
 
-@dataclass(frozen=True)
+@dataclass
 class DbConnectInfo:
     user_name: str
     host: str
     db_name: str
+    port: int
     ssl_mode: str | None = None
     # No password will prompt user
     password: str | None = None
-    port: int = 5432
 
 
 @dataclass
@@ -54,6 +53,7 @@ class UpstreamFilter:
 class DependencyBreak:
     fk_table: str
     target_table: str
+    preserve_fk_opportunistically: bool = False
 
 
 @dataclass
@@ -76,12 +76,17 @@ LOCAL_POSTGRES_HOST = DbConnectInfo(
     port=5432,
 )
 
+LOCAL_MYSQL_HOST = DbConnectInfo(
+    user_name="root", host="localhost", db_name="default_db", password="", port=3306
+)
+
 
 @dataclass
 class Config:
     db_type: DbType
     initial_targets: list[InitialTarget]
     source_db_connection_info: DbConnectInfo
+    destination_db_connection_info: DbConnectInfo
     keep_disconnected_tables: bool = False
     upstream_filters: list[UpstreamFilter] = field(default_factory=list)
     excluded_tables: list[str] = field(default_factory=list)
@@ -91,37 +96,71 @@ class Config:
     max_rows_per_table: int | Literal["ALL"] | None = None
     pre_constraint_sql: list[str] = field(default_factory=list)
     post_subset_sql: list[str] = field(default_factory=list)
-    destination_db_connection_info: DbConnectInfo = LOCAL_POSTGRES_HOST
+
+    @property
+    def dependency_break_set(self) -> set[tuple[str, str]]:
+        return {(b.fk_table, b.target_table) for b in self.dependency_breaks}
+
+    @property
+    def preserve_fk_opportunistically(self) -> set[tuple[str, str]]:
+        return {
+            (b.fk_table, b.target_table)
+            for b in self.dependency_breaks
+            if b.preserve_fk_opportunistically
+        }
+
+    @property
+    def initial_target_tables(self) -> list[str]:
+        return [target.table for target in self.initial_targets]
 
 
-_config: dict = {}
+config: Config | None = None
 
 
 def _raw_dict_to_config(raw_config: dict) -> Config:
     initial_targets = []
     db_type = DbType(raw_config["db_type"].lower())
+
     initial_targets = [
         InitialTarget(**target) for target in raw_config["initial_targets"]
     ]
+    default_localhost = (
+        LOCAL_POSTGRES_HOST if db_type == DbType.POSTGRES else LOCAL_MYSQL_HOST
+    )
     source_db = DbConnectInfo(**raw_config["source_db_connection_info"])
+    dest_db = DbConnectInfo(
+        **raw_config.get("destination_db_connection_info", default_localhost)
+    )
+
     upstream_filters = [
         UpstreamFilter(**table) for table in raw_config.get("upstream_filters", [])
     ]
+
     excluded_tables = [table for table in raw_config.get("excluded_tables", [])]
     passthrough_tables = [table for table in raw_config.get("passthrough_tables", [])]
     dependency_breaks = [
         DependencyBreak(**relation)
         for relation in raw_config.get("dependency_breaks", [])
     ]
-    fk_augmentation = [
-        FkAugmentation(**fka) for fka in raw_config.get("fk_augmentation", [])
-    ]
+    fk_augmentation = []
+    for fka in raw_config.get("fk_augmentation", []):
+        if "fk_schema" in fka:
+            fka = {
+                "fk_table": fka["fk_schema"] + "." + fka["fk_table"],
+                "fk_columns": fka["fk_columns"],
+                "target_table": fka["target_schema"] + "." + fka["target_table"],
+                "target_columns": fka["target_columns"],
+            }
+        fk_augmentation.append(FkAugmentation(**fka))
+
     pre_constraint_sql = [sql for sql in raw_config.get("pre_constraint_sql", [])]
     post_subset_sql = [sql for sql in raw_config.get("post_subset_sql", [])]
+    max_rows_per_table = raw_config.get("max_rows_per_table", None)
     return Config(
         db_type=db_type,
         initial_targets=initial_targets,
         source_db_connection_info=source_db,
+        destination_db_connection_info=dest_db,
         keep_disconnected_tables=bool(
             raw_config.get("keep_disconnected_tables", False)
         ),
@@ -130,117 +169,32 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
         passthrough_tables=passthrough_tables,
         dependency_breaks=dependency_breaks,
         fk_augmentation=fk_augmentation,
+        max_rows_per_table=max_rows_per_table,
         pre_constraint_sql=pre_constraint_sql,
         post_subset_sql=post_subset_sql,
     )
 
 
 def initialize(file_like=None):
-    global _config
-    if _config:
+    global config
+    if config:
         print("WARNING: Attempted to initialize configuration twice.", file=sys.stderr)
 
     if not file_like:
         with open("config.json", "r") as fp:
-            _config = json.load(fp)
+            raw_config = json.load(fp)
     else:
-        _config = json.load(file_like)
+        raw_config = json.load(file_like)
 
-    print(_raw_dict_to_config(_config))
-    # raise Exception()
-
-
-DependencyBreak_ = collections.namedtuple(
-    "DependencyBreak", ["fk_table", "target_table"]
-)
+    config = _raw_dict_to_config(raw_config)
 
 
-def get_dependency_breaks():
-    return set(
-        [
-            DependencyBreak_(b["fk_table"], b["target_table"])
-            for b in _config["dependency_breaks"]
-        ]
-    )
+def get_config() -> Config:
+    if config is None:
+        raise RuntimeError("Config not initialized — call initialize() first")
+    return config
 
 
-def get_preserve_fk_opportunistically():
-    return set(
-        [
-            DependencyBreak_(b["fk_table"], b["target_table"])
-            for b in _config["dependency_breaks"]
-            if "perserve_fk_opportunistically" in b
-            and b["perserve_fk_opportunistically"]
-        ]
-    )
-
-
-def get_initial_targets():
-    return _config["initial_targets"]
-
-
-def get_initial_target_tables():
-    return [target["table"] for target in _config["initial_targets"]]
-
-
-def keep_disconnected_tables():
-    return "keep_disconnected_tables" in _config and bool(
-        _config["keep_disconnected_tables"]
-    )
-
-
-def get_db_type():
-    return _config["db_type"]
-
-
-def get_source_db_connection_info():
-    return _config["source_db_connection_info"]
-
-
-def get_destination_db_connection_info():
-    destination = _config.get("destination_db_connection_info")
-    return destination if destination else LOCAL_POSTGRES_HOST
-
-
-def get_excluded_tables():
-    return list(_config["excluded_tables"])
-
-
-def get_passthrough_tables():
-    return list(_config["passthrough_tables"])
-
-
-def get_fk_augmentation():
-    return list(map(__convert_tonic_format, _config["fk_augmentation"]))
-
-
-def get_upstream_filters():
-    return _config["upstream_filters"]
-
-
-def get_pre_constraint_sql():
-    return _config["pre_constraint_sql"] if "pre_constraint_sql" in _config else []
-
-
-def get_post_subset_sql():
-    return _config["post_subset_sql"] if "post_subset_sql" in _config else []
-
-
-def get_max_rows_per_table():
-    return _config["max_rows_per_table"] if "max_rows_per_table" in _config else None
-
-
-def __convert_tonic_format(obj):
-    if "fk_schema" in obj:
-        return {
-            "fk_table": obj["fk_schema"] + "." + obj["fk_table"],
-            "fk_columns": obj["fk_columns"],
-            "target_table": obj["target_schema"] + "." + obj["target_table"],
-            "target_columns": obj["target_columns"],
-        }
-    else:
-        return obj
-
-
-def verbose_logging():
-    return "-v" in sys.argv
+def reset_config():
+    global config
+    config = None
