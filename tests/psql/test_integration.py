@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -39,28 +40,34 @@ def _query_one(conn, sql):
         return cur.fetchone()[0]
 
 
-@pytest.fixture(scope="module")
-def subsetter_dbs():
+def _run_subsetter(use_temp_tables):
+    suffix = "_temp" if use_temp_tables else ""
+    source_db = SOURCE_DB + suffix
+    dest_db = DEST_DB + suffix
+
     admin = _admin_conn()
     with admin.cursor() as cur:
-        cur.execute(f"DROP DATABASE IF EXISTS {SOURCE_DB}")
-        cur.execute(f"DROP DATABASE IF EXISTS {DEST_DB}")
-        cur.execute(f"CREATE DATABASE {SOURCE_DB}")
-        cur.execute(f"CREATE DATABASE {DEST_DB}")
+        cur.execute(f"DROP DATABASE IF EXISTS {source_db}")
+        cur.execute(f"DROP DATABASE IF EXISTS {dest_db}")
+        cur.execute(f"CREATE DATABASE {source_db}")
+        cur.execute(f"CREATE DATABASE {dest_db}")
     admin.close()
 
-    source_admin = _admin_conn(SOURCE_DB)
+    source_admin = _admin_conn(source_db)
     with source_admin.cursor() as cur:
         cur.execute(SEED_SQL.read_text())
     source_admin.close()
 
-    # Reset config_reader global state and initialize with test config
-    config_reader.reset_config()
     with open(CONFIG_JSON, "r") as fp:
-        config_reader.initialize(fp)
+        raw_config = json.load(fp)
+    raw_config["source_db_connection_info"]["db_name"] = source_db
+    raw_config["destination_db_connection_info"]["db_name"] = dest_db
+    raw_config["use_temp_tables"] = use_temp_tables
+
+    config_reader.reset_config()
+    config_reader.config = config_reader._raw_dict_to_config(raw_config)
 
     config = config_reader.get_config()
-    # Run the full subsetter pipeline
     db_type = config.db_type
     source_dbc = DbConnect(db_type, config.source_db_connection_info)
     destination_dbc = DbConnect(db_type, config.destination_db_connection_info)
@@ -78,13 +85,13 @@ def subsetter_dbs():
         subsetter.prep_temp_dbs()
         subsetter.run_middle_out()
 
-        for sql in config.pre_constraint_sql:
-            db_helper.run_query(sql, destination_dbc.get_db_connection())
+        for sql_stmt in config.pre_constraint_sql:
+            db_helper.run_query(sql_stmt, destination_dbc.get_db_connection())
 
         database.add_constraints()
 
-        for sql in config.post_subset_sql:
-            db_helper.run_query(sql, destination_dbc.get_db_connection())
+        for sql_stmt in config.post_subset_sql:
+            db_helper.run_query(sql_stmt, destination_dbc.get_db_connection())
 
         all_tables_no_pg = [t for t in all_tables if "pgbench" not in t]
         dest_conn = destination_dbc.get_db_connection()
@@ -94,16 +101,27 @@ def subsetter_dbs():
         subsetter.unprep_temp_dbs()
         subsetter.close_connections()
 
-    # Yield connections for assertions
+    return source_db, dest_db
+
+
+@pytest.fixture(
+    scope="module",
+    params=[False, True],
+    ids=["unnest", "temp_tables"],
+)
+def subsetter_dbs(request):
+    use_temp_tables = request.param
+    source_db, dest_db = _run_subsetter(use_temp_tables)
+
     source = psycopg.connect(
-        dbname=SOURCE_DB,
+        dbname=source_db,
         user=DB_USER,
         password=DB_PASSWORD,
         host=DB_HOST,
         port=DB_PORT,
     )
     dest = psycopg.connect(
-        dbname=DEST_DB,
+        dbname=dest_db,
         user=DB_USER,
         password=DB_PASSWORD,
         host=DB_HOST,
@@ -115,10 +133,9 @@ def subsetter_dbs():
     source.close()
     dest.close()
 
-    # Teardown — terminate lingering connections before dropping
     admin = _admin_conn()
     with admin.cursor() as cur:
-        for db in (SOURCE_DB, DEST_DB):
+        for db in (source_db, dest_db):
             cur.execute(
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
                 "WHERE datname = %s AND pid <> pg_backend_pid()",
