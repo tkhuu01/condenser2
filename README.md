@@ -1,8 +1,10 @@
 # Condenser2
 
-Condenser2 is a fork of Tonic's Condenser with additional fixes and features.
+Condenser2 is a modernized fork of Tonic's Condenser with many changes.
 
-* Fixes the upstream subsetting code
+Some of them are:
+
+* Refactors many areas of the subsetting code
 * Adds sequence numbering reset automatically after subsetting
 * Moves the project to astral's uv and to psycopg3
 
@@ -24,13 +26,6 @@ integrity.
 You can find more details about how we built this
 [here](https://www.tonic.ai/blog/condenser-a-database-subsetting-tool) and
 [here](https://www.tonic.ai/blog/condenser-v2/).
-
-## Need to Subset a Large Database?
-
-Our open-source tool can subset databases up to 10GB, but it will struggle with
-larger databases. Our premium database subsetter can, among other things
-(graphical UI, job scheduling, fancy algorithms), subset multi-TB databases
-with ease. If you're interested find us at [hello@tonic.ai](mailto:hello@tonic.ai).
 
 ## Installation
 
