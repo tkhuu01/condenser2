@@ -1,5 +1,5 @@
 [project]
-name = "Database Condenser"
+name = "db-condenser"
 version = "0.1.0"
 description = "db-condenser"
 readme = "README.md"
