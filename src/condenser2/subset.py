@@ -60,7 +60,7 @@ class Subset:
         self.config = get_config()
 
     def run_middle_out(self):
-        passthrough_tables = self.__get_passthrough_tables()
+        passthrough_tables = self.config.passthrough_tables
         relationships = self.__db_helper.get_unredacted_fk_relationships(
             self.__all_tables, self.__source_conn
         )
@@ -295,9 +295,6 @@ class Subset:
             dest_cursor.close()
 
         return True
-
-    def __get_passthrough_tables(self):
-        return list(set(self.config.passthrough_tables))
 
     def subset_downstream(self, table, relationships):
         """

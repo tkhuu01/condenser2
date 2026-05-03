@@ -12,14 +12,12 @@ from condenser2.subset_utils import print_progress
 
 
 def db_creator(
-    db_type: str, source: DbConnect, dest: DbConnect
+    db_type: DbType, source: DbConnect, dest: DbConnect
 ) -> PsqlDatabaseCreator | MySqlDatabaseCreator:
     if db_type == DbType.POSTGRES:
         return PsqlDatabaseCreator(source, dest, False)
     elif db_type == DbType.MYSQL:
         return MySqlDatabaseCreator(source, dest)
-    else:
-        raise ValueError("unknown db_type " + db_type)
 
 
 def _parse_args():

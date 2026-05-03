@@ -170,13 +170,15 @@ def clean_temp_table_cells(fk_table, fk_columns, target_table, target_columns, c
     run_query(q, conn)
 
 
-def get_redacted_table_references(table_name, tables, conn):
+def get_redacted_table_references(
+    table_name: str, tables: list[str], conn: PsqlConnection
+):
     relationships = get_unredacted_fk_relationships(tables, conn)
     redacted = redact_relationships(relationships)
     return [r for r in redacted if r["target_table"] == table_name]
 
 
-def get_unredacted_fk_relationships(tables, conn):
+def get_unredacted_fk_relationships(tables: list[str], conn: PsqlConnection):
     q = """
         SELECT fk_nsp.nspname || '.' || fk_table AS fk_table,
         array_agg(fk_att.attname ORDER BY fk_att.attnum) AS fk_columns,

@@ -92,7 +92,10 @@ def compute_downstream_tables(passthrough_tables, disconnected_tables, order):
 
 
 def compute_disconnected_tables(
-    target_tables, passthrough_tables, all_tables, relationships
+    target_tables: list[str],
+    passthrough_tables: list[str],
+    all_tables: list[str],
+    relationships,
 ):
     uf = UnionFind()
     for t in all_tables:
