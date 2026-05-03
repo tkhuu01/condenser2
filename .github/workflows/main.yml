@@ -36,8 +36,8 @@ jobs:
       - name: Copy PostgreSQL 18 client tools from service container
         run: |
           PG_CONTAINER=$(docker ps -q -f "ancestor=postgres:18")
-          docker cp "$PG_CONTAINER":/usr/bin/pg_dump /usr/local/bin/pg_dump
-          docker cp "$PG_CONTAINER":/usr/bin/pg_restore /usr/local/bin/pg_restore
+          docker cp "$PG_CONTAINER":/usr/lib/postgresql/18/bin/pg_dump /usr/local/bin/pg_dump
+          docker cp "$PG_CONTAINER":/usr/lib/postgresql/18/bin/pg_restore /usr/local/bin/pg_restore
           pg_dump --version
       - uses: astral-sh/setup-uv@v6
       - run: uv sync
