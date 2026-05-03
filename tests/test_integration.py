@@ -39,12 +39,6 @@ def _query_one(conn, sql):
         return cur.fetchone()[0]
 
 
-def _query_all(conn, sql):
-    with conn.cursor() as cur:
-        cur.execute(sql)
-        return cur.fetchall()
-
-
 @pytest.fixture(scope="module")
 def subsetter_dbs():
     admin = _admin_conn()
@@ -61,16 +55,15 @@ def subsetter_dbs():
     source_admin.close()
 
     # Reset config_reader global state and initialize with test config
-    config_reader._config = {}
+    config_reader.reset_config()
     with open(CONFIG_JSON, "r") as fp:
         config_reader.initialize(fp)
 
+    config = config_reader.get_config()
     # Run the full subsetter pipeline
-    db_type = config_reader.get_db_type()
-    source_dbc = DbConnect(db_type, config_reader.get_source_db_connection_info())
-    destination_dbc = DbConnect(
-        db_type, config_reader.get_destination_db_connection_info()
-    )
+    db_type = config.db_type
+    source_dbc = DbConnect(db_type, config.source_db_connection_info)
+    destination_dbc = DbConnect(db_type, config.destination_db_connection_info)
 
     database = db_creator(db_type, source_dbc, destination_dbc)
     database.teardown()
@@ -78,19 +71,19 @@ def subsetter_dbs():
 
     db_helper = database_helper.get_specific_helper()
     all_tables = db_helper.list_all_tables(source_dbc)
-    all_tables = [x for x in all_tables if x not in config_reader.get_excluded_tables()]
+    all_tables = [x for x in all_tables if x not in config.excluded_tables]
 
     subsetter = Subset(source_dbc, destination_dbc, all_tables)
     try:
         subsetter.prep_temp_dbs()
         subsetter.run_middle_out()
 
-        for sql in config_reader.get_pre_constraint_sql():
+        for sql in config.pre_constraint_sql:
             db_helper.run_query(sql, destination_dbc.get_db_connection())
 
         database.add_constraints()
 
-        for sql in config_reader.get_post_subset_sql():
+        for sql in config.post_subset_sql:
             db_helper.run_query(sql, destination_dbc.get_db_connection())
 
         all_tables_no_pg = [t for t in all_tables if "pgbench" not in t]

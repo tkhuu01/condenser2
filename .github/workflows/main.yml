@@ -33,13 +33,11 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@v4
-      - name: Install PostgreSQL 18 client
+      - name: Copy PostgreSQL 18 client tools from service container
         run: |
-          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/postgresql.gpg
-          sudo apt-get update
-          sudo apt-get install -y postgresql-client-18
-          echo "/usr/lib/postgresql/18/bin" >> $GITHUB_PATH
+          PG_CONTAINER=$(docker ps -q -f "ancestor=postgres:18")
+          docker cp "$PG_CONTAINER":/usr/lib/postgresql/18/bin/pg_dump /usr/local/bin/pg_dump
+          docker cp "$PG_CONTAINER":/usr/lib/postgresql/18/bin/pg_restore /usr/local/bin/pg_restore
       - uses: astral-sh/setup-uv@v6
       - run: uv sync
       - run: uv run pytest tests/ -v

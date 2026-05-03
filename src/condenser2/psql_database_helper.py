@@ -1,9 +1,10 @@
 import uuid
+from dataclasses import asdict
 
 from psycopg import sql
 from psycopg.types.json import Json, set_json_loads
 
-from condenser2 import config_reader
+from condenser2.config_reader import get_config
 from condenser2.db_connect import PsqlConnection
 from condenser2.subset_utils import (
     columns_joined,
@@ -31,7 +32,7 @@ def turn_off_constraints(connection):
     pass
 
 
-def copy_rows(source, destination, query, destination_table):
+def copy_rows(source, destination, query, destination_table, params=None):
     datatypes = get_table_datatypes(
         table_name(destination_table), schema_name(destination_table), destination
     )
@@ -79,7 +80,7 @@ def copy_rows(source, destination, query, destination_table):
     # using the inner_cursor means we don't log all the noise
     destination_cursor = destination.cursor().inner_cursor
     try:
-        cursor.execute(query)
+        cursor.execute(query, params)
 
         insert_query = "INSERT INTO {} {} VALUES {}".format(
             fully_qualified_table(destination_table), columns, template
@@ -169,13 +170,15 @@ def clean_temp_table_cells(fk_table, fk_columns, target_table, target_columns, c
     run_query(q, conn)
 
 
-def get_redacted_table_references(table_name, tables, conn):
+def get_redacted_table_references(
+    table_name: str, tables: list[str], conn: PsqlConnection
+):
     relationships = get_unredacted_fk_relationships(tables, conn)
     redacted = redact_relationships(relationships)
     return [r for r in redacted if r["target_table"] == table_name]
 
 
-def get_unredacted_fk_relationships(tables, conn):
+def get_unredacted_fk_relationships(tables: list[str], conn: PsqlConnection):
     q = """
         SELECT fk_nsp.nspname || '.' || fk_table AS fk_table,
         array_agg(fk_att.attname ORDER BY fk_att.attnum) AS fk_columns,
@@ -226,7 +229,9 @@ def get_unredacted_fk_relationships(tables, conn):
             if d["fk_table"] in tables and d["target_table"] in tables:
                 relationships.append(d)
 
-    for augment in config_reader.get_fk_augmentation():
+    config = get_config()
+    for fka in config.fk_augmentation:
+        augment = asdict(fka)
         not_present = True
         for r in relationships:
             not_present = not_present and not all(

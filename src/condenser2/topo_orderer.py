@@ -1,6 +1,6 @@
 from toposort import toposort
 
-from condenser2 import config_reader
+from condenser2.config_reader import get_config
 
 
 def get_topological_order_by_tables(relationships, tables):
@@ -9,7 +9,8 @@ def get_topological_order_by_tables(relationships, tables):
 
 
 def __prepare_topsort_input(relationships, tables):
-    dep_breaks = config_reader.get_dependency_breaks()
+    config = get_config()
+    dep_breaks = config.dependency_breaks
     deps = dict()
     for r in relationships:
         p = r["fk_table"]

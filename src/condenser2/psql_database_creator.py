@@ -62,6 +62,11 @@ class PsqlDatabaseCreator:
                     "--schema-only",
                     "--no-owner",
                     "--no-privileges",
+                    "--no-comments",
+                    "--no-tablespaces",
+                    "--no-publications",
+                    "--no-subscriptions",
+                    "--no-security-labels",
                     "--section=pre-data",
                 ],
                 stdout=subprocess.PIPE,
@@ -69,7 +74,7 @@ class PsqlDatabaseCreator:
             )
             if result.returncode != 0 or contains_errors(result.stderr):
                 raise Exception(
-                    "Captuing pre-data schema failed. Details:\n{}".format(
+                    "Capturing pre-data schema failed. Details:\n{}".format(
                         result.stderr
                     )
                 )
@@ -120,6 +125,11 @@ class PsqlDatabaseCreator:
                     "--schema-only",
                     "--no-owner",
                     "--no-privileges",
+                    "--no-comments",
+                    "--no-tablespaces",
+                    "--no-publications",
+                    "--no-subscriptions",
+                    "--no-security-labels",
                     "--section=post-data",
                 ],
                 stderr=subprocess.PIPE,
@@ -127,7 +137,7 @@ class PsqlDatabaseCreator:
             )
             if result.returncode != 0 or contains_errors(result.stderr):
                 raise Exception(
-                    "Captuing post-data schema failed. Details:\n{}".format(
+                    "Capturing post-data schema failed. Details:\n{}".format(
                         result.stderr
                     )
                 )

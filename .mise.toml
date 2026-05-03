@@ -3,8 +3,12 @@ postgres = "18.3"
 
 [tasks.qa]
 description = "Format, sort imports, and lint"
-run = """
-uv run ruff format src/
-uv run ruff check --select I --fix src/
-uv run ruff check src/
-"""
+run = [
+    "uv run ruff format src/",
+    "uv run ruff check --select I --fix src/",
+    "uv run ruff check src/"
+]
+
+[tasks.test]
+description = "Run integration tests"
+run = "uv run pytest tests/ -v"
