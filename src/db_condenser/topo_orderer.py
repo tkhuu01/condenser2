@@ -1,6 +1,6 @@
 from toposort import toposort
 
-from condenser2.config_reader import get_config
+from db_condenser.config_reader import get_config
 
 
 def get_topological_order_by_tables(relationships, tables):

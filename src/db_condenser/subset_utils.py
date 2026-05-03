@@ -1,6 +1,6 @@
-from condenser2 import database_helper
-from condenser2.config_reader import DbType, get_config
-from condenser2.db_connect import MySqlConnection
+from db_condenser import database_helper
+from db_condenser.config_reader import DbType, get_config
+from db_condenser.db_connect import MySqlConnection
 
 
 # this function generally copies all columns as is, but if the table has been selected as

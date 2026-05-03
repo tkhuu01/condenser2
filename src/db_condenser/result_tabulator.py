@@ -1,5 +1,5 @@
-from condenser2 import database_helper
-from condenser2.db_connect import MySqlConnection
+from db_condenser import database_helper
+from db_condenser.db_connect import MySqlConnection
 
 
 def tabulate(source_dbc, destination_dbc, tables):

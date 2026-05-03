@@ -1,7 +1,7 @@
 import os
 import subprocess
 
-from condenser2 import config_reader, db_connect
+from db_condenser import config_reader, db_connect
 
 
 class MySqlDatabaseCreator:

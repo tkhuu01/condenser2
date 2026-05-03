@@ -6,7 +6,7 @@ from datetime import datetime
 import mysql.connector
 import psycopg
 
-from condenser2.config_reader import DbConnectInfo, DbType
+from db_condenser.config_reader import DbConnectInfo, DbType
 
 
 class DbConnection:

@@ -1,6 +1,6 @@
-# Condenser2
+# Database Condenser
 
-Condenser2 is a modernized fork of Tonic's Condenser with many changes.
+db-condenser is a modernized fork of Tonic's Condenser with many changes.
 
 Some of them are:
 

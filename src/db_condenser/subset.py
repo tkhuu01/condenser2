@@ -2,10 +2,10 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from condenser2 import database_helper
-from condenser2.config_reader import DbType, InitialTarget, get_config
-from condenser2.db_connect import DbConnect
-from condenser2.subset_utils import (
+from db_condenser import database_helper
+from db_condenser.config_reader import DbType, InitialTarget, get_config
+from db_condenser.db_connect import DbConnect
+from db_condenser.subset_utils import (
     columns_joined,
     columns_to_copy,
     columns_tupled,
@@ -21,7 +21,7 @@ from condenser2.subset_utils import (
     table_name,
     upstream_filter_match,
 )
-from condenser2.topo_orderer import get_topological_order_by_tables
+from db_condenser.topo_orderer import get_topological_order_by_tables
 
 """
 A QUICK NOTE ON DEFINITIONS:

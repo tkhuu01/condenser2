@@ -1,7 +1,7 @@
 [project]
-name = "condenser2"
+name = "Database Condenser"
 version = "0.1.0"
-description = "Condenser2"
+description = "db-condenser"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,7 +13,7 @@ dependencies = [
 
 
 [project.scripts]
-subset = "condenser2.direct_subset:main"
+subset = "db_condenser.direct_subset:main"
 
 [dependency-groups]
 dev = [

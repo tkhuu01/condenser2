@@ -4,10 +4,10 @@ from pathlib import Path
 import psycopg
 import pytest
 
-from condenser2 import config_reader, database_helper
-from condenser2.db_connect import DbConnect, PsqlConnection
-from condenser2.direct_subset import db_creator
-from condenser2.subset import Subset
+from db_condenser import config_reader, database_helper
+from db_condenser.db_connect import DbConnect, PsqlConnection
+from db_condenser.direct_subset import db_creator
+from db_condenser.subset import Subset
 
 TEST_DIR = Path(__file__).parent
 SEED_SQL = TEST_DIR / "seed.sql"

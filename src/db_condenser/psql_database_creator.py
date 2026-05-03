@@ -2,7 +2,7 @@ import os
 import subprocess
 from urllib.parse import urlencode
 
-from condenser2 import database_helper
+from db_condenser import database_helper
 
 
 class PsqlDatabaseCreator:

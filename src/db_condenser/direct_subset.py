@@ -2,13 +2,13 @@ import argparse
 import sys
 import time
 
-from condenser2 import config_reader, database_helper, result_tabulator
-from condenser2.config_reader import DbConnectInfo, DbType
-from condenser2.db_connect import DbConnect, MySqlConnection, PsqlConnection
-from condenser2.mysql_database_creator import MySqlDatabaseCreator
-from condenser2.psql_database_creator import PsqlDatabaseCreator
-from condenser2.subset import Subset
-from condenser2.subset_utils import print_progress
+from db_condenser import config_reader, database_helper, result_tabulator
+from db_condenser.config_reader import DbConnectInfo, DbType
+from db_condenser.db_connect import DbConnect, MySqlConnection, PsqlConnection
+from db_condenser.mysql_database_creator import MySqlDatabaseCreator
+from db_condenser.psql_database_creator import PsqlDatabaseCreator
+from db_condenser.subset import Subset
+from db_condenser.subset_utils import print_progress
 
 
 def db_creator(
@@ -21,7 +21,7 @@ def db_creator(
 
 
 def _parse_args():
-    parser = argparse.ArgumentParser(description="Condenser2 database subsetter")
+    parser = argparse.ArgumentParser(description="Database Condenser")
     parser.add_argument("--stdin", action="store_true", help="Read config from stdin")
     parser.add_argument(
         "-y", "--yes", action="store_true", help="Skip destination confirmation prompt"

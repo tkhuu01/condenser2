@@ -12,7 +12,7 @@ wheels = [
 ]
 
 [[package]]
-name = "condenser2"
+name = "db-condenser"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

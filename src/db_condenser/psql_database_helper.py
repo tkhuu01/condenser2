@@ -4,9 +4,9 @@ from dataclasses import asdict
 from psycopg import sql
 from psycopg.types.json import Json, set_json_loads
 
-from condenser2.config_reader import get_config
-from condenser2.db_connect import PsqlConnection
-from condenser2.subset_utils import (
+from db_condenser.config_reader import get_config
+from db_condenser.db_connect import PsqlConnection
+from db_condenser.subset_utils import (
     columns_joined,
     columns_tupled,
     fully_qualified_table,
