@@ -59,6 +59,37 @@ class Subset:
         self.__db_helper.turn_off_constraints(self.__destination_conn)
         self.config = get_config()
 
+        if self.config.use_temp_tables:
+            self.__check_source_writable()
+
+    def __check_source_writable(self):
+        if self.config.db_type == DbType.POSTGRES:
+            with self.__source_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_is_in_recovery(),"
+                    " has_database_privilege(current_user, current_database(), 'TEMP')"
+                )
+                is_replica, has_temp = cur.fetchone()
+            if is_replica:
+                raise RuntimeError(
+                    "use_temp_tables is enabled but the source database is a"
+                    " read replica (pg_is_in_recovery() = true)"
+                )
+            if not has_temp:
+                raise RuntimeError(
+                    "use_temp_tables is enabled but the source user lacks the"
+                    " TEMP privilege on the source database"
+                )
+        elif self.config.db_type == DbType.MYSQL:
+            with self.__source_conn.cursor() as cur:
+                cur.execute("SELECT @@global.read_only")
+                (read_only,) = cur.fetchone()
+            if read_only:
+                raise RuntimeError(
+                    "use_temp_tables is enabled but the source database is"
+                    " read-only (@@global.read_only = 1)"
+                )
+
     def run_middle_out(self):
         passthrough_tables = self.config.passthrough_tables
         relationships = self.__db_helper.get_unredacted_fk_relationships(
@@ -172,6 +203,53 @@ class Subset:
                 print_progress(table, idx + 1, len(tables))
                 future.result()  # raises if the worker failed
 
+    def __stream_ids_to_source_temp(self, dest_query, columns):
+        """Stream ID rows from a destination query into a temp table on the source.
+
+        Returns the temp table name on the source connection.
+        """
+        id_temp = self.__db_helper.create_id_temp_table(
+            self.__source_conn, len(columns)
+        )
+        insert_q = 'INSERT INTO "{}" VALUES ({})'.format(
+            id_temp, ",".join(["%s"] * len(columns))
+        )
+        cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
+        dest_cursor = self.__destination_conn.cursor(name=cursor_name, withhold=True)
+        src_insert_cur = self.__source_conn.cursor()
+        try:
+            dest_cursor.execute(dest_query)
+            fetch_row_count = 100000
+            while True:
+                rows = dest_cursor.fetchmany(fetch_row_count)
+                if not rows:
+                    break
+                valid_rows = [row for row in rows if all(c is not None for c in row)]
+                if valid_rows:
+                    src_insert_cur.executemany(insert_q, valid_rows)
+            self.__source_conn.commit()
+        finally:
+            src_insert_cur.close()
+            dest_cursor.close()
+        return id_temp
+
+    def __build_temp_table_join(
+        self, source_table, id_temp, columns, datatypes, select_expr=None
+    ):
+        """Build a SELECT ... JOIN query against a source temp table."""
+        fqt = fully_qualified_table(source_table)
+        if select_expr is None:
+            select_expr = "{}.*".format(fqt)
+        join_conditions = " AND ".join(
+            '{}.{} = "{}".col{}::{}'.format(
+                fqt, quoter(col), id_temp, i, datatypes[col]
+            )
+            for i, col in enumerate(columns)
+        )
+        return 'SELECT {} FROM {} JOIN "{}" ON {}'.format(
+            select_expr, fqt, id_temp, join_conditions
+        )
+
     def __subset_direct(self, target: InitialTarget, relationships):
         t = target.table
         columns_query = columns_to_copy(t, relationships, self.__source_conn)
@@ -221,24 +299,63 @@ class Subset:
         if len(relevant_key_constraints) == 0 or target in processed_tables:
             return False
 
+        table_columns = self.__db_helper.get_table_columns(
+            table_name(target), schema_name(target), self.__source_conn
+        )
+        upstream_filters = upstream_filter_match(target, table_columns)
+
+        if self.config.use_temp_tables:
+            self.__subset_upstream_temp_tables(
+                target, relevant_key_constraints, upstream_filters
+            )
+        else:
+            self.__subset_upstream_unnest(
+                target, relevant_key_constraints, upstream_filters
+            )
+
+        return True
+
+    def __subset_upstream_temp_tables(
+        self, target, relevant_key_constraints, upstream_filters
+    ):
+        target_datatypes = {
+            col: typ
+            for col, typ, _, _ in self.__db_helper.get_table_datatypes(
+                table_name(target), schema_name(target), self.__source_conn
+            )
+        }
+        for kc in relevant_key_constraints:
+            qualified_table = fully_qualified_table(
+                mysql_db_name_hack(kc["target_table"], self.__destination_conn)
+            )
+            dest_query = "SELECT {} FROM {}".format(
+                columns_joined(kc["target_columns"]), qualified_table
+            )
+            id_temp = self.__stream_ids_to_source_temp(dest_query, kc["target_columns"])
+            q = self.__build_temp_table_join(
+                target, id_temp, kc["target_columns"], target_datatypes
+            )
+            if upstream_filters:
+                q += " AND {}".format(" AND ".join(upstream_filters))
+            if self.config.max_rows_per_table is not None:
+                q += " LIMIT {}".format(self.config.max_rows_per_table)
+            self.__db_helper.copy_rows(
+                self.__source_conn, self.__destination_conn, q, target
+            )
+
+    def __subset_upstream_unnest(
+        self, target, relevant_key_constraints, upstream_filters
+    ):
+        target_datatypes = {
+            col: typ
+            for col, typ, _, _ in self.__db_helper.get_table_datatypes(
+                table_name(target), schema_name(target), self.__source_conn
+            )
+        }
+
         cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
         dest_cursor = self.__destination_conn.cursor(name=cursor_name, withhold=True)
         try:
-            # filter it down in the target database
-            table_columns = self.__db_helper.get_table_columns(
-                table_name(target), schema_name(target), self.__source_conn
-            )
-            # Additional filters to apply upstream
-            upstream_filters = upstream_filter_match(target, table_columns)
-
-            # Datatypes for casting varchar temp columns to proper types in JOIN
-            target_datatypes = {
-                col: typ
-                for col, typ, _, _ in self.__db_helper.get_table_datatypes(
-                    table_name(target), schema_name(target), self.__source_conn
-                )
-            }
-
             fetch_row_count = 100000
             for kc in relevant_key_constraints:
                 qualified_table = fully_qualified_table(
@@ -289,12 +406,14 @@ class Subset:
 
                     params = [[row[i] for row in valid_rows] for i in range(len(cols))]
                     self.__db_helper.copy_rows(
-                        self.__source_conn, self.__destination_conn, q, target, params
+                        self.__source_conn,
+                        self.__destination_conn,
+                        q,
+                        target,
+                        params,
                     )
         finally:
             dest_cursor.close()
-
-        return True
 
     def subset_downstream(self, table, relationships):
         """
@@ -338,7 +457,41 @@ class Subset:
 
         columns_query = columns_to_copy(table, relationships, self.__source_conn)
 
-        # Datatypes for casting varchar temp columns to proper types in JOIN
+        if self.config.use_temp_tables:
+            self.__subset_downstream_temp_tables(
+                table, temp_table, pk_columns, columns_query
+            )
+        else:
+            self.__subset_downstream_unnest(
+                table, temp_table, pk_columns, columns_query
+            )
+
+    def __subset_downstream_temp_tables(
+        self, table, dest_temp_table, pk_columns, columns_query
+    ):
+        downstream_datatypes = {
+            col: typ
+            for col, typ, _, _ in self.__db_helper.get_table_datatypes(
+                table_name(table), schema_name(table), self.__source_conn
+            )
+        }
+        dest_query = "SELECT DISTINCT * FROM {}".format(
+            fully_qualified_table(dest_temp_table)
+        )
+        src_id_temp = self.__stream_ids_to_source_temp(dest_query, pk_columns)
+        q = self.__build_temp_table_join(
+            table, src_id_temp, pk_columns, downstream_datatypes, columns_query
+        )
+        self.__db_helper.copy_rows(
+            self.__source_conn,
+            self.__destination_conn,
+            q,
+            mysql_db_name_hack(table, self.__destination_conn),
+        )
+
+    def __subset_downstream_unnest(
+        self, table, dest_temp_table, pk_columns, columns_query
+    ):
         downstream_datatypes = {
             col: typ
             for col, typ, _, _ in self.__db_helper.get_table_datatypes(
@@ -350,7 +503,7 @@ class Subset:
         cursor = self.__destination_conn.cursor(name=cursor_name, withhold=True)
         try:
             cursor_query = "SELECT DISTINCT * FROM {}".format(
-                fully_qualified_table(temp_table)
+                fully_qualified_table(dest_temp_table)
             )
             cursor.execute(cursor_query)
             fetch_row_count = 100000

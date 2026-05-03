@@ -94,6 +94,7 @@ class Config:
     dependency_breaks: list[DependencyBreak] = field(default_factory=list)
     fk_augmentation: list[FkAugmentation] = field(default_factory=list)
     max_rows_per_table: int | Literal["ALL"] | None = None
+    use_temp_tables: bool = False
     pre_constraint_sql: list[str] = field(default_factory=list)
     post_subset_sql: list[str] = field(default_factory=list)
 
@@ -158,6 +159,7 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
     pre_constraint_sql = [sql for sql in raw_config.get("pre_constraint_sql", [])]
     post_subset_sql = [sql for sql in raw_config.get("post_subset_sql", [])]
     max_rows_per_table = raw_config.get("max_rows_per_table", None)
+    use_temp_tables = bool(raw_config.get("use_temp_tables", False))
     return Config(
         db_type=db_type,
         initial_targets=initial_targets,
@@ -172,6 +174,7 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
         dependency_breaks=dependency_breaks,
         fk_augmentation=fk_augmentation,
         max_rows_per_table=max_rows_per_table,
+        use_temp_tables=use_temp_tables,
         pre_constraint_sql=pre_constraint_sql,
         post_subset_sql=post_subset_sql,
     )

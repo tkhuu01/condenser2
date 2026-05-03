@@ -25,6 +25,7 @@
     "fk_augmentation": [],
     "upstream_filters": [],
     "keep_disconnected_tables": true,
+    "use_temp_tables": false,
     "pre_constraint_sql": [],
     "post_subset_sql": []
 }

@@ -79,6 +79,11 @@ the tables and foreign keys create a graph (where tables are nodes and foreign k
 are directed edges) disconnected tables are the tables in components that don't
 contain any targets. This setting decides how to import those tables.
 
+`use_temp_tables`: If `true` temp ID tables will be created in the source connection
+so that IDs are not stored in Python memory when batching 100k rows. This will
+also allow server-side JOINs, so this option makes the subsetting more efficient.
+The default will be `false` which will use Python memory.
+
 `max_rows_per_table`: This is interpreted as a limit on all of the tables to be
 copied. Useful if you have some very large tables that you want a sampling from.
 For an unlimited dataset (recommended) set this parameter to `ALL`.
