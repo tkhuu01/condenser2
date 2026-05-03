@@ -62,7 +62,7 @@ def main():
     )
 
     dest_info = config.destination_db_connection_info
-    if not args.yes and "localhost" not in dest_info.host:
+    if not args.yes and dest_info.host not in ("localhost", "127.0.0.1"):
         _confirm_destination(dest_info)
 
     destination_dbc = DbConnect(db_type, dest_info, verbose=args.verbose)
