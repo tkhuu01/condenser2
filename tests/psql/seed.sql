@@ -61,6 +61,13 @@ CREATE TABLE sales.order_lines (
     unit_price DECIMAL(10,2) NOT NULL
 );
 
+CREATE TABLE sales.order_transfers (
+    id SERIAL PRIMARY KEY,
+    from_order_id INT NOT NULL REFERENCES sales.orders(id),
+    to_order_id INT NOT NULL REFERENCES sales.orders(id),
+    reason VARCHAR NOT NULL
+);
+
 -- ============================================================
 -- PUBLIC SCHEMA (passthrough + disconnected)
 -- ============================================================
@@ -183,6 +190,23 @@ INSERT INTO sales.order_lines (order_id, product_id, quantity, unit_price) VALUE
     (28, 1, 1, 9.99), (28, 3, 2, 24.99), (28, 19, 1, 6.99),
     (29, 2, 3, 14.99), (29, 4, 1, 29.99), (29, 20, 1, 8.99),
     (30, 11, 1, 12.00), (30, 13, 2, 89.99), (30, 18, 1, 39.99);
+
+-- Order transfers (8): exercises multi-FK to same table
+-- Orders 16-30 belong to customers 6-10 (the imported set)
+-- Transfers where BOTH orders are imported (should be included with AND semantics)
+INSERT INTO sales.order_transfers (from_order_id, to_order_id, reason) VALUES
+    (16, 17, 'warehouse change'),
+    (20, 21, 'customer request'),
+    (25, 28, 'consolidation');
+-- Transfers where only ONE order is imported (should be excluded with AND semantics)
+INSERT INTO sales.order_transfers (from_order_id, to_order_id, reason) VALUES
+    (1, 16, 'partial from'),
+    (16, 1, 'partial to'),
+    (5, 20, 'partial from 2');
+-- Transfers where NEITHER order is imported
+INSERT INTO sales.order_transfers (from_order_id, to_order_id, reason) VALUES
+    (1, 2, 'old transfer'),
+    (3, 5, 'old transfer 2');
 
 -- Regions (5, passthrough)
 INSERT INTO public.regions (code, name, tax_rate) VALUES

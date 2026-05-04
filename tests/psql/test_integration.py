@@ -243,6 +243,33 @@ def test_downstream_warehouses_pulled_in(subsetter_dbs):
     assert 0 < wh_count <= 5
 
 
+def test_upstream_multi_fk_no_orphans(subsetter_dbs):
+    """order_transfers has two FKs to orders (from_order_id, to_order_id).
+    Verify no orphaned references after subsetting."""
+    _, dest = subsetter_dbs
+    orphans = _query_one(
+        dest,
+        """
+        SELECT COUNT(*) FROM sales.order_transfers t
+        WHERE NOT EXISTS (
+            SELECT 1 FROM sales.orders o WHERE o.id = t.from_order_id
+        )
+        OR NOT EXISTS (
+            SELECT 1 FROM sales.orders o WHERE o.id = t.to_order_id
+        )
+        """,
+    )
+    assert orphans == 0
+
+
+def test_upstream_multi_fk_and_semantics(subsetter_dbs):
+    """Only transfers where BOTH from_order and to_order are imported should
+    be included (AND semantics, not OR)."""
+    _, dest = subsetter_dbs
+    count = _query_one(dest, "SELECT COUNT(*) FROM sales.order_transfers")
+    assert count == 3
+
+
 def test_destination_has_fewer_rows(subsetter_dbs):
     source, dest = subsetter_dbs
     for table in ["sales.customers", "sales.orders", "sales.order_lines"]:
@@ -259,6 +286,7 @@ def test_sequences_reset(subsetter_dbs):
         ("sales", "customers"),
         ("sales", "orders"),
         ("sales", "order_lines"),
+        ("sales", "order_transfers"),
         ("inventory", "products"),
         ("inventory", "warehouses"),
     ]
