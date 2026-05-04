@@ -324,6 +324,7 @@ class Subset:
                 table_name(target), schema_name(target), self.__source_conn
             )
         }
+        id_temps = []
         for kc in relevant_key_constraints:
             qualified_table = fully_qualified_table(
                 mysql_db_name_hack(kc["target_table"], self.__destination_conn)
@@ -332,16 +333,27 @@ class Subset:
                 columns_joined(kc["target_columns"]), qualified_table
             )
             id_temp = self.__stream_ids_to_source_temp(dest_query, kc["target_columns"])
-            q = self.__build_temp_table_join(
-                target, id_temp, kc["target_columns"], target_datatypes
+            id_temps.append((id_temp, kc["fk_columns"]))
+
+        fqt = fully_qualified_table(target)
+        joins = ""
+        for id_temp, fk_cols in id_temps:
+            join_conditions = " AND ".join(
+                '{}.{} = "{}".col{}::{}'.format(
+                    fqt, quoter(col), id_temp, i, target_datatypes[col]
+                )
+                for i, col in enumerate(fk_cols)
             )
-            if upstream_filters:
-                q += " AND {}".format(" AND ".join(upstream_filters))
-            if self.config.max_rows_per_table is not None:
-                q += " LIMIT {}".format(self.config.max_rows_per_table)
-            self.__db_helper.copy_rows(
-                self.__source_conn, self.__destination_conn, q, target
-            )
+            joins += ' JOIN "{}" ON {}'.format(id_temp, join_conditions)
+
+        q = "SELECT {}.* FROM {}{}".format(fqt, fqt, joins)
+        if upstream_filters:
+            q += " WHERE {}".format(" AND ".join(upstream_filters))
+        if self.config.max_rows_per_table is not None:
+            q += " LIMIT {}".format(self.config.max_rows_per_table)
+        self.__db_helper.copy_rows(
+            self.__source_conn, self.__destination_conn, q, target
+        )
 
     def __subset_upstream_unnest(
         self, target, relevant_key_constraints, upstream_filters
@@ -353,6 +365,7 @@ class Subset:
             )
         }
 
+        all_id_rows = {}
         cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
         dest_cursor = self.__destination_conn.cursor(name=cursor_name, withhold=True)
         try:
@@ -364,56 +377,52 @@ class Subset:
                 query = "SELECT {} FROM {}".format(
                     columns_joined(kc["target_columns"]), qualified_table
                 )
-
                 dest_cursor.execute(query)
+                rows = []
                 while True:
-                    rows = dest_cursor.fetchmany(fetch_row_count)
-                    if not rows:
+                    batch = dest_cursor.fetchmany(fetch_row_count)
+                    if not batch:
                         break
-                    valid_rows = [
-                        row for row in rows if all(c is not None for c in row)
-                    ]
-                    if not valid_rows:
-                        continue
-
-                    cols = kc["target_columns"]
-                    unnest_args = ", ".join(
-                        "%s::{}[]".format(target_datatypes[col]) for col in cols
-                    )
-                    join_cols = ", ".join("col{}".format(i) for i in range(len(cols)))
-                    join_conditions = " AND ".join(
-                        "{}.{} = ids.col{}".format(
-                            fully_qualified_table(target), quoter(col), i
-                        )
-                        for i, col in enumerate(cols)
-                    )
-                    q = (
-                        "SELECT {tbl}.* FROM {tbl}"
-                        " JOIN unnest({unnest}) AS ids({join_cols})"
-                        " ON {conditions}"
-                    ).format(
-                        tbl=fully_qualified_table(target),
-                        unnest=unnest_args,
-                        join_cols=join_cols,
-                        conditions=join_conditions,
-                    )
-                    if upstream_filters:
-                        q += " AND {}".format(
-                            " AND ".join(upstream_filters),
-                        )
-                    if self.config.max_rows_per_table is not None:
-                        q += " LIMIT {}".format(self.config.max_rows_per_table)
-
-                    params = [[row[i] for row in valid_rows] for i in range(len(cols))]
-                    self.__db_helper.copy_rows(
-                        self.__source_conn,
-                        self.__destination_conn,
-                        q,
-                        target,
-                        params,
-                    )
+                    rows.extend(row for row in batch if all(c is not None for c in row))
+                fk_cols = kc["fk_columns"]
+                all_id_rows[id(kc)] = (fk_cols, rows)
         finally:
             dest_cursor.close()
+
+        if not any(rows for _, rows in all_id_rows.values()):
+            return
+
+        fqt = fully_qualified_table(target)
+        joins = ""
+        all_params = []
+        for idx, (_, (fk_cols, rows)) in enumerate(all_id_rows.items()):
+            unnest_args = ", ".join(
+                "%s::{}[]".format(target_datatypes[col]) for col in fk_cols
+            )
+            join_cols = ", ".join("col{}".format(i) for i in range(len(fk_cols)))
+            join_conditions = " AND ".join(
+                "{}.{} = ids{}.col{}".format(fqt, quoter(col), idx, i)
+                for i, col in enumerate(fk_cols)
+            )
+            joins += (
+                " JOIN unnest({unnest}) AS ids{idx}({join_cols}) ON {conds}".format(
+                    unnest=unnest_args,
+                    idx=idx,
+                    join_cols=join_cols,
+                    conds=join_conditions,
+                )
+            )
+            all_params.extend([row[i] for row in rows] for i in range(len(fk_cols)))
+
+        q = "SELECT {}.* FROM {}{}".format(fqt, fqt, joins)
+        if upstream_filters:
+            q += " AND {}".format(" AND ".join(upstream_filters))
+        if self.config.max_rows_per_table is not None:
+            q += " LIMIT {}".format(self.config.max_rows_per_table)
+
+        self.__db_helper.copy_rows(
+            self.__source_conn, self.__destination_conn, q, target, all_params
+        )
 
     def subset_downstream(self, table, relationships):
         """
