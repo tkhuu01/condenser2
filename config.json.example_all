@@ -36,6 +36,7 @@
     ],
     "max_rows_per_table": 100000,
     "use_temp_tables": false,
+    "use_copy_protocol": false,
     "excluded_tables": [
         "public.table_to_ignore", "public.spatial_ref_sys"
     ],

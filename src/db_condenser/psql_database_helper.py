@@ -118,6 +118,50 @@ def copy_rows(source, destination, query, destination_table, params=None):
         destination.commit()
 
 
+def copy_rows_copy_protocol(source, destination, query, destination_table, params=None):
+    datatypes = get_table_datatypes(
+        table_name(destination_table), schema_name(destination_table), destination
+    )
+
+    non_generated_columns = [dt[0] for _, dt in enumerate(datatypes) if dt[2] != "s"]
+    generated_columns_positions = {i for i, dt in enumerate(datatypes) if "s" in dt[2]}
+
+    column_list = ", ".join('"' + col + '"' for col in non_generated_columns)
+    copy_command = "COPY {} ({}) FROM STDIN".format(
+        fully_qualified_table(destination_table), column_list
+    )
+
+    cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
+    cursor = source.cursor(name=cursor_name)
+    dest_cursor = destination.cursor().inner_cursor
+    try:
+        cursor.execute(query, params)
+
+        with dest_cursor.copy(copy_command) as copy:
+            fetch_row_count = 100000
+            while True:
+                rows = cursor.fetchmany(fetch_row_count)
+                if not rows:
+                    break
+
+                if generated_columns_positions:
+                    for row in rows:
+                        copy.write_row(
+                            tuple(
+                                val
+                                for i, val in enumerate(row)
+                                if i not in generated_columns_positions
+                            )
+                        )
+                else:
+                    for row in rows:
+                        copy.write_row(row)
+    finally:
+        dest_cursor.close()
+        cursor.close()
+        destination.commit()
+
+
 def source_db_temp_table(target_table):
     return "tonic_subset_" + schema_name(target_table) + "_" + table_name(target_table)
 

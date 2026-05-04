@@ -40,8 +40,8 @@ def _query_one(conn, sql):
         return cur.fetchone()[0]
 
 
-def _run_subsetter(use_temp_tables):
-    suffix = "_temp" if use_temp_tables else ""
+def _run_subsetter(use_temp_tables, use_copy_protocol=False):
+    suffix = "_temp" if use_temp_tables else "_copy" if use_copy_protocol else ""
     source_db = SOURCE_DB + suffix
     dest_db = DEST_DB + suffix
 
@@ -63,6 +63,7 @@ def _run_subsetter(use_temp_tables):
     raw_config["source_db_connection_info"]["db_name"] = source_db
     raw_config["destination_db_connection_info"]["db_name"] = dest_db
     raw_config["use_temp_tables"] = use_temp_tables
+    raw_config["use_copy_protocol"] = use_copy_protocol
 
     config_reader.reset_config()
     config_reader.config = config_reader._raw_dict_to_config(raw_config)
@@ -106,12 +107,15 @@ def _run_subsetter(use_temp_tables):
 
 @pytest.fixture(
     scope="module",
-    params=[False, True],
-    ids=["unnest", "temp_tables"],
+    params=[
+        {"use_temp_tables": False, "use_copy_protocol": False},
+        {"use_temp_tables": True, "use_copy_protocol": False},
+        {"use_temp_tables": False, "use_copy_protocol": True},
+    ],
+    ids=["unnest", "temp_tables", "copy_protocol"],
 )
 def subsetter_dbs(request):
-    use_temp_tables = request.param
-    source_db, dest_db = _run_subsetter(use_temp_tables)
+    source_db, dest_db = _run_subsetter(**request.param)
 
     source = psycopg.connect(
         dbname=source_db,
