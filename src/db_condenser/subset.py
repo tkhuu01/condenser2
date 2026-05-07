@@ -114,9 +114,13 @@ class Subset:
         )
         start_time = time.time()
         processed_tables = set()
-        for idx, target in enumerate(self.config.initial_targets):
-            print_progress(target, idx + 1, len(self.config.initial_targets))
-            self.__subset_direct(target, relationships)
+        if len(self.config.initial_targets) >= 3:
+            self.__subset_direct_concurrent(relationships)
+        else:
+            for idx, target in enumerate(self.config.initial_targets):
+                print_progress(target, idx + 1, len(self.config.initial_targets))
+                self.__subset_direct(target, relationships)
+        for target in self.config.initial_targets:
             processed_tables.add(target.table)
         print("Direct target tables completed in {}s".format(time.time() - start_time))
 
@@ -202,6 +206,17 @@ class Subset:
                 table = futures[future]
                 print_progress(table, idx + 1, len(tables))
                 future.result()  # raises if the worker failed
+
+    def __subset_direct_concurrent(self, relationships, max_workers=4):
+        targets = self.config.initial_targets
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(self.__subset_direct, t, relationships): t for t in targets
+            }
+            for idx, future in enumerate(as_completed(futures)):
+                target = futures[future]
+                print_progress(target, idx + 1, len(targets))
+                future.result()
 
     def __stream_ids_to_source_temp(self, dest_query, columns):
         """Stream ID rows from a destination query into a temp table on the source.

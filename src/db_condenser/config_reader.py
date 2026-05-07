@@ -1,6 +1,6 @@
 import json
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Literal
 
@@ -130,7 +130,7 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
     )
     source_db = DbConnectInfo(**raw_config["source_db_connection_info"])
     dest_db = DbConnectInfo(
-        **raw_config.get("destination_db_connection_info", default_localhost)
+        **raw_config.get("destination_db_connection_info", asdict(default_localhost))
     )
 
     upstream_filters = [
