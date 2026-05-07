@@ -4,7 +4,9 @@ db-condenser is a modernized fork of Tonic's Condenser with many changes.
 
 Some of them are:
 
-* Refactors many areas of the subsetting code
+* Refactors many areas of the subsetting code (ex. making use of temp ID tables
+instead of storing everything in Python's running memory)
+* Concurrent thread pool usage to speed up subsetting
 * Adds sequence numbering reset automatically after subsetting
 * Moves the project to astral's uv and to psycopg3
 
@@ -29,7 +31,7 @@ You can find more details about how we built this
 
 ## Installation
 
-Five steps to install, assuming Python 3.10+:
+Six steps to set up, assuming Python 3.10+:
 
 1. Install [astral-uv](https://docs.astral.sh/uv/getting-started/installation/)
 
@@ -66,16 +68,19 @@ named `public.target_table`.
 
 ## Running
 
-Almost all the configuration is in the `config.json` file, so running is as simple as
+Almost all the configuration is in the `config.json` file, so running it is as simple as
 
 ```
 $ uv run subset
 ```
 
-Two commandline arguements are supported:
+Two command-line arguments are supported:
 
 `-v`: Verbose output. Useful for performance debugging. Lists almost every
-query made, and it's speed.
+query made, and its speed.
 
 `--no-constraints`: For Postgres this will not add constraints found in the source
 database to the destination database. This option has no effect for MySQL.
+
+`-y`: Skip confirmation on subsetting to destination host if it isn't localhost
+or 127.0.0.1
