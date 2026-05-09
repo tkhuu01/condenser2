@@ -480,7 +480,7 @@ class Subset:
             fk_table = r["fk_table"]
             fk_columns = r["fk_columns"]
 
-            q = "SELECT {} FROM {} WHERE {} NOT IN (SELECT {} FROM {})".format(
+            select_q = "SELECT {} FROM {} WHERE {} NOT IN (SELECT {} FROM {})".format(
                 columns_joined(fk_columns),
                 fully_qualified_table(
                     mysql_db_name_hack(fk_table, self.__destination_conn)
@@ -491,9 +491,10 @@ class Subset:
                     mysql_db_name_hack(table, self.__destination_conn)
                 ),
             )
-            self.__copy_rows(
-                self.__destination_conn, self.__destination_conn, q, temp_table
-            )
+            insert_q = 'INSERT INTO "{}" {}'.format(temp_table, select_q)
+            with self.__destination_conn.cursor() as cur:
+                cur.execute(insert_q)
+            self.__destination_conn.commit()
 
         columns_query = columns_to_copy(table, relationships, self.__source_conn)
 

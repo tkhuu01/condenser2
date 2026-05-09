@@ -125,6 +125,7 @@ def copy_rows_copy_protocol(source, destination, query, destination_table, param
 
     non_generated_columns = [dt[0] for _, dt in enumerate(datatypes) if dt[2] != "s"]
     generated_columns_positions = {i for i, dt in enumerate(datatypes) if "s" in dt[2]}
+    json_positions = {i for i, dt in enumerate(datatypes) if dt[1] in ("json", "jsonb")}
 
     column_list = ", ".join('"' + col + '"' for col in non_generated_columns)
     copy_command = "COPY {} ({}) FROM STDIN".format(
@@ -144,11 +145,13 @@ def copy_rows_copy_protocol(source, destination, query, destination_table, param
                 if not rows:
                     break
 
-                if generated_columns_positions:
+                if generated_columns_positions or json_positions:
                     for row in rows:
                         copy.write_row(
                             tuple(
-                                val
+                                val.decode("utf-8")
+                                if isinstance(val, bytes) and i in json_positions
+                                else val
                                 for i, val in enumerate(row)
                                 if i not in generated_columns_positions
                             )

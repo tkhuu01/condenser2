@@ -68,19 +68,6 @@ class FkAugmentation:
             raise ValueError("fk_columns and target_columns must be the same length")
 
 
-LOCAL_POSTGRES_HOST = DbConnectInfo(
-    user_name="postgres",
-    host="localhost",
-    db_name="postgres",
-    password="postgres",
-    port=5432,
-)
-
-LOCAL_MYSQL_HOST = DbConnectInfo(
-    user_name="root", host="localhost", db_name="default_db", password="", port=3306
-)
-
-
 @dataclass
 class Config:
     db_type: DbType
@@ -126,13 +113,9 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
     initial_targets = [
         InitialTarget(**target) for target in raw_config["initial_targets"]
     ]
-    default_localhost = (
-        LOCAL_POSTGRES_HOST if db_type == DbType.POSTGRES else LOCAL_MYSQL_HOST
-    )
+
     source_db = DbConnectInfo(**raw_config["source_db_connection_info"])
-    dest_db = DbConnectInfo(
-        **raw_config.get("destination_db_connection_info", asdict(default_localhost))
-    )
+    dest_db = DbConnectInfo(**raw_config["destination_db_connection_info"])
 
     upstream_filters = [
         UpstreamFilter(**table) for table in raw_config.get("upstream_filters", [])
