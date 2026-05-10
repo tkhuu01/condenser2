@@ -1,16 +1,15 @@
 # Database Condenser
 
-db-condenser is a modernized fork of Tonic's Condenser with many changes.
+A config-driven database subsetting tool for PostgreSQL and MySQL, forked from
+Tonic's Condenser.
 
-Some of them are:
+Some changes from the original Condenser:
 
-* Refactors many areas of the subsetting code (ex. making use of temp ID tables
-instead of storing everything in Python's running memory)
 * Concurrent thread pool usage to speed up subsetting
-* Adds sequence numbering reset automatically after subsetting
-* Moves the project to astral's uv and to psycopg3
-
-Condenser is a config-driven database subsetting tool for Postgres and MySQL.
+* Optional temp-table strategy for memory-efficient ID batching
+* Optional Postgres COPY protocol for faster transfer
+* Automatic sequence reset after subsetting
+* Built on psycopg3 and managed with astral's uv
 
 Subsetting data is the process of taking a representative sample of your data
 in a manner that preserves the integrity of your database, e.g., give me 5% of
@@ -25,7 +24,7 @@ quite powerful as a productivity enhancer. Another example is copying specific
 rows from one database and placing them into another while maintaining referential
 integrity.
 
-You can find more details about how we built this
+You can find more about the original Condenser details
 [here](https://www.tonic.ai/blog/condenser-a-database-subsetting-tool) and
 [here](https://www.tonic.ai/blog/condenser-v2/).
 

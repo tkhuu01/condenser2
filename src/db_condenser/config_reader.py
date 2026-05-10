@@ -1,6 +1,6 @@
 import json
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Literal
 
@@ -68,19 +68,6 @@ class FkAugmentation:
             raise ValueError("fk_columns and target_columns must be the same length")
 
 
-LOCAL_POSTGRES_HOST = DbConnectInfo(
-    user_name="postgres",
-    host="localhost",
-    db_name="postgres",
-    password="postgres",
-    port=5432,
-)
-
-LOCAL_MYSQL_HOST = DbConnectInfo(
-    user_name="root", host="localhost", db_name="default_db", password="", port=3306
-)
-
-
 @dataclass
 class Config:
     db_type: DbType
@@ -95,6 +82,7 @@ class Config:
     fk_augmentation: list[FkAugmentation] = field(default_factory=list)
     max_rows_per_table: int | Literal["ALL"] | None = None
     use_temp_tables: bool = False
+    use_copy_protocol: bool = False
     pre_constraint_sql: list[str] = field(default_factory=list)
     post_subset_sql: list[str] = field(default_factory=list)
 
@@ -125,13 +113,9 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
     initial_targets = [
         InitialTarget(**target) for target in raw_config["initial_targets"]
     ]
-    default_localhost = (
-        LOCAL_POSTGRES_HOST if db_type == DbType.POSTGRES else LOCAL_MYSQL_HOST
-    )
+
     source_db = DbConnectInfo(**raw_config["source_db_connection_info"])
-    dest_db = DbConnectInfo(
-        **raw_config.get("destination_db_connection_info", asdict(default_localhost))
-    )
+    dest_db = DbConnectInfo(**raw_config["destination_db_connection_info"])
 
     upstream_filters = [
         UpstreamFilter(**table) for table in raw_config.get("upstream_filters", [])
@@ -160,6 +144,7 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
     post_subset_sql = [sql for sql in raw_config.get("post_subset_sql", [])]
     max_rows_per_table = raw_config.get("max_rows_per_table", None)
     use_temp_tables = bool(raw_config.get("use_temp_tables", False))
+    use_copy_protocol = bool(raw_config.get("use_copy_protocol", False))
     return Config(
         db_type=db_type,
         initial_targets=initial_targets,
@@ -175,6 +160,7 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
         fk_augmentation=fk_augmentation,
         max_rows_per_table=max_rows_per_table,
         use_temp_tables=use_temp_tables,
+        use_copy_protocol=use_copy_protocol,
         pre_constraint_sql=pre_constraint_sql,
         post_subset_sql=post_subset_sql,
     )

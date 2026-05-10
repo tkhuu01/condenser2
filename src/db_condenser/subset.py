@@ -59,6 +59,11 @@ class Subset:
         self.__db_helper.turn_off_constraints(self.__destination_conn)
         self.config = get_config()
 
+        if self.config.use_copy_protocol and self.config.db_type == DbType.POSTGRES:
+            self.__copy_rows = self.__db_helper.copy_rows_copy_protocol
+        else:
+            self.__copy_rows = self.__db_helper.copy_rows
+
         if self.config.use_temp_tables:
             self.__check_source_writable()
 
@@ -168,7 +173,7 @@ class Subset:
             for idx, t in enumerate(disconnected_tables):
                 print_progress(t, idx + 1, len(disconnected_tables))
                 q = "SELECT * FROM {}".format(fully_qualified_table(t))
-                self.__db_helper.copy_rows(
+                self.__copy_rows(
                     self.__source_conn,
                     self.__destination_conn,
                     q,
@@ -192,7 +197,7 @@ class Subset:
         q = "SELECT * FROM {}".format(fully_qualified_table(table))
         if self.config.max_rows_per_table is not None:
             q += " LIMIT {}".format(self.config.max_rows_per_table)
-        self.__db_helper.copy_rows(
+        self.__copy_rows(
             self.__source_conn,
             self.__destination_conn,
             q,
@@ -249,9 +254,18 @@ class Subset:
         return id_temp
 
     def __build_temp_table_join(
-        self, source_table, id_temp, columns, datatypes, select_expr=None
+        self,
+        source_table,
+        id_temp,
+        join_columns,
+        datatypes,
+        select_expr=None,
     ):
-        """Build a SELECT ... JOIN query against a source temp table."""
+        """Build a SELECT ... JOIN query against a source temp table.
+
+        join_columns are the columns on source_table to match against the temp table.
+        datatypes maps temp table column names to their real types for casting.
+        """
         fqt = fully_qualified_table(source_table)
         if select_expr is None:
             select_expr = "{}.*".format(fqt)
@@ -259,7 +273,7 @@ class Subset:
             '{}.{} = "{}".col{}::{}'.format(
                 fqt, quoter(col), id_temp, i, datatypes[col]
             )
-            for i, col in enumerate(columns)
+            for i, col in enumerate(join_columns)
         )
         return 'SELECT {} FROM {} JOIN "{}" ON {}'.format(
             select_expr, fqt, id_temp, join_conditions
@@ -291,7 +305,7 @@ class Subset:
                     t
                 )
             )
-        self.__db_helper.copy_rows(
+        self.__copy_rows(
             self.__source_conn,
             self.__destination_conn,
             q,
@@ -333,7 +347,7 @@ class Subset:
     def __subset_upstream_temp_tables(
         self, target, relevant_key_constraints, upstream_filters
     ):
-        target_datatypes = {
+        fk_datatypes = {
             col: typ
             for col, typ, _, _ in self.__db_helper.get_table_datatypes(
                 table_name(target), schema_name(target), self.__source_conn
@@ -341,8 +355,9 @@ class Subset:
         }
         id_temps = []
         for kc in relevant_key_constraints:
+            kc_target = kc["target_table"]
             qualified_table = fully_qualified_table(
-                mysql_db_name_hack(kc["target_table"], self.__destination_conn)
+                mysql_db_name_hack(kc_target, self.__destination_conn)
             )
             dest_query = "SELECT {} FROM {}".format(
                 columns_joined(kc["target_columns"]), qualified_table
@@ -355,7 +370,7 @@ class Subset:
         for id_temp, fk_cols in id_temps:
             join_conditions = " AND ".join(
                 '{}.{} = "{}".col{}::{}'.format(
-                    fqt, quoter(col), id_temp, i, target_datatypes[col]
+                    fqt, quoter(col), id_temp, i, fk_datatypes[col]
                 )
                 for i, col in enumerate(fk_cols)
             )
@@ -366,14 +381,12 @@ class Subset:
             q += " WHERE {}".format(" AND ".join(upstream_filters))
         if self.config.max_rows_per_table is not None:
             q += " LIMIT {}".format(self.config.max_rows_per_table)
-        self.__db_helper.copy_rows(
-            self.__source_conn, self.__destination_conn, q, target
-        )
+        self.__copy_rows(self.__source_conn, self.__destination_conn, q, target)
 
     def __subset_upstream_unnest(
         self, target, relevant_key_constraints, upstream_filters
     ):
-        target_datatypes = {
+        fk_datatypes = {
             col: typ
             for col, typ, _, _ in self.__db_helper.get_table_datatypes(
                 table_name(target), schema_name(target), self.__source_conn
@@ -386,8 +399,9 @@ class Subset:
         try:
             fetch_row_count = 100000
             for kc in relevant_key_constraints:
+                kc_target = kc["target_table"]
                 qualified_table = fully_qualified_table(
-                    mysql_db_name_hack(kc["target_table"], self.__destination_conn)
+                    mysql_db_name_hack(kc_target, self.__destination_conn)
                 )
                 query = "SELECT {} FROM {}".format(
                     columns_joined(kc["target_columns"]), qualified_table
@@ -412,7 +426,7 @@ class Subset:
         all_params = []
         for idx, (_, (fk_cols, rows)) in enumerate(all_id_rows.items()):
             unnest_args = ", ".join(
-                "%s::{}[]".format(target_datatypes[col]) for col in fk_cols
+                "%s::{}[]".format(fk_datatypes[col]) for col in fk_cols
             )
             join_cols = ", ".join("col{}".format(i) for i in range(len(fk_cols)))
             join_conditions = " AND ".join(
@@ -435,7 +449,7 @@ class Subset:
         if self.config.max_rows_per_table is not None:
             q += " LIMIT {}".format(self.config.max_rows_per_table)
 
-        self.__db_helper.copy_rows(
+        self.__copy_rows(
             self.__source_conn, self.__destination_conn, q, target, all_params
         )
 
@@ -464,7 +478,7 @@ class Subset:
             fk_table = r["fk_table"]
             fk_columns = r["fk_columns"]
 
-            q = "SELECT {} FROM {} WHERE {} NOT IN (SELECT {} FROM {})".format(
+            select_q = "SELECT {} FROM {} WHERE {} NOT IN (SELECT {} FROM {})".format(
                 columns_joined(fk_columns),
                 fully_qualified_table(
                     mysql_db_name_hack(fk_table, self.__destination_conn)
@@ -475,9 +489,10 @@ class Subset:
                     mysql_db_name_hack(table, self.__destination_conn)
                 ),
             )
-            self.__db_helper.copy_rows(
-                self.__destination_conn, self.__destination_conn, q, temp_table
-            )
+            insert_q = 'INSERT INTO "{}" {}'.format(temp_table, select_q)
+            with self.__destination_conn.cursor() as cur:
+                cur.execute(insert_q)
+            self.__destination_conn.commit()
 
         columns_query = columns_to_copy(table, relationships, self.__source_conn)
 
@@ -506,7 +521,7 @@ class Subset:
         q = self.__build_temp_table_join(
             table, src_id_temp, pk_columns, downstream_datatypes, columns_query
         )
-        self.__db_helper.copy_rows(
+        self.__copy_rows(
             self.__source_conn,
             self.__destination_conn,
             q,
@@ -564,7 +579,7 @@ class Subset:
                 params = [
                     [row[i] for row in valid_rows] for i in range(len(pk_columns))
                 ]
-                self.__db_helper.copy_rows(
+                self.__copy_rows(
                     self.__source_conn,
                     self.__destination_conn,
                     q,
