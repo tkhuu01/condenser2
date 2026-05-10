@@ -1,0 +1,41 @@
+name: "Publish release to PyPI"
+
+on:
+  push:
+    tags:
+      # Publish on any tag starting with a `v`, e.g., v0.1.0
+      - v*
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - name: Install Python 3.13
+        run: uv python install 3.13
+      - name: Validate version tag
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          TOML_VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          if [ "$TAG_VERSION" != "$TOML_VERSION" ]; then
+            echo "Error: Git tag v$TAG_VERSION does not match pyproject.toml version $TOML_VERSION"
+            exit 1
+          fi
+          echo "Version validation passed: $TAG_VERSION"
+      - name: Build
+        run: uv build
+      # Check that basic features work and we didn't miss to include crucial files
+      - name: Smoke test (wheel)
+        run: uv run --isolated --no-project --with dist/*.whl tests/smoke_test.py
+      - name: Smoke test (source distribution)
+        run: uv run --isolated --no-project --with dist/*.tar.gz tests/smoke_test.py
+      - name: Publish
+        run: uv publish
