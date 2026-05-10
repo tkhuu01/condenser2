@@ -66,19 +66,19 @@ named `public.target_table`.
 
 Or, from PyPI:
 
-```
-pip install db-condenser
+```bash
+$ pip install db-condenser
 ```
 
-```
-pipx install db-condenser
+```bash
+$ pipx install db-condenser
 ```
 
 ## Running
 
 Almost all the configuration is in the `config.json` file, so running it is as simple as
 
-```
+```bash
 $ uv run subset
 ```
 
