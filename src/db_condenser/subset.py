@@ -381,9 +381,7 @@ class Subset:
             q += " WHERE {}".format(" AND ".join(upstream_filters))
         if self.config.max_rows_per_table is not None:
             q += " LIMIT {}".format(self.config.max_rows_per_table)
-        self.__copy_rows(
-            self.__source_conn, self.__destination_conn, q, target
-        )
+        self.__copy_rows(self.__source_conn, self.__destination_conn, q, target)
 
     def __subset_upstream_unnest(
         self, target, relevant_key_constraints, upstream_filters
