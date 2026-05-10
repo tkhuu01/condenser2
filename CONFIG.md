@@ -38,7 +38,8 @@ and `password` (optional). If `password` is omitted, you will be prompted for
 a password.
 
 `destination_db_connection_info`: Destination database connection details. Same
-fields as `source_db_connection_info`.
+fields as `source_db_connection_info`. If you don't pass the -y flag then a confirmation
+message will appear if subsetting is not localhost or 127.0.0.1
 
 `initial_targets`: JSON array of JSON objects. Each object must contain a
 `table` field (the target table) and exactly one of `where` or `percent`.
