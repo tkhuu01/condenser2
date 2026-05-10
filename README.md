@@ -30,7 +30,7 @@ You can find more about the original Condenser details
 
 ## Installation
 
-Six steps to set up, assuming Python 3.10+:
+Six steps to set up from source, assuming Python 3.10+:
 
 1. Install [astral-uv](https://docs.astral.sh/uv/getting-started/installation/)
 
@@ -64,6 +64,15 @@ named `public.target_table`.
 
 6. Run! `$ uv run subset`
 
+Or, from PyPI:
+
+```
+pip install db-condenser
+```
+
+```
+pipx install db-condenser
+```
 
 ## Running
 
@@ -73,7 +82,7 @@ Almost all the configuration is in the `config.json` file, so running it is as s
 $ uv run subset
 ```
 
-Two command-line arguments are supported:
+Three command-line arguments are supported:
 
 `-v`: Verbose output. Useful for performance debugging. Lists almost every
 query made, and its speed.

@@ -1,4 +1,5 @@
 [tools]
+python = "3.13"
 postgres = "18.3"
 
 [tasks.qa]

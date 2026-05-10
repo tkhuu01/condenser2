@@ -13,7 +13,7 @@ wheels = [
 
 [[package]]
 name = "db-condenser"
-version = "0.1.0"
+version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "faker" },
@@ -30,9 +30,9 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "faker", specifier = "==38.2.0" },
-    { name = "mysql-connector-python", specifier = "==9.5.0" },
-    { name = "psycopg", extras = ["binary"], specifier = "==3.2.13" },
+    { name = "faker", specifier = ">=38.2.0,<39" },
+    { name = "mysql-connector-python", specifier = ">=9.5.0,<10" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "toposort", specifier = "==1.10" },
 ]
 

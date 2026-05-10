@@ -1,16 +1,32 @@
 [project]
 name = "db-condenser"
-version = "0.1.0"
-description = "db-condenser"
+description = "Config-driven database subsetting tool that creates representative samples while preserving referential integrity. Modernized fork of Tonic's Condenser with performance and feature improvements."
+authors = [{ name = "Thomas Khuu" }]
+license = "MIT"
+license-files = ["LICENSE"]
+version = "1.0.0"
 readme = "README.md"
+classifiers = [
+    "Intended Audience :: Developers",
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
 requires-python = ">=3.10"
 dependencies = [
-    "faker==38.2.0",
-    "mysql-connector-python==9.5.0",
-    "psycopg[binary]==3.2.13",
+    "faker>=38.2.0,<39",
+    "mysql-connector-python>=9.5.0,<10",
+    "psycopg[binary]>=3.2",
     "toposort==1.10",
 ]
 
+[project.urls]
+Repository = "https://github.com/tkhuu01/db-condenser"
 
 [project.scripts]
 subset = "db_condenser.direct_subset:main"
@@ -25,5 +41,5 @@ dev = [
 extend-select = ["I"]
 
 [build-system]
-requires = ["uv_build>=0.9.6,<0.10.0"]
+requires = ["uv_build>=0.10.0,<0.11.12"]
 build-backend = "uv_build"
