@@ -6,7 +6,7 @@ Tonic's Condenser.
 Some changes from the original Condenser:
 
 * Concurrent thread pool usage to speed up subsetting
-* Optional temp-table strategy for memory-efficent ID batching
+* Optional temp-table strategy for memory-efficient ID batching
 * Optional Postgres COPY protocol for faster transfer
 * Automatic sequence reset after subsetting
 * Built on psycopg3 and managed with astral's uv

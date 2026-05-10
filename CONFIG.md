@@ -38,8 +38,7 @@ and `password` (optional). If `password` is omitted, you will be prompted for
 a password.
 
 `destination_db_connection_info`: Destination database connection details. Same
-fields as `source_db_connection_info`. If omitted, defaults to a local
-Postgres or MySQL instance depending on `db_type`.
+fields as `source_db_connection_info`.
 
 `initial_targets`: JSON array of JSON objects. Each object must contain a
 `table` field (the target table) and exactly one of `where` or `percent`.
