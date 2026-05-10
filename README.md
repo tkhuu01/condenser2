@@ -67,11 +67,11 @@ named `public.target_table`.
 Or, from PyPI:
 
 ```bash
-$ pip install db-condenser
+pip install db-condenser
 ```
 
 ```bash
-$ pipx install db-condenser
+pipx install db-condenser
 ```
 
 ## Running
@@ -79,7 +79,7 @@ $ pipx install db-condenser
 Almost all the configuration is in the `config.json` file, so running it is as simple as
 
 ```bash
-$ uv run subset
+uv run subset
 ```
 
 Three command-line arguments are supported:
