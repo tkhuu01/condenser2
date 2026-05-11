@@ -32,7 +32,10 @@ def _parse_args():
         "-v", "--verbose", action="store_true", help="Log every query with timing"
     )
     parser.add_argument(
-        "--config", type=str, default=None, help="Specify a custom JSON config file name"
+        "--config",
+        type=str,
+        default=None,
+        help="Specify a custom JSON config file name",
     )
     return parser.parse_args()
 
