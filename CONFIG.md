@@ -106,6 +106,14 @@ Default is `false`.
 protocol for row transfer instead of per-row INSERT statements. Significantly
 faster (5-10x for bulk inserts). Postgres only. Default is `false`.
 
+## Incremental subsetting
+
+`skip_schema_setup`: If `true`, the tool will not drop/recreate the destination
+schema or run `pg_dump`. Use this when re-running the subsetter against an
+existing destination database — for example, to add rows from different initial
+targets across multiple runs. Duplicate rows are silently skipped via
+`ON CONFLICT DO NOTHING`. Default is `false`.
+
 ## Post-processing
 
 `pre_constraint_sql`: An array of SQL commands issued on the destination

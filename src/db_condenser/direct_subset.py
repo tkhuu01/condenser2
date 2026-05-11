@@ -22,7 +22,6 @@ def db_creator(
 
 def _parse_args():
     parser = argparse.ArgumentParser(description="Database Condenser")
-    parser.add_argument("--stdin", action="store_true", help="Read config from stdin")
     parser.add_argument(
         "-y", "--yes", action="store_true", help="Skip destination confirmation prompt"
     )
@@ -31,6 +30,12 @@ def _parse_args():
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Log every query with timing"
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Specify a custom JSON config file name",
     )
     return parser.parse_args()
 
@@ -49,10 +54,10 @@ def _confirm_destination(dest_info: DbConnectInfo):
 def main():
     args = _parse_args()
 
-    if args.stdin:
-        config_reader.initialize(sys.stdin)
+    if args.config:
+        config_reader.initialize(args.config)
     else:
-        config_reader.initialize()
+        config_reader.initialize("config.json")
 
     config = config_reader.get_config()
 
@@ -68,8 +73,10 @@ def main():
     destination_dbc = DbConnect(db_type, dest_info, verbose=args.verbose)
 
     database = db_creator(db_type, source_dbc, destination_dbc)
-    database.teardown()
-    database.create()
+
+    if not config.skip_schema_setup:
+        database.teardown()
+        database.create()
 
     # Get list of tables to operate on
     db_helper = database_helper.get_specific_helper()

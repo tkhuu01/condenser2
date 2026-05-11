@@ -32,7 +32,7 @@ dev = [
 requires-dist = [
     { name = "faker", specifier = ">=38.2.0,<39" },
     { name = "mysql-connector-python", specifier = ">=9.5.0,<10" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
     { name = "toposort", specifier = "==1.10" },
 ]
 

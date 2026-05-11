@@ -82,11 +82,11 @@ def copy_rows(source, destination, query, destination_table, params=None):
     try:
         cursor.execute(query, params)
 
-        insert_query = "INSERT INTO {} {} VALUES {}".format(
+        insert_query = "INSERT INTO {} {} VALUES {} ON CONFLICT DO NOTHING".format(
             fully_qualified_table(destination_table), columns, template
         )
         if always_generated_id:
-            insert_query = "INSERT INTO {} {} OVERRIDING SYSTEM VALUE VALUES {}".format(
+            insert_query = "INSERT INTO {} {} OVERRIDING SYSTEM VALUE VALUES {} ON CONFLICT DO NOTHING".format(
                 fully_qualified_table(destination_table), columns, template
             )
 
@@ -128,14 +128,20 @@ def copy_rows_copy_protocol(source, destination, query, destination_table, param
     json_positions = {i for i, dt in enumerate(datatypes) if dt[1] in ("json", "jsonb")}
 
     column_list = ", ".join('"' + col + '"' for col in non_generated_columns)
-    copy_command = "COPY {} ({}) FROM STDIN".format(
-        fully_qualified_table(destination_table), column_list
-    )
+    dest_table = fully_qualified_table(destination_table)
+    temp_table = '"_copy_staging_' + str(uuid.uuid4()).replace("-", "") + '"'
 
     cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
     cursor = source.cursor(name=cursor_name)
     dest_cursor = destination.cursor().inner_cursor
     try:
+        dest_cursor.execute(
+            "CREATE TEMPORARY TABLE {} (LIKE {} INCLUDING DEFAULTS)".format(
+                temp_table, dest_table
+            )
+        )
+
+        copy_command = "COPY {} ({}) FROM STDIN".format(temp_table, column_list)
         cursor.execute(query, params)
 
         with dest_cursor.copy(copy_command) as copy:
@@ -159,6 +165,13 @@ def copy_rows_copy_protocol(source, destination, query, destination_table, param
                 else:
                     for row in rows:
                         copy.write_row(row)
+
+        dest_cursor.execute(
+            "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT DO NOTHING".format(
+                dest_table, column_list, column_list, temp_table
+            )
+        )
+        dest_cursor.execute("DROP TABLE {}".format(temp_table))
     finally:
         dest_cursor.close()
         cursor.close()
