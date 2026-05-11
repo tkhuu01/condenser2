@@ -41,11 +41,11 @@ def _query_one(conn, sql):
 
 
 def _run_subsetter(
-    use_temp_tables,
-    use_copy_protocol=False,
-    skip_schema_setup=False,
-    suffix_override=None,
-):
+    use_temp_tables: bool,
+    use_copy_protocol: bool = False,
+    skip_schema_setup: bool = False,
+    suffix_override: str | None = None,
+) -> tuple[str, str]:
     if suffix_override is not None:
         suffix = suffix_override
     else:
@@ -329,12 +329,17 @@ def test_sequences_reset(subsetter_dbs):
             "suffix_override": "_rerun",
         },
         {
+            "use_temp_tables": True,
+            "use_copy_protocol": False,
+            "suffix_override": "_rerun_temp_tables",
+        },
+        {
             "use_temp_tables": False,
             "use_copy_protocol": True,
             "suffix_override": "_rerun_copy",
         },
     ],
-    ids=["unnest_rerun", "copy_protocol_rerun"],
+    ids=["unnest_rerun", "temp_tables_rerun", "copy_protocol_rerun"],
 )
 def rerun_dbs(request):
     """Run the subsetter twice on the same destination with skip_schema_setup."""
