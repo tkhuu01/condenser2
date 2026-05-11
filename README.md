@@ -83,7 +83,7 @@ Almost all the configuration is in the `config.json` file, so running it is as s
 uv run subset
 ```
 
-Three command-line arguments are supported:
+Four command-line arguments are supported:
 
 `-v`: Verbose output. Useful for performance debugging. Lists almost every
 query made, and its speed.
@@ -93,3 +93,6 @@ database to the destination database. This option has no effect for MySQL.
 
 `-y`: Skip confirmation on subsetting to destination host if it isn't localhost
 or 127.0.0.1
+
+`--config <file>`: Use a custom JSON config file instead of the default
+`config.json`.
