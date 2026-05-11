@@ -8,6 +8,7 @@ Some changes from the original Condenser:
 * Concurrent thread pool usage to speed up subsetting
 * Optional temp-table strategy for memory-efficient ID batching
 * Optional Postgres COPY protocol for faster transfer
+* Incremental subsetting (skip schema setup and keep existing data)
 * Automatic sequence reset after subsetting
 * Built on psycopg3 and managed with astral's uv
 

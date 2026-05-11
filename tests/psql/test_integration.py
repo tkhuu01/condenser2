@@ -40,23 +40,29 @@ def _query_one(conn, sql):
         return cur.fetchone()[0]
 
 
-def _run_subsetter(use_temp_tables, use_copy_protocol=False):
-    suffix = "_temp" if use_temp_tables else "_copy" if use_copy_protocol else ""
+def _run_subsetter(
+    use_temp_tables, use_copy_protocol=False, skip_schema_setup=False, suffix_override=None
+):
+    if suffix_override is not None:
+        suffix = suffix_override
+    else:
+        suffix = "_temp" if use_temp_tables else "_copy" if use_copy_protocol else ""
     source_db = SOURCE_DB + suffix
     dest_db = DEST_DB + suffix
 
-    admin = _admin_conn()
-    with admin.cursor() as cur:
-        cur.execute(f"DROP DATABASE IF EXISTS {source_db}")
-        cur.execute(f"DROP DATABASE IF EXISTS {dest_db}")
-        cur.execute(f"CREATE DATABASE {source_db}")
-        cur.execute(f"CREATE DATABASE {dest_db}")
-    admin.close()
+    if not skip_schema_setup:
+        admin = _admin_conn()
+        with admin.cursor() as cur:
+            cur.execute(f"DROP DATABASE IF EXISTS {source_db}")
+            cur.execute(f"DROP DATABASE IF EXISTS {dest_db}")
+            cur.execute(f"CREATE DATABASE {source_db}")
+            cur.execute(f"CREATE DATABASE {dest_db}")
+        admin.close()
 
-    source_admin = _admin_conn(source_db)
-    with source_admin.cursor() as cur:
-        cur.execute(SEED_SQL.read_text())
-    source_admin.close()
+        source_admin = _admin_conn(source_db)
+        with source_admin.cursor() as cur:
+            cur.execute(SEED_SQL.read_text())
+        source_admin.close()
 
     with open(CONFIG_JSON, "r") as fp:
         raw_config = json.load(fp)
@@ -64,6 +70,7 @@ def _run_subsetter(use_temp_tables, use_copy_protocol=False):
     raw_config["destination_db_connection_info"]["db_name"] = dest_db
     raw_config["use_temp_tables"] = use_temp_tables
     raw_config["use_copy_protocol"] = use_copy_protocol
+    raw_config["skip_schema_setup"] = skip_schema_setup
 
     config_reader.reset_config()
     config_reader.config = config_reader._raw_dict_to_config(raw_config)
@@ -74,8 +81,9 @@ def _run_subsetter(use_temp_tables, use_copy_protocol=False):
     destination_dbc = DbConnect(db_type, config.destination_db_connection_info)
 
     database = db_creator(db_type, source_dbc, destination_dbc)
-    database.teardown()
-    database.create()
+    if not skip_schema_setup:
+        database.teardown()
+        database.create()
 
     db_helper = database_helper.get_specific_helper()
     all_tables = db_helper.list_all_tables(source_dbc)
@@ -86,18 +94,19 @@ def _run_subsetter(use_temp_tables, use_copy_protocol=False):
         subsetter.prep_temp_dbs()
         subsetter.run_middle_out()
 
-        for sql_stmt in config.pre_constraint_sql:
-            db_helper.run_query(sql_stmt, destination_dbc.get_db_connection())
+        if not skip_schema_setup:
+            for sql_stmt in config.pre_constraint_sql:
+                db_helper.run_query(sql_stmt, destination_dbc.get_db_connection())
 
-        database.add_constraints()
+            database.add_constraints()
 
-        for sql_stmt in config.post_subset_sql:
-            db_helper.run_query(sql_stmt, destination_dbc.get_db_connection())
+            for sql_stmt in config.post_subset_sql:
+                db_helper.run_query(sql_stmt, destination_dbc.get_db_connection())
 
-        all_tables_no_pg = [t for t in all_tables if "pgbench" not in t]
-        dest_conn = destination_dbc.get_db_connection()
-        assert isinstance(dest_conn, PsqlConnection)
-        db_helper.update_sequence_numbering(dest_conn, all_tables_no_pg)
+            all_tables_no_pg = [t for t in all_tables if "pgbench" not in t]
+            dest_conn = destination_dbc.get_db_connection()
+            assert isinstance(dest_conn, PsqlConnection)
+            db_helper.update_sequence_numbering(dest_conn, all_tables_no_pg)
     finally:
         subsetter.unprep_temp_dbs()
         subsetter.close_connections()
@@ -306,3 +315,60 @@ def test_sequences_reset(subsetter_dbs):
         assert seq_val >= max_id, (
             f"{schema}.{table}: sequence value ({seq_val}) should be >= max id ({max_id})"
         )
+
+
+@pytest.fixture(
+    scope="module",
+    params=[
+        {"use_temp_tables": False, "use_copy_protocol": False, "suffix_override": "_rerun"},
+        {"use_temp_tables": False, "use_copy_protocol": True, "suffix_override": "_rerun_copy"},
+    ],
+    ids=["unnest_rerun", "copy_protocol_rerun"],
+)
+def rerun_dbs(request):
+    """Run the subsetter twice on the same destination with skip_schema_setup."""
+    source_db, dest_db = _run_subsetter(**request.param)
+    _run_subsetter(**request.param, skip_schema_setup=True)
+
+    dest = psycopg.connect(
+        dbname=dest_db,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT,
+    )
+    yield dest
+    dest.close()
+
+    admin = _admin_conn()
+    with admin.cursor() as cur:
+        for db in (source_db, dest_db):
+            cur.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid()",
+                (db,),
+            )
+            cur.execute(f"DROP DATABASE IF EXISTS {db}")
+    admin.close()
+
+
+def test_rerun_no_duplicate_rows(rerun_dbs):
+    dest = rerun_dbs
+    for table in ["sales.customers", "sales.orders", "sales.order_lines"]:
+        total = _query_one(dest, f"SELECT COUNT(*) FROM {table}")
+        distinct = _query_one(dest, f"SELECT COUNT(DISTINCT id) FROM {table}")
+        assert total == distinct, f"{table}: found duplicate rows after rerun"
+
+
+def test_rerun_fk_integrity(rerun_dbs):
+    dest = rerun_dbs
+    orphans = _query_one(
+        dest,
+        """
+        SELECT COUNT(*) FROM sales.orders o
+        WHERE NOT EXISTS (
+            SELECT 1 FROM sales.customers c WHERE c.id = o.customer_id
+        )
+        """,
+    )
+    assert orphans == 0

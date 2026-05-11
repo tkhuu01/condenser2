@@ -83,6 +83,7 @@ class Config:
     max_rows_per_table: int | Literal["ALL"] | None = None
     use_temp_tables: bool = False
     use_copy_protocol: bool = False
+    skip_schema_setup: bool = False
     pre_constraint_sql: list[str] = field(default_factory=list)
     post_subset_sql: list[str] = field(default_factory=list)
 
@@ -145,6 +146,7 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
     max_rows_per_table = raw_config.get("max_rows_per_table", None)
     use_temp_tables = bool(raw_config.get("use_temp_tables", False))
     use_copy_protocol = bool(raw_config.get("use_copy_protocol", False))
+    skip_schema_setup = bool(raw_config.get("skip_schema_setup", False))
     return Config(
         db_type=db_type,
         initial_targets=initial_targets,
@@ -161,21 +163,19 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
         max_rows_per_table=max_rows_per_table,
         use_temp_tables=use_temp_tables,
         use_copy_protocol=use_copy_protocol,
+        skip_schema_setup=skip_schema_setup,
         pre_constraint_sql=pre_constraint_sql,
         post_subset_sql=post_subset_sql,
     )
 
 
-def initialize(file_like=None):
+def initialize(file_name: str):
     global config
     if config:
         print("WARNING: Attempted to initialize configuration twice.", file=sys.stderr)
 
-    if not file_like:
-        with open("config.json", "r") as fp:
-            raw_config = json.load(fp)
-    else:
-        raw_config = json.load(file_like)
+    with open(file_name, "r") as fp:
+        raw_config = json.load(fp)
 
     config = _raw_dict_to_config(raw_config)
 
