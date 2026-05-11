@@ -5,9 +5,9 @@ postgres = "18.3"
 [tasks.qa]
 description = "Format, sort imports, and lint"
 run = [
-    "uv run ruff format src/",
-    "uv run ruff check --select I --fix src/",
-    "uv run ruff check src/"
+    "uv run ruff format",
+    "uv run ruff check --select I --fix",
+    "uv run ruff check"
 ]
 
 [tasks.test]

@@ -41,7 +41,10 @@ def _query_one(conn, sql):
 
 
 def _run_subsetter(
-    use_temp_tables, use_copy_protocol=False, skip_schema_setup=False, suffix_override=None
+    use_temp_tables,
+    use_copy_protocol=False,
+    skip_schema_setup=False,
+    suffix_override=None,
 ):
     if suffix_override is not None:
         suffix = suffix_override
@@ -320,8 +323,16 @@ def test_sequences_reset(subsetter_dbs):
 @pytest.fixture(
     scope="module",
     params=[
-        {"use_temp_tables": False, "use_copy_protocol": False, "suffix_override": "_rerun"},
-        {"use_temp_tables": False, "use_copy_protocol": True, "suffix_override": "_rerun_copy"},
+        {
+            "use_temp_tables": False,
+            "use_copy_protocol": False,
+            "suffix_override": "_rerun",
+        },
+        {
+            "use_temp_tables": False,
+            "use_copy_protocol": True,
+            "suffix_override": "_rerun_copy",
+        },
     ],
     ids=["unnest_rerun", "copy_protocol_rerun"],
 )
