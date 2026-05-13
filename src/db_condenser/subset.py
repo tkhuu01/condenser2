@@ -352,28 +352,37 @@ class Subset:
                 table_name(target), schema_name(target), self.__source_conn
             )
         }
-        id_temps = []
+        groups = {}
         for kc in relevant_key_constraints:
-            kc_target = kc["target_table"]
+            key = (kc["target_table"], tuple(kc["target_columns"]))
+            groups.setdefault(key, []).append(kc)
+
+        group_temps = {}
+        for kc_target, target_cols in groups:
             qualified_table = fully_qualified_table(
                 mysql_db_name_hack(kc_target, self.__destination_conn)
             )
             dest_query = "SELECT {} FROM {}".format(
-                columns_joined(kc["target_columns"]), qualified_table
+                columns_joined(target_cols), qualified_table
             )
-            id_temp = self.__stream_ids_to_source_temp(dest_query, kc["target_columns"])
-            id_temps.append((id_temp, kc["fk_columns"]))
+            group_temps[(kc_target, target_cols)] = self.__stream_ids_to_source_temp(
+                dest_query, target_cols
+            )
 
         fqt = fully_qualified_table(target)
         joins = ""
-        for id_temp, fk_cols in id_temps:
+        for idx, kc in enumerate(relevant_key_constraints):
+            key = (kc["target_table"], tuple(kc["target_columns"]))
+            id_temp = group_temps[key]
+            fk_cols = kc["fk_columns"]
+            alias = "_ids{}".format(idx)
             join_conditions = " AND ".join(
-                '{}.{} = "{}".col{}::{}'.format(
-                    fqt, quoter(col), id_temp, i, fk_datatypes[col]
+                "{}.{} = {}.col{}::{}".format(
+                    fqt, quoter(col), alias, i, fk_datatypes[col]
                 )
                 for i, col in enumerate(fk_cols)
             )
-            joins += ' JOIN "{}" ON {}'.format(id_temp, join_conditions)
+            joins += ' JOIN "{}" AS {} ON {}'.format(id_temp, alias, join_conditions)
 
         q = "SELECT {}.* FROM {}{}".format(fqt, fqt, joins)
         if upstream_filters:
@@ -392,18 +401,22 @@ class Subset:
             )
         }
 
-        all_id_rows = {}
+        groups = {}
+        for kc in relevant_key_constraints:
+            key = (kc["target_table"], tuple(kc["target_columns"]))
+            groups.setdefault(key, []).append(kc)
+
+        group_rows = {}
         cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
         dest_cursor = self.__destination_conn.cursor(name=cursor_name, withhold=True)
         try:
             fetch_row_count = 100000
-            for kc in relevant_key_constraints:
-                kc_target = kc["target_table"]
+            for kc_target, target_cols in groups:
                 qualified_table = fully_qualified_table(
                     mysql_db_name_hack(kc_target, self.__destination_conn)
                 )
                 query = "SELECT {} FROM {}".format(
-                    columns_joined(kc["target_columns"]), qualified_table
+                    columns_joined(target_cols), qualified_table
                 )
                 dest_cursor.execute(query)
                 rows = []
@@ -412,35 +425,39 @@ class Subset:
                     if not batch:
                         break
                     rows.extend(row for row in batch if all(c is not None for c in row))
-                fk_cols = kc["fk_columns"]
-                all_id_rows[id(kc)] = (fk_cols, rows)
+                group_rows[(kc_target, target_cols)] = rows
         finally:
             dest_cursor.close()
 
-        if not any(rows for _, rows in all_id_rows.values()):
+        if not any(group_rows.values()):
             return
 
         fqt = fully_qualified_table(target)
         joins = ""
         all_params = []
-        for idx, (_, (fk_cols, rows)) in enumerate(all_id_rows.items()):
-            unnest_args = ", ".join(
-                "%s::{}[]".format(fk_datatypes[col]) for col in fk_cols
-            )
-            join_cols = ", ".join("col{}".format(i) for i in range(len(fk_cols)))
-            join_conditions = " AND ".join(
-                "{}.{} = ids{}.col{}".format(fqt, quoter(col), idx, i)
-                for i, col in enumerate(fk_cols)
-            )
-            joins += (
-                " JOIN unnest({unnest}) AS ids{idx}({join_cols}) ON {conds}".format(
-                    unnest=unnest_args,
-                    idx=idx,
-                    join_cols=join_cols,
-                    conds=join_conditions,
+        join_idx = 0
+        for group_key, kcs in groups.items():
+            rows = group_rows[group_key]
+            for kc in kcs:
+                fk_cols = kc["fk_columns"]
+                unnest_args = ", ".join(
+                    "%s::{}[]".format(fk_datatypes[col]) for col in fk_cols
                 )
-            )
-            all_params.extend([row[i] for row in rows] for i in range(len(fk_cols)))
+                join_cols = ", ".join("col{}".format(i) for i in range(len(fk_cols)))
+                join_conditions = " AND ".join(
+                    "{}.{} = ids{}.col{}".format(fqt, quoter(col), join_idx, i)
+                    for i, col in enumerate(fk_cols)
+                )
+                joins += (
+                    " JOIN unnest({unnest}) AS ids{idx}({join_cols}) ON {conds}".format(
+                        unnest=unnest_args,
+                        idx=join_idx,
+                        join_cols=join_cols,
+                        conds=join_conditions,
+                    )
+                )
+                all_params.extend([row[i] for row in rows] for i in range(len(fk_cols)))
+                join_idx += 1
 
         q = "SELECT {}.* FROM {}{}".format(fqt, fqt, joins)
         if upstream_filters:
@@ -477,16 +494,18 @@ class Subset:
             fk_table = r["fk_table"]
             fk_columns = r["fk_columns"]
 
-            select_q = "SELECT {} FROM {} WHERE {} NOT IN (SELECT {} FROM {})".format(
-                columns_joined(fk_columns),
-                fully_qualified_table(
-                    mysql_db_name_hack(fk_table, self.__destination_conn)
-                ),
-                columns_tupled(fk_columns),
-                columns_joined(pk_columns),
-                fully_qualified_table(
-                    mysql_db_name_hack(table, self.__destination_conn)
-                ),
+            select_q = (
+                "SELECT DISTINCT {} FROM {} WHERE {} NOT IN (SELECT {} FROM {})".format(
+                    columns_joined(fk_columns),
+                    fully_qualified_table(
+                        mysql_db_name_hack(fk_table, self.__destination_conn)
+                    ),
+                    columns_tupled(fk_columns),
+                    columns_joined(pk_columns),
+                    fully_qualified_table(
+                        mysql_db_name_hack(table, self.__destination_conn)
+                    ),
+                )
             )
             insert_q = 'INSERT INTO "{}" {}'.format(temp_table, select_q)
             with self.__destination_conn.cursor() as cur:
