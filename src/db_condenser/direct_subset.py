@@ -99,7 +99,7 @@ def main():
         )
 
         print("Adding database constraints")
-        if not args.no_constraints:
+        if not args.no_constraints and not config.skip_schema_setup:
             database.add_constraints()
 
         print("Beginning post subset SQL calls")

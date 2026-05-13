@@ -286,6 +286,58 @@ def test_upstream_multi_fk_and_semantics(subsetter_dbs):
     assert count == 3
 
 
+def test_upstream_order_lines_multi_fk_no_orphans(subsetter_dbs):
+    """order_lines has FKs to orders and products (different target tables).
+    Verifies grouped ID collection keeps separate groups distinct."""
+    _, dest = subsetter_dbs
+    order_orphans = _query_one(
+        dest,
+        """
+        SELECT COUNT(*) FROM sales.order_lines ol
+        WHERE NOT EXISTS (
+            SELECT 1 FROM sales.orders o WHERE o.id = ol.order_id
+        )
+        """,
+    )
+    product_orphans = _query_one(
+        dest,
+        """
+        SELECT COUNT(*) FROM sales.order_lines ol
+        WHERE NOT EXISTS (
+            SELECT 1 FROM inventory.products p WHERE p.id = ol.product_id
+        )
+        """,
+    )
+    assert order_orphans == 0
+    assert product_orphans == 0
+
+
+def test_stock_levels_fk_integrity(subsetter_dbs):
+    """stock_levels has a composite PK and FKs to both warehouses and products.
+    Verifies downstream subsetting pulls in all referenced rows."""
+    _, dest = subsetter_dbs
+    warehouse_orphans = _query_one(
+        dest,
+        """
+        SELECT COUNT(*) FROM inventory.stock_levels sl
+        WHERE NOT EXISTS (
+            SELECT 1 FROM inventory.warehouses w WHERE w.id = sl.warehouse_id
+        )
+        """,
+    )
+    product_orphans = _query_one(
+        dest,
+        """
+        SELECT COUNT(*) FROM inventory.stock_levels sl
+        WHERE NOT EXISTS (
+            SELECT 1 FROM inventory.products p WHERE p.id = sl.product_id
+        )
+        """,
+    )
+    assert warehouse_orphans == 0
+    assert product_orphans == 0
+
+
 def test_destination_has_fewer_rows(subsetter_dbs):
     source, dest = subsetter_dbs
     for table in ["sales.customers", "sales.orders", "sales.order_lines"]:

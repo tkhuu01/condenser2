@@ -84,6 +84,20 @@ CREATE TABLE public.feature_flags (
 );
 
 -- ============================================================
+-- INDEXES & CONSTRAINTS (exercises subsetter against production-like schema)
+-- ============================================================
+CREATE UNIQUE INDEX idx_customers_email ON sales.customers (email);
+CREATE INDEX idx_orders_customer_id ON sales.orders (customer_id);
+CREATE INDEX idx_orders_warehouse_id ON sales.orders (warehouse_id);
+CREATE INDEX idx_orders_ordered_at ON sales.orders (ordered_at);
+CREATE INDEX idx_order_lines_order_id ON sales.order_lines (order_id);
+CREATE INDEX idx_order_lines_product_id ON sales.order_lines (product_id);
+CREATE UNIQUE INDEX idx_order_transfers_pair ON sales.order_transfers (from_order_id, to_order_id);
+ALTER TABLE sales.order_lines ADD CONSTRAINT chk_quantity_positive CHECK (quantity > 0);
+ALTER TABLE sales.order_lines ADD CONSTRAINT chk_unit_price_positive CHECK (unit_price >= 0);
+ALTER TABLE inventory.products ADD CONSTRAINT chk_price_positive CHECK (price >= 0);
+
+-- ============================================================
 -- SEED DATA
 -- ============================================================
 
