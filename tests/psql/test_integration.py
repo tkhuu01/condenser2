@@ -45,6 +45,7 @@ def _run_subsetter(
     use_copy_protocol: bool = False,
     skip_schema_setup: bool = False,
     suffix_override: str | None = None,
+    parallel_read_workers: int = 1,
 ) -> tuple[str, str]:
     if suffix_override is not None:
         suffix = suffix_override
@@ -74,6 +75,7 @@ def _run_subsetter(
     raw_config["use_temp_tables"] = use_temp_tables
     raw_config["use_copy_protocol"] = use_copy_protocol
     raw_config["skip_schema_setup"] = skip_schema_setup
+    raw_config["parallel_read_workers"] = parallel_read_workers
 
     config_reader.reset_config()
     config_reader.config = config_reader._raw_dict_to_config(raw_config)
@@ -430,6 +432,78 @@ def test_rerun_no_duplicate_rows(rerun_dbs):
 
 def test_rerun_fk_integrity(rerun_dbs):
     dest = rerun_dbs
+    orphans = _query_one(
+        dest,
+        """
+        SELECT COUNT(*) FROM sales.orders o
+        WHERE NOT EXISTS (
+            SELECT 1 FROM sales.customers c WHERE c.id = o.customer_id
+        )
+        """,
+    )
+    assert orphans == 0
+
+
+@pytest.fixture(scope="module")
+def parallel_dbs():
+    """Run subsetter with parallel ctid page-range splitting."""
+    source_db, dest_db = _run_subsetter(
+        use_temp_tables=False,
+        use_copy_protocol=False,
+        parallel_read_workers=4,
+        suffix_override="_parallel",
+    )
+
+    source = psycopg.connect(
+        dbname=source_db,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT,
+    )
+    dest = psycopg.connect(
+        dbname=dest_db,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT,
+    )
+
+    yield source, dest
+
+    source.close()
+    dest.close()
+
+    admin = _admin_conn()
+    with admin.cursor() as cur:
+        for db in (source_db, dest_db):
+            cur.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid()",
+                (db,),
+            )
+            cur.execute(f"DROP DATABASE IF EXISTS {db}")
+    admin.close()
+
+
+def test_parallel_target_filtered(parallel_dbs):
+    source, dest = parallel_dbs
+    source_count = _query_one(source, "SELECT COUNT(*) FROM sales.customers")
+    dest_count = _query_one(dest, "SELECT COUNT(*) FROM sales.customers")
+    assert dest_count < source_count
+    assert dest_count >= 5
+
+
+def test_parallel_no_duplicate_rows(parallel_dbs):
+    _, dest = parallel_dbs
+    for table in ["sales.customers", "sales.orders", "sales.order_lines"]:
+        total = _query_one(dest, f"SELECT COUNT(*) FROM {table}")
+        distinct = _query_one(dest, f"SELECT COUNT(DISTINCT id) FROM {table}")
+        assert total == distinct, f"{table}: duplicate rows with parallel reads"
+
+
+def test_parallel_fk_integrity(parallel_dbs):
+    _, dest = parallel_dbs
     orphans = _query_one(
         dest,
         """

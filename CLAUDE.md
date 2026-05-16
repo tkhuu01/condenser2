@@ -74,6 +74,21 @@ Row transfer from source to destination uses `copy_rows` in `psql_database_helpe
 
 The copy function is selected once in `Subset.__init__` and stored as `self.__copy_rows`, used by all 8 call sites.
 
+### Parallel Read (Direct Targets)
+
+When `parallel_read_workers` > 1, direct target tables are read in parallel using ctid page-range splitting:
+
+- Queries `pg_class.relpages` to get total heap pages (instant, no table scan)
+- Divides pages evenly among N workers; each worker reads its page range via TID Range Scan
+- Each worker: `WHERE ctid >= '(start,0)'::tid AND ctid < '(end,0)'::tid AND (<user_where>)`
+- Each worker gets its own source + destination connection; `ON CONFLICT DO NOTHING` deduplicates
+- Falls back to single-threaded if the table has fewer pages than `workers * 10`
+- Works for any PK type (UUID, text, composite, or no PK at all) — splits by physical storage, not key values
+
+Designed for read-only replicas where parallel reads are safe (AccessShareLock only). Source connections use `REPEATABLE READ` isolation for consistent snapshots across workers. Requires PostgreSQL 12+ for TID Range Scan support.
+
+Config: `"parallel_read_workers": 4` (default `1` = sequential, current behavior)
+
 ### Database Support
 - **PostgreSQL:** Full support including sequence reset, named cursors, JSON casting
 - **MySQL:** Functional but limited (no sequence reset, no constraint re-application, no cross-db FKs)

@@ -106,6 +106,11 @@ Default is `false`.
 protocol for row transfer instead of per-row INSERT statements. Significantly
 faster (5-10x for bulk inserts). Postgres only. Default is `false`.
 
+`parallel_read_workers`: Number of parallel connections used to read direct
+target tables from the source. Splits work by physical page ranges (ctid),
+so it works for any table regardless of primary key type. Designed for
+read-only replicas. Requires PostgreSQL 12+. Default is `1` (sequential).
+
 ## Incremental subsetting
 
 `skip_schema_setup`: If `true`, the tool will not drop/recreate the destination

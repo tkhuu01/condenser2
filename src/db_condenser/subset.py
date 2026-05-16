@@ -48,6 +48,8 @@ class Subset:
         destination_dbc: DbConnect,
         all_tables: list[str],
     ):
+        self.__source_dbc = source_dbc
+        self.__destination_dbc = destination_dbc
         self.__source_conn = source_dbc.get_db_connection(read_repeatable=True)
         self.__destination_conn = destination_dbc.get_db_connection()
 
@@ -65,6 +67,13 @@ class Subset:
 
         if self.config.use_temp_tables:
             self.__check_source_writable()
+
+        self.__source_pool = []
+        if self.config.parallel_read_workers > 1:
+            for _ in range(self.config.parallel_read_workers):
+                self.__source_pool.append(
+                    source_dbc.get_db_connection(read_repeatable=True)
+                )
 
     def __check_source_writable(self):
         if self.config.db_type == DbType.POSTGRES:
@@ -118,7 +127,11 @@ class Subset:
         )
         start_time = time.time()
         processed_tables = set()
-        if len(self.config.initial_targets) >= 3:
+        if self.config.parallel_read_workers > 1:
+            for idx, target in enumerate(self.config.initial_targets):
+                print_progress(target, idx + 1, len(self.config.initial_targets))
+                self.__subset_direct_parallel(target, relationships)
+        elif len(self.config.initial_targets) >= 3:
             self.__subset_direct_concurrent(relationships)
         else:
             for idx, target in enumerate(self.config.initial_targets):
@@ -191,6 +204,8 @@ class Subset:
     def close_connections(self):
         self.__source_conn.close()
         self.__destination_conn.close()
+        for conn in self.__source_pool:
+            conn.close()
 
     def __copy_table_worker(self, table):
         q = "SELECT * FROM {}".format(fully_qualified_table(table))
@@ -220,6 +235,60 @@ class Subset:
             for idx, future in enumerate(as_completed(futures)):
                 target = futures[future]
                 print_progress(target, idx + 1, len(targets))
+                future.result()
+
+    def __subset_direct_parallel(self, target: InitialTarget, relationships):
+        """Subset a direct target using parallel ctid page-range splitting."""
+        t = target.table
+        num_workers = self.config.parallel_read_workers
+
+        page_count = self.__db_helper.get_table_page_count(
+            table_name(t), schema_name(t), self.__source_conn
+        )
+        if page_count < num_workers * 10:
+            self.__subset_direct(target, relationships)
+            return
+
+        columns_query = columns_to_copy(t, relationships, self.__source_conn)
+        fqt = fully_qualified_table(t)
+        pages_per_worker = page_count // num_workers
+
+        def worker(idx, start_page, end_page):
+            source_conn = self.__source_pool[idx]
+            dest_conn = self.__destination_dbc.get_db_connection()
+            try:
+                ctid_filter = (
+                    "{}.ctid >= '({},0)'::tid AND {}.ctid < '({},0)'::tid".format(
+                        fqt, start_page, fqt, end_page
+                    )
+                )
+                if target.where is not None:
+                    q = "SELECT {} FROM {} WHERE ({}) AND ({})".format(
+                        columns_query, fqt, target.where, ctid_filter
+                    )
+                elif target.percent is not None:
+                    q = "SELECT {} FROM {} WHERE random() < {} AND ({})".format(
+                        columns_query, fqt, float(target.percent) / 100, ctid_filter
+                    )
+                else:
+                    q = "SELECT {} FROM {} WHERE {}".format(
+                        columns_query, fqt, ctid_filter
+                    )
+                self.__copy_rows(source_conn, dest_conn, q, t)
+            finally:
+                dest_conn.close()
+
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            futures = []
+            for idx in range(num_workers):
+                start_page = idx * pages_per_worker
+                end_page = (
+                    page_count
+                    if idx == num_workers - 1
+                    else (idx + 1) * pages_per_worker
+                )
+                futures.append(pool.submit(worker, idx, start_page, end_page))
+            for future in as_completed(futures):
                 future.result()
 
     def __stream_ids_to_source_temp(self, dest_query, columns):

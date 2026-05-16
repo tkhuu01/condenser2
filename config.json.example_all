@@ -38,6 +38,7 @@
     "use_temp_tables": false,
     "use_copy_protocol": false,
     "skip_schema_setup": false,
+    "parallel_read_workers": 4,
     "excluded_tables": [
         "public.table_to_ignore", "public.spatial_ref_sys"
     ],

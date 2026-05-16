@@ -84,6 +84,7 @@ class Config:
     use_temp_tables: bool = False
     use_copy_protocol: bool = False
     skip_schema_setup: bool = False
+    parallel_read_workers: int = 1
     pre_constraint_sql: list[str] = field(default_factory=list)
     post_subset_sql: list[str] = field(default_factory=list)
 
@@ -147,6 +148,7 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
     use_temp_tables = bool(raw_config.get("use_temp_tables", False))
     use_copy_protocol = bool(raw_config.get("use_copy_protocol", False))
     skip_schema_setup = bool(raw_config.get("skip_schema_setup", False))
+    parallel_read_workers = int(raw_config.get("parallel_read_workers", 1))
     return Config(
         db_type=db_type,
         initial_targets=initial_targets,
@@ -164,6 +166,7 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
         use_temp_tables=use_temp_tables,
         use_copy_protocol=use_copy_protocol,
         skip_schema_setup=skip_schema_setup,
+        parallel_read_workers=parallel_read_workers,
         pre_constraint_sql=pre_constraint_sql,
         post_subset_sql=post_subset_sql,
     )

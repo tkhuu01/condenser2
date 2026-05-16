@@ -409,6 +409,18 @@ def list_all_tables(db_connect):
         return [r[0] for r in cur.fetchall()]
 
 
+def get_table_page_count(table, schema, conn):
+    """Return the number of heap pages for a table from pg_class."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT relpages FROM pg_class WHERE oid='"{}"."{}"'::regclass""".format(
+                schema, table
+            )
+        )
+        row = cur.fetchone()
+    return row[0] if row else 0
+
+
 def get_table_datatypes(table, schema, conn):
     if not schema:
         table_clause = "cl.relname = '{}'".format(table)
