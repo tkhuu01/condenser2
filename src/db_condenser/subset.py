@@ -69,7 +69,10 @@ class Subset:
             self.__check_source_writable()
 
         self.__source_pool = []
-        if self.config.parallel_read_workers > 1:
+        if (
+            self.config.parallel_read_workers > 1
+            and self.config.db_type == DbType.POSTGRES
+        ):
             for _ in range(self.config.parallel_read_workers):
                 self.__source_pool.append(
                     source_dbc.get_db_connection(read_repeatable=True)
@@ -127,7 +130,10 @@ class Subset:
         )
         start_time = time.time()
         processed_tables = set()
-        if self.config.parallel_read_workers > 1:
+        if (
+            self.config.parallel_read_workers > 1
+            and self.config.db_type == DbType.POSTGRES
+        ):
             for idx, target in enumerate(self.config.initial_targets):
                 print_progress(target, idx + 1, len(self.config.initial_targets))
                 self.__subset_direct_parallel(target, relationships)

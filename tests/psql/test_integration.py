@@ -444,14 +444,21 @@ def test_rerun_fk_integrity(rerun_dbs):
     assert orphans == 0
 
 
-@pytest.fixture(scope="module")
-def parallel_dbs():
+@pytest.fixture(
+    scope="module",
+    params=[
+        {"use_copy_protocol": False, "suffix_override": "_parallel"},
+        {"use_copy_protocol": True, "suffix_override": "_parallel_copy"},
+    ],
+    ids=["parallel_unnest", "parallel_copy_protocol"],
+)
+def parallel_dbs(request):
     """Run subsetter with parallel ctid page-range splitting."""
     source_db, dest_db = _run_subsetter(
         use_temp_tables=False,
-        use_copy_protocol=False,
+        use_copy_protocol=request.param["use_copy_protocol"],
         parallel_read_workers=4,
-        suffix_override="_parallel",
+        suffix_override=request.param["suffix_override"],
     )
 
     source = psycopg.connect(
