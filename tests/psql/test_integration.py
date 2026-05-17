@@ -45,6 +45,7 @@ def _run_subsetter(
     use_copy_protocol: bool = False,
     skip_schema_setup: bool = False,
     suffix_override: str | None = None,
+    parallel_read_workers: int = 1,
 ) -> tuple[str, str]:
     if suffix_override is not None:
         suffix = suffix_override
@@ -74,6 +75,7 @@ def _run_subsetter(
     raw_config["use_temp_tables"] = use_temp_tables
     raw_config["use_copy_protocol"] = use_copy_protocol
     raw_config["skip_schema_setup"] = skip_schema_setup
+    raw_config["parallel_read_workers"] = parallel_read_workers
 
     config_reader.reset_config()
     config_reader.config = config_reader._raw_dict_to_config(raw_config)
@@ -440,3 +442,177 @@ def test_rerun_fk_integrity(rerun_dbs):
         """,
     )
     assert orphans == 0
+
+
+@pytest.fixture(
+    scope="module",
+    params=[
+        {"use_copy_protocol": False, "suffix_override": "_parallel"},
+        {"use_copy_protocol": True, "suffix_override": "_parallel_copy"},
+    ],
+    ids=["parallel_unnest", "parallel_copy_protocol"],
+)
+def parallel_dbs(request):
+    """Run subsetter with parallel ctid page-range splitting."""
+    source_db, dest_db = _run_subsetter(
+        use_temp_tables=False,
+        use_copy_protocol=request.param["use_copy_protocol"],
+        parallel_read_workers=4,
+        suffix_override=request.param["suffix_override"],
+    )
+
+    source = psycopg.connect(
+        dbname=source_db,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT,
+    )
+    dest = psycopg.connect(
+        dbname=dest_db,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT,
+    )
+
+    yield source, dest
+
+    source.close()
+    dest.close()
+
+    admin = _admin_conn()
+    with admin.cursor() as cur:
+        for db in (source_db, dest_db):
+            cur.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid()",
+                (db,),
+            )
+            cur.execute(f"DROP DATABASE IF EXISTS {db}")
+    admin.close()
+
+
+def test_parallel_target_filtered(parallel_dbs):
+    source, dest = parallel_dbs
+    source_count = _query_one(source, "SELECT COUNT(*) FROM sales.customers")
+    dest_count = _query_one(dest, "SELECT COUNT(*) FROM sales.customers")
+    assert dest_count < source_count
+    assert dest_count >= 5
+
+
+def test_parallel_no_duplicate_rows(parallel_dbs):
+    _, dest = parallel_dbs
+    for table in ["sales.customers", "sales.orders", "sales.order_lines"]:
+        total = _query_one(dest, f"SELECT COUNT(*) FROM {table}")
+        distinct = _query_one(dest, f"SELECT COUNT(DISTINCT id) FROM {table}")
+        assert total == distinct, f"{table}: duplicate rows with parallel reads"
+
+
+def test_parallel_fk_integrity(parallel_dbs):
+    _, dest = parallel_dbs
+    orphans = _query_one(
+        dest,
+        """
+        SELECT COUNT(*) FROM sales.orders o
+        WHERE NOT EXISTS (
+            SELECT 1 FROM sales.customers c WHERE c.id = o.customer_id
+        )
+        """,
+    )
+    assert orphans == 0
+
+
+@pytest.fixture(scope="module")
+def pre_filter_dbs():
+    """Run subsetter with a pre_filter to simulate FDW-based filtering."""
+    source_db = SOURCE_DB + "_prefilter"
+    dest_db = DEST_DB + "_prefilter"
+
+    admin = _admin_conn()
+    with admin.cursor() as cur:
+        cur.execute(f"DROP DATABASE IF EXISTS {source_db}")
+        cur.execute(f"DROP DATABASE IF EXISTS {dest_db}")
+        cur.execute(f"CREATE DATABASE {source_db}")
+        cur.execute(f"CREATE DATABASE {dest_db}")
+    admin.close()
+
+    source_admin = _admin_conn(source_db)
+    with source_admin.cursor() as cur:
+        cur.execute(SEED_SQL.read_text())
+    source_admin.close()
+
+    with open(CONFIG_JSON, "r") as fp:
+        raw_config = json.load(fp)
+    raw_config["source_db_connection_info"]["db_name"] = source_db
+    raw_config["destination_db_connection_info"]["db_name"] = dest_db
+    raw_config["initial_targets"] = [
+        {"table": "sales.customers", "where": "1=1", "pre_filter": "region_ids"}
+    ]
+    raw_config["pre_filters"] = [
+        {
+            "name": "region_ids",
+            "query": "SELECT id FROM sales.customers WHERE region = 'US-W'",
+            "column": "id",
+        }
+    ]
+    raw_config["parallel_read_workers"] = 4
+
+    config_reader.reset_config()
+    config_reader.config = config_reader._raw_dict_to_config(raw_config)
+
+    config = config_reader.get_config()
+    db_type = config.db_type
+    source_dbc = DbConnect(db_type, config.source_db_connection_info)
+    destination_dbc = DbConnect(db_type, config.destination_db_connection_info)
+
+    database = db_creator(db_type, source_dbc, destination_dbc)
+    database.teardown()
+    database.create()
+
+    db_helper = database_helper.get_specific_helper()
+    all_tables = db_helper.list_all_tables(source_dbc)
+    all_tables = [x for x in all_tables if x not in config.excluded_tables]
+
+    subsetter = Subset(source_dbc, destination_dbc, all_tables)
+    try:
+        subsetter.prep_temp_dbs()
+        subsetter.run_middle_out()
+    finally:
+        subsetter.unprep_temp_dbs()
+        subsetter.close_connections()
+
+    dest = psycopg.connect(
+        dbname=dest_db,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT,
+    )
+
+    yield dest
+
+    dest.close()
+
+    admin = _admin_conn()
+    with admin.cursor() as cur:
+        for db in (source_db, dest_db):
+            cur.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid()",
+                (db,),
+            )
+            cur.execute(f"DROP DATABASE IF EXISTS {db}")
+    admin.close()
+
+
+def test_pre_filter_limits_rows(pre_filter_dbs):
+    dest = pre_filter_dbs
+    count = _query_one(dest, "SELECT COUNT(*) FROM sales.customers")
+    # Only US-W customers: Alice(1), Eve(5), Iris(9) = 3
+    assert count == 3
+    regions = _query_one(
+        dest,
+        "SELECT COUNT(DISTINCT region) FROM sales.customers",
+    )
+    assert regions == 1

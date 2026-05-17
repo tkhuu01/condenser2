@@ -48,6 +48,8 @@ class Subset:
         destination_dbc: DbConnect,
         all_tables: list[str],
     ):
+        self.__source_dbc = source_dbc
+        self.__destination_dbc = destination_dbc
         self.__source_conn = source_dbc.get_db_connection(read_repeatable=True)
         self.__destination_conn = destination_dbc.get_db_connection()
 
@@ -65,6 +67,16 @@ class Subset:
 
         if self.config.use_temp_tables:
             self.__check_source_writable()
+
+        self.__source_pool = []
+        if (
+            self.config.parallel_read_workers > 1
+            and self.config.db_type == DbType.POSTGRES
+        ):
+            for _ in range(self.config.parallel_read_workers):
+                self.__source_pool.append(
+                    source_dbc.get_db_connection(read_repeatable=True)
+                )
 
     def __check_source_writable(self):
         if self.config.db_type == DbType.POSTGRES:
@@ -111,6 +123,29 @@ class Subset:
         order = get_topological_order_by_tables(relationships, connected_tables)
         order = list(order)
 
+        # validate pre_filter references
+        pf_names = {pf.name for pf in self.config.pre_filters}
+        for target in self.config.initial_targets:
+            if target.pre_filter and target.pre_filter not in pf_names:
+                raise ValueError(
+                    "initial target '{}' references pre_filter '{}' which does not exist".format(
+                        target.table, target.pre_filter
+                    )
+                )
+
+        # execute pre_filters once and cache results
+        self.__pre_filter_cache = {}
+        for pf in self.config.pre_filters:
+            with self.__source_conn.cursor() as cur:
+                cur.execute(pf.query)
+                values = list(set(row[0] for row in cur.fetchall()))
+                self.__pre_filter_cache[pf.name] = values
+                print(
+                    "Pre-filter '{}' cached {} unique values".format(
+                        pf.name, len(values)
+                    )
+                )
+
         # start by subsetting the direct targets
         print(
             "Beginning subsetting with these direct targets: "
@@ -118,7 +153,14 @@ class Subset:
         )
         start_time = time.time()
         processed_tables = set()
-        if len(self.config.initial_targets) >= 3:
+        if (
+            self.config.parallel_read_workers > 1
+            and self.config.db_type == DbType.POSTGRES
+        ):
+            for idx, target in enumerate(self.config.initial_targets):
+                print_progress(target, idx + 1, len(self.config.initial_targets))
+                self.__subset_direct_parallel(target, relationships)
+        elif len(self.config.initial_targets) >= 3:
             self.__subset_direct_concurrent(relationships)
         else:
             for idx, target in enumerate(self.config.initial_targets):
@@ -191,6 +233,8 @@ class Subset:
     def close_connections(self):
         self.__source_conn.close()
         self.__destination_conn.close()
+        for conn in self.__source_pool:
+            conn.close()
 
     def __copy_table_worker(self, table):
         q = "SELECT * FROM {}".format(fully_qualified_table(table))
@@ -220,6 +264,78 @@ class Subset:
             for idx, future in enumerate(as_completed(futures)):
                 target = futures[future]
                 print_progress(target, idx + 1, len(targets))
+                future.result()
+
+    def __get_pre_filter_info(self, target: InitialTarget):
+        """Return (column, values) for a target's pre_filter, or None."""
+        if target.pre_filter is None:
+            return None
+        pf = next(
+            (p for p in self.config.pre_filters if p.name == target.pre_filter), None
+        )
+        if pf is None:
+            return None
+        values = self.__pre_filter_cache.get(pf.name)
+        if not values:
+            return None
+        return (pf.column, values)
+
+    def __subset_direct_parallel(self, target: InitialTarget, relationships):
+        """Subset a direct target using parallel ctid page-range splitting."""
+        t = target.table
+        num_workers = self.config.parallel_read_workers
+
+        page_count = self.__db_helper.get_table_page_count(
+            table_name(t), schema_name(t), self.__source_conn
+        )
+        if page_count < num_workers * 10:
+            self.__subset_direct(target, relationships)
+            return
+
+        columns_query = columns_to_copy(t, relationships, self.__source_conn)
+        fqt = fully_qualified_table(t)
+        pages_per_worker = page_count // num_workers
+        pre_filter_info = self.__get_pre_filter_info(target)
+
+        def worker(idx, start_page, end_page):
+            source_conn = self.__source_pool[idx]
+            dest_conn = self.__destination_dbc.get_db_connection()
+            try:
+                ctid_filter = (
+                    "{}.ctid >= '({},0)'::tid AND {}.ctid < '({},0)'::tid".format(
+                        fqt, start_page, fqt, end_page
+                    )
+                )
+                conditions = [ctid_filter]
+                if target.where is not None:
+                    conditions.append("({})".format(target.where))
+                elif target.percent is not None:
+                    conditions.append(
+                        "random() < {}".format(float(target.percent) / 100)
+                    )
+                if pre_filter_info:
+                    conditions.append(
+                        '{}."{}" = ANY(%s)'.format(fqt, pre_filter_info[0])
+                    )
+                q = "SELECT {} FROM {} WHERE {}".format(
+                    columns_query, fqt, " AND ".join(conditions)
+                )
+                params = [pre_filter_info[1]] if pre_filter_info else None
+                self.__copy_rows(source_conn, dest_conn, q, t, params)
+            finally:
+                dest_conn.close()
+
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            futures = []
+            for idx in range(num_workers):
+                start_page = idx * pages_per_worker
+                end_page = (
+                    page_count
+                    if idx == num_workers - 1
+                    else (idx + 1) * pages_per_worker
+                )
+                futures.append(pool.submit(worker, idx, start_page, end_page))
+            for future in as_completed(futures):
                 future.result()
 
     def __stream_ids_to_source_temp(self, dest_query, columns):
@@ -304,11 +420,19 @@ class Subset:
                     t
                 )
             )
+        pre_filter_info = self.__get_pre_filter_info(target)
+        params = None
+        if pre_filter_info:
+            q += ' AND {}."{}" = ANY(%s)'.format(
+                fully_qualified_table(t), pre_filter_info[0]
+            )
+            params = [pre_filter_info[1]]
         self.__copy_rows(
             self.__source_conn,
             self.__destination_conn,
             q,
             mysql_db_name_hack(t, self.__destination_conn),
+            params,
         )
 
     def __subset_upstream(self, target, processed_tables, relationships):

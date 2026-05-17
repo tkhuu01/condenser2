@@ -106,6 +106,24 @@ Default is `false`.
 protocol for row transfer instead of per-row INSERT statements. Significantly
 faster (5-10x for bulk inserts). Postgres only. Default is `false`.
 
+`parallel_read_workers`: Number of parallel connections used to read direct
+target tables from the source. Splits work by physical page ranges (ctid),
+so it works for any table regardless of primary key type. Designed for
+read-only replicas. Requires PostgreSQL 12+. Default is `1` (sequential).
+
+## Pre-filters
+
+`pre_filters`: Named queries that execute once at the start of subsetting and
+cache their results. Use this when an initial target needs to be filtered by a
+slow or remote source (e.g., a foreign data wrapper table) that you don't want
+re-executed per parallel worker. Each entry is a JSON object with `name` (a
+reference key), `query` (the SQL to execute on the source), and `column` (the
+target table column to filter against).
+
+Initial targets reference a pre-filter by name via the optional `pre_filter`
+field. The cached results are applied as `AND <column> = ANY(<cached values>)`
+to the target's query.
+
 ## Incremental subsetting
 
 `skip_schema_setup`: If `true`, the tool will not drop/recreate the destination
