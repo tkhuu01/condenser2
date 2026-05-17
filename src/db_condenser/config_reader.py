@@ -11,6 +11,14 @@ class PreFilter:
     query: str
     column: str
 
+    def __post_init__(self):
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("PreFilter 'name' must be a non-empty string")
+        if not isinstance(self.query, str) or not self.query.strip():
+            raise ValueError("PreFilter 'query' must be a non-empty string")
+        if not isinstance(self.column, str) or not self.column.strip():
+            raise ValueError("PreFilter 'column' must be a non-empty string")
+
 
 @dataclass
 class InitialTarget:
@@ -96,6 +104,13 @@ class Config:
     pre_filters: list[PreFilter] = field(default_factory=list)
     pre_constraint_sql: list[str] = field(default_factory=list)
     post_subset_sql: list[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        if (
+            not isinstance(self.parallel_read_workers, int)
+            or self.parallel_read_workers < 1
+        ):
+            raise ValueError("parallel_read_workers must be an integer >= 1")
 
     @property
     def dependency_break_set(self) -> set[tuple[str, str]]:
