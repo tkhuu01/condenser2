@@ -6,10 +6,18 @@ from typing import Literal
 
 
 @dataclass
+class PreFilter:
+    name: str
+    query: str
+    column: str
+
+
+@dataclass
 class InitialTarget:
     table: str
     percent: float | None = None
     where: str | None = None
+    pre_filter: str | None = None
 
     def __post_init__(self):
         # Exactly one of where/percent must be set
@@ -85,6 +93,7 @@ class Config:
     use_copy_protocol: bool = False
     skip_schema_setup: bool = False
     parallel_read_workers: int = 1
+    pre_filters: list[PreFilter] = field(default_factory=list)
     pre_constraint_sql: list[str] = field(default_factory=list)
     post_subset_sql: list[str] = field(default_factory=list)
 
@@ -149,6 +158,7 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
     use_copy_protocol = bool(raw_config.get("use_copy_protocol", False))
     skip_schema_setup = bool(raw_config.get("skip_schema_setup", False))
     parallel_read_workers = int(raw_config.get("parallel_read_workers", 1))
+    pre_filters = [PreFilter(**pf) for pf in raw_config.get("pre_filters", [])]
     return Config(
         db_type=db_type,
         initial_targets=initial_targets,
@@ -167,6 +177,7 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
         use_copy_protocol=use_copy_protocol,
         skip_schema_setup=skip_schema_setup,
         parallel_read_workers=parallel_read_workers,
+        pre_filters=pre_filters,
         pre_constraint_sql=pre_constraint_sql,
         post_subset_sql=post_subset_sql,
     )

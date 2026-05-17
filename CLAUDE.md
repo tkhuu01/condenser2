@@ -89,6 +89,16 @@ Designed for read-only replicas where parallel reads are safe (AccessShareLock o
 
 Config: `"parallel_read_workers": 4` (default `1` = sequential, current behavior)
 
+### Pre-filters
+
+Named queries executed once at subset start, cached in memory, and applied as `AND <column> = ANY(<values>)` to initial targets. Designed for slow/remote data sources (e.g., FDW tables) where re-executing the filter per worker or per target would be expensive.
+
+- Defined in top-level `pre_filters` array (name, query, column)
+- Referenced from `initial_targets` via optional `pre_filter` field (by name)
+- Multiple targets can share the same pre-filter — query runs once regardless
+- Works on read-only replicas (no writes to source)
+- Practical limit: ~2M cached values (~140MB memory); beyond that, consider a materialized view
+
 ### Database Support
 - **PostgreSQL:** Full support including sequence reset, named cursors, JSON casting
 - **MySQL:** Functional but limited (no sequence reset, no constraint re-application, no cross-db FKs)

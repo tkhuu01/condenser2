@@ -7,6 +7,18 @@
         {
             "table": "public.users",
             "where": "split_part(email, '@', 2) = 'hotmail.com'"
+        },
+        {
+            "table": "public.event_history",
+            "where": "year >= 2025",
+            "pre_filter": "region_entities"
+        }
+    ],
+    "pre_filters": [
+        {
+            "name": "region_entities",
+            "query": "SELECT entity_uuid FROM fdw_region_mapping WHERE region = 'US-West'",
+            "column": "entity_uuid"
         }
     ],
     "db_type": "postgres",

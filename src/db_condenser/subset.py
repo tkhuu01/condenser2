@@ -123,6 +123,29 @@ class Subset:
         order = get_topological_order_by_tables(relationships, connected_tables)
         order = list(order)
 
+        # validate pre_filter references
+        pf_names = {pf.name for pf in self.config.pre_filters}
+        for target in self.config.initial_targets:
+            if target.pre_filter and target.pre_filter not in pf_names:
+                raise ValueError(
+                    "initial target '{}' references pre_filter '{}' which does not exist".format(
+                        target.table, target.pre_filter
+                    )
+                )
+
+        # execute pre_filters once and cache results
+        self.__pre_filter_cache = {}
+        for pf in self.config.pre_filters:
+            with self.__source_conn.cursor() as cur:
+                cur.execute(pf.query)
+                values = list(set(row[0] for row in cur.fetchall()))
+                self.__pre_filter_cache[pf.name] = values
+                print(
+                    "Pre-filter '{}' cached {} unique values".format(
+                        pf.name, len(values)
+                    )
+                )
+
         # start by subsetting the direct targets
         print(
             "Beginning subsetting with these direct targets: "
@@ -243,6 +266,20 @@ class Subset:
                 print_progress(target, idx + 1, len(targets))
                 future.result()
 
+    def __get_pre_filter_info(self, target: InitialTarget):
+        """Return (column, values) for a target's pre_filter, or None."""
+        if target.pre_filter is None:
+            return None
+        pf = next(
+            (p for p in self.config.pre_filters if p.name == target.pre_filter), None
+        )
+        if pf is None:
+            return None
+        values = self.__pre_filter_cache.get(pf.name)
+        if not values:
+            return None
+        return (pf.column, values)
+
     def __subset_direct_parallel(self, target: InitialTarget, relationships):
         """Subset a direct target using parallel ctid page-range splitting."""
         t = target.table
@@ -258,6 +295,7 @@ class Subset:
         columns_query = columns_to_copy(t, relationships, self.__source_conn)
         fqt = fully_qualified_table(t)
         pages_per_worker = page_count // num_workers
+        pre_filter_info = self.__get_pre_filter_info(target)
 
         def worker(idx, start_page, end_page):
             source_conn = self.__source_pool[idx]
@@ -268,19 +306,22 @@ class Subset:
                         fqt, start_page, fqt, end_page
                     )
                 )
+                conditions = [ctid_filter]
                 if target.where is not None:
-                    q = "SELECT {} FROM {} WHERE ({}) AND ({})".format(
-                        columns_query, fqt, target.where, ctid_filter
-                    )
+                    conditions.append("({})".format(target.where))
                 elif target.percent is not None:
-                    q = "SELECT {} FROM {} WHERE random() < {} AND ({})".format(
-                        columns_query, fqt, float(target.percent) / 100, ctid_filter
+                    conditions.append(
+                        "random() < {}".format(float(target.percent) / 100)
                     )
-                else:
-                    q = "SELECT {} FROM {} WHERE {}".format(
-                        columns_query, fqt, ctid_filter
+                if pre_filter_info:
+                    conditions.append(
+                        '{}."{}" = ANY(%s)'.format(fqt, pre_filter_info[0])
                     )
-                self.__copy_rows(source_conn, dest_conn, q, t)
+                q = "SELECT {} FROM {} WHERE {}".format(
+                    columns_query, fqt, " AND ".join(conditions)
+                )
+                params = [pre_filter_info[1]] if pre_filter_info else None
+                self.__copy_rows(source_conn, dest_conn, q, t, params)
             finally:
                 dest_conn.close()
 
@@ -379,11 +420,19 @@ class Subset:
                     t
                 )
             )
+        pre_filter_info = self.__get_pre_filter_info(target)
+        params = None
+        if pre_filter_info:
+            q += ' AND {}."{}" = ANY(%s)'.format(
+                fully_qualified_table(t), pre_filter_info[0]
+            )
+            params = [pre_filter_info[1]]
         self.__copy_rows(
             self.__source_conn,
             self.__destination_conn,
             q,
             mysql_db_name_hack(t, self.__destination_conn),
+            params,
         )
 
     def __subset_upstream(self, target, processed_tables, relationships):
