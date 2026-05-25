@@ -103,6 +103,13 @@ Named queries executed once at subset start, cached in memory, and applied as `A
 - **PostgreSQL:** Full support including sequence reset, named cursors, JSON casting
 - **MySQL:** Functional but limited (no sequence reset, no constraint re-application, no cross-db FKs)
 
+## Design Principles
+
+- **Scalability:** Solutions must work efficiently from small tables to massive tables (500M to 1B rows). Avoid approaches that load full result sets into memory, prefer streaming/batching when you think the solution is optimal, and consider query plan impact at scale.
+- When streaming/batching are not optimal then think of other means, like storing information in the SQL folder.
+- When planning an optimal solution, it should first consider read only replicas so that production master instances are not impacted.
+- When planning an optimal solution, it should not only consider PKs as a number.
+
 ## Code Style
 
 - Formatter/linter: Ruff (format + isort + lint)
