@@ -36,7 +36,7 @@ def tabulate(source_dbc, destination_dbc, tables, total_elapsed=None):
     header = "  {:<{}}  {:>{}}  {:>{}}  {:>7}".format(
         "Table", name_w, "Source", src_w, "Dest", dst_w, "Ratio"
     )
-    sep = "  " + "-" * (name_w + src_w + dst_w + 14)
+    sep = "  " + "-" * (name_w + src_w + dst_w + 13)
 
     print()
     print(sep)
