@@ -149,8 +149,7 @@ class Subset:
 
         # start by subsetting the direct targets
         print(
-            "Beginning subsetting with these direct targets: "
-            + str(self.config.initial_target_tables)
+            "Beginning direct targets: " + ", ".join(self.config.initial_target_tables)
         )
         start_time = time.time()
         processed_tables = set()
@@ -169,17 +168,14 @@ class Subset:
                 self.__subset_direct(target, relationships)
         for target in self.config.initial_targets:
             processed_tables.add(target.table)
-        print("Direct target tables completed in {}s".format(time.time() - start_time))
+        print("Direct targets completed in {:.1f}s".format(time.time() - start_time))
 
         # greedily grab rows with foreign keys to rows in the target strata
         upstream_strata = compute_upstream_strata(
             self.config.initial_target_tables, order
         )
         upstream_tables = [t for stratum in upstream_strata for t in stratum]
-        print(
-            "Beginning greedy upstream subsetting with these tables: "
-            + str(upstream_tables)
-        )
+        print("Beginning upstream subsetting: " + ", ".join(upstream_tables))
         start_time = time.time()
         table_idx = 0
         for stratum in upstream_strata:
@@ -192,24 +188,23 @@ class Subset:
             )
             processed_tables.update(added)
             table_idx += len(stratum)
-        print("Greedy subsettings completed in {}s".format(time.time() - start_time))
+        print(
+            "Upstream subsetting completed in {:.1f}s".format(time.time() - start_time)
+        )
 
         # process pass-through tables concurrently, you need this before subset_downstream,
         # so you can get all required downstream rows
-        print("Beginning pass-through tables (concurrent): " + str(passthrough_tables))
+        print("Beginning pass-through tables: " + ", ".join(passthrough_tables))
         start_time = time.time()
         self.__copy_tables_concurrent(passthrough_tables)
-        print("Pass-through completed in {}s".format(time.time() - start_time))
+        print("Pass-through completed in {:.1f}s".format(time.time() - start_time))
 
         # use subset_downstream to get all supporting rows according to existing needs
         downstream_strata = compute_downstream_strata(
             passthrough_tables, disconnected_tables, order
         )
         downstream_tables = [t for stratum in downstream_strata for t in stratum]
-        print(
-            "Beginning downstream subsetting with these tables: "
-            + str(downstream_tables)
-        )
+        print("Beginning downstream subsetting: " + ", ".join(downstream_tables))
         start_time = time.time()
         table_idx = 0
         for stratum in downstream_strata:
@@ -217,11 +212,15 @@ class Subset:
                 stratum, relationships, table_idx, len(downstream_tables)
             )
             table_idx += len(stratum)
-        print("Downstream subsetting completed in {}s".format(time.time() - start_time))
+        print(
+            "Downstream subsetting completed in {:.1f}s".format(
+                time.time() - start_time
+            )
+        )
 
         if self.config.keep_disconnected_tables:
             # get all the data for tables in disconnected components (i.e. pass those tables through)
-            print("Beginning disconnected tables: " + str(disconnected_tables))
+            print("Beginning disconnected tables: " + ", ".join(disconnected_tables))
             start_time = time.time()
             for idx, t in enumerate(disconnected_tables):
                 print_progress(t, idx + 1, len(disconnected_tables))
@@ -233,7 +232,9 @@ class Subset:
                     mysql_db_name_hack(t, self.__destination_conn),
                 )
             print(
-                "Disconnected tables completed in {}s".format(time.time() - start_time)
+                "Disconnected tables completed in {:.1f}s".format(
+                    time.time() - start_time
+                )
             )
 
     def prep_temp_dbs(self):
