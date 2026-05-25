@@ -642,7 +642,7 @@ class Subset:
 
         q = "SELECT {}.* FROM {}{}".format(fqt, fqt, joins)
         if upstream_filters:
-            q += " AND {}".format(" AND ".join(upstream_filters))
+            q += " WHERE {}".format(" AND ".join(upstream_filters))
         return q, all_params
 
     def __subset_upstream_unnest(
