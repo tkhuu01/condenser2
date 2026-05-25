@@ -71,6 +71,17 @@ def compute_upstream_tables(target_tables: list[str], order):
     return upstream_tables
 
 
+def compute_upstream_strata(target_tables: list[str], order) -> list[set[str]]:
+    strata_list = []
+    in_upstream = False
+    for stratum in order:
+        if in_upstream:
+            strata_list.append(set(stratum))
+        if any(tt in stratum for tt in target_tables):
+            in_upstream = True
+    return strata_list
+
+
 def compute_downstream_tables(passthrough_tables, disconnected_tables, order):
     downstream_tables = []
     for strata in order:
@@ -89,6 +100,19 @@ def compute_downstream_tables(passthrough_tables, disconnected_tables, order):
         )
     )
     return downstream_tables
+
+
+def compute_downstream_strata(
+    passthrough_tables, disconnected_tables, order
+) -> list[set[str]]:
+    excluded = set(passthrough_tables) | set(disconnected_tables)
+    strata_list = []
+    for stratum in order:
+        filtered = {t for t in stratum if t not in excluded}
+        if filtered:
+            strata_list.append(filtered)
+    strata_list.reverse()
+    return strata_list
 
 
 def compute_disconnected_tables(
@@ -217,6 +241,13 @@ class UnionFind:
                 retval.append(self.elements[idx])
 
         return retval
+
+
+def compute_batch_size(column_count: int) -> int:
+    target_bytes = 300_000_000
+    bytes_per_row = max(column_count * 150, 400)
+    batch = target_bytes // bytes_per_row
+    return max(100_000, min(batch, 500_000))
 
 
 def mysql_db_name_hack(target, conn):

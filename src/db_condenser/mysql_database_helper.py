@@ -49,14 +49,15 @@ def turn_off_constraints(connection):
         cur.close()
 
 
-def copy_rows(source, destination, query, destination_table, params=None):
+def copy_rows(
+    source, destination, query, destination_table, params=None, batch_size=1000
+):
     cursor = source.cursor()
 
     try:
         cursor.execute(query, params)
-        fetch_row_count = 1000
         while True:
-            rows = cursor.fetchmany(fetch_row_count)
+            rows = cursor.fetchmany(batch_size)
             if len(rows) == 0:
                 break
 
@@ -70,7 +71,7 @@ def copy_rows(source, destination, query, destination_table, params=None):
             destination_cursor.close()
             destination.commit()
 
-            if len(rows) < fetch_row_count:
+            if len(rows) < batch_size:
                 # necessary because mysql doesn't behave if you fetchmany after the last row
                 break
     except Exception as e:

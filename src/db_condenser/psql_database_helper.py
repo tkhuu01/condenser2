@@ -9,6 +9,7 @@ from db_condenser.db_connect import PsqlConnection
 from db_condenser.subset_utils import (
     columns_joined,
     columns_tupled,
+    compute_batch_size,
     fully_qualified_table,
     quoter,
     redact_relationships,
@@ -32,10 +33,14 @@ def turn_off_constraints(connection):
     pass
 
 
-def copy_rows(source, destination, query, destination_table, params=None):
+def copy_rows(
+    source, destination, query, destination_table, params=None, batch_size=None
+):
     datatypes = get_table_datatypes(
         table_name(destination_table), schema_name(destination_table), destination
     )
+    if batch_size is None:
+        batch_size = compute_batch_size(len(datatypes))
 
     non_generated_columns = [
         (dt[0], dt[1]) for _, dt in enumerate(datatypes) if dt[2] != "s"
@@ -90,9 +95,8 @@ def copy_rows(source, destination, query, destination_table, params=None):
                 fully_qualified_table(destination_table), columns, template
             )
 
-        fetch_row_count = 100000
         while True:
-            rows = cursor.fetchmany(fetch_row_count)
+            rows = cursor.fetchmany(batch_size)
             if not rows:
                 break
 
@@ -118,10 +122,14 @@ def copy_rows(source, destination, query, destination_table, params=None):
         destination.commit()
 
 
-def copy_rows_copy_protocol(source, destination, query, destination_table, params=None):
+def copy_rows_copy_protocol(
+    source, destination, query, destination_table, params=None, batch_size=None
+):
     datatypes = get_table_datatypes(
         table_name(destination_table), schema_name(destination_table), destination
     )
+    if batch_size is None:
+        batch_size = compute_batch_size(len(datatypes))
 
     non_generated_columns = [dt[0] for _, dt in enumerate(datatypes) if dt[2] != "s"]
     generated_columns_positions = {i for i, dt in enumerate(datatypes) if "s" in dt[2]}
@@ -145,9 +153,8 @@ def copy_rows_copy_protocol(source, destination, query, destination_table, param
         cursor.execute(query, params)
 
         with dest_cursor.copy(copy_command) as copy:
-            fetch_row_count = 100000
             while True:
-                rows = cursor.fetchmany(fetch_row_count)
+                rows = cursor.fetchmany(batch_size)
                 if not rows:
                     break
 
