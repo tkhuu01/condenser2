@@ -41,8 +41,8 @@ without `${...}` are used as-is.
 
 `destination_db_connection_info`: Destination database connection details. Same
 fields and environment variable support as `source_db_connection_info`. If you
-don't pass the -y flag then a confirmation message will appear if subsetting is
-not localhost or 127.0.0.1
+do not pass the `-y` flag, a confirmation prompt will appear unless the
+destination is localhost or 127.0.0.1.
 
 `initial_targets`: JSON array of JSON objects. Each object must contain a
 `table` field (the target table) and exactly one of `where` or `percent`.
