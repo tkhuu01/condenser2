@@ -85,29 +85,30 @@ def main():
 
     subsetter = Subset(source_dbc, destination_dbc, all_tables)
 
+    total_start_time = time.time()
     try:
         subsetter.prep_temp_dbs()
         subsetter.run_middle_out()
 
-        print("Beginning pre constraint SQL calls")
+        print("Beginning pre-constraint SQL calls")
         start_time = time.time()
         for idx, sql in enumerate(config.pre_constraint_sql):
             print_progress(sql, idx + 1, len(config.pre_constraint_sql))
             db_helper.run_query(sql, destination_dbc.get_db_connection())
         print(
-            "Completed pre constraint SQL calls in {}s".format(time.time() - start_time)
+            "Pre-constraint SQL completed in {:.1f}s".format(time.time() - start_time)
         )
 
         print("Adding database constraints")
         if not args.no_constraints and not config.skip_schema_setup:
             database.add_constraints()
 
-        print("Beginning post subset SQL calls")
+        print("Beginning post-subset SQL calls")
         start_time = time.time()
         for idx, sql in enumerate(config.post_subset_sql):
             print_progress(sql, idx + 1, len(config.post_subset_sql))
             db_helper.run_query(sql, destination_dbc.get_db_connection())
-        print("Completed post subset SQL calls in {}s".format(time.time() - start_time))
+        print("Post-subset SQL completed in {:.1f}s".format(time.time() - start_time))
 
         print("Resetting sequence numbering")
         all_tables_no_pg = [table for table in all_tables if "pgbench" not in table]
@@ -122,7 +123,10 @@ def main():
             #    dest_conn, all_tables_no_pg
             # )
 
-        result_tabulator.tabulate(source_dbc, destination_dbc, all_tables)
+        total_elapsed = time.time() - total_start_time
+        result_tabulator.tabulate(
+            source_dbc, destination_dbc, all_tables, total_elapsed
+        )
     except KeyboardInterrupt:
         print("\nInterrupted — closing connections...")
         raise
