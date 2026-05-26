@@ -816,7 +816,6 @@ class Subset:
         if len(referencing_tables) > 0:
             pk_columns = referencing_tables[0]["target_columns"]
         else:
-            print("Nothing to do in downstream subset")
             return
 
         temp_table = self.__db_helper.create_id_temp_table(dest_conn, len(pk_columns))
