@@ -1,4 +1,6 @@
 import json
+import os
+import re
 import sys
 from dataclasses import dataclass, field
 from enum import Enum
@@ -132,6 +134,25 @@ class Config:
 config: Config | None = None
 
 
+_ENV_PATTERN = re.compile(r"\$\{([^}]+)\}")
+
+
+def _resolve_env(value):
+    if not isinstance(value, str):
+        return value
+    match = _ENV_PATTERN.fullmatch(value)
+    if match:
+        var = match.group(1)
+        if var not in os.environ:
+            raise ValueError("Environment variable {} is not set".format(var))
+        return os.environ[var]
+    return value
+
+
+def _resolve_env_dict(d: dict) -> dict:
+    return {k: _resolve_env(v) for k, v in d.items()}
+
+
 def _raw_dict_to_config(raw_config: dict) -> Config:
     initial_targets = []
     db_type = DbType(raw_config["db_type"].lower())
@@ -140,8 +161,14 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
         InitialTarget(**target) for target in raw_config["initial_targets"]
     ]
 
-    source_db = DbConnectInfo(**raw_config["source_db_connection_info"])
-    dest_db = DbConnectInfo(**raw_config["destination_db_connection_info"])
+    source_raw = _resolve_env_dict(raw_config["source_db_connection_info"])
+    dest_raw = _resolve_env_dict(raw_config["destination_db_connection_info"])
+    if "port" in source_raw:
+        source_raw["port"] = int(source_raw["port"])
+    if "port" in dest_raw:
+        dest_raw["port"] = int(dest_raw["port"])
+    source_db = DbConnectInfo(**source_raw)
+    dest_db = DbConnectInfo(**dest_raw)
 
     upstream_filters = [
         UpstreamFilter(**table) for table in raw_config.get("upstream_filters", [])

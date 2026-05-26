@@ -35,11 +35,14 @@ for the exact format.
 `source_db_connection_info`: Source database connection details. A JSON object
 with the fields `user_name`, `host`, `db_name`, `port`, `ssl_mode` (optional),
 and `password` (optional). If `password` is omitted, you will be prompted for
-a password.
+a password. Any string field can reference an environment variable using
+`${VAR_NAME}` syntax (e.g., `"password": "${DB_SOURCE_PASSWORD}"`). Values
+without `${...}` are used as-is.
 
 `destination_db_connection_info`: Destination database connection details. Same
-fields as `source_db_connection_info`. If you don't pass the -y flag then a confirmation
-message will appear if subsetting is not localhost or 127.0.0.1
+fields and environment variable support as `source_db_connection_info`. If you
+don't pass the -y flag then a confirmation message will appear if subsetting is
+not localhost or 127.0.0.1
 
 `initial_targets`: JSON array of JSON objects. Each object must contain a
 `table` field (the target table) and exactly one of `where` or `percent`.
