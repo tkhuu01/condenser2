@@ -20,7 +20,7 @@ def tabulate(source_dbc, destination_dbc, tables, total_elapsed=None):
             n = db_helper.get_table_count_estimate(
                 table_name(table), dest_schema_name, dest_conn
             )
-            row_counts.append((table, int(o), int(n)))
+            row_counts.append((table, max(int(o), 0), max(int(n), 0)))
     finally:
         source_conn.close()
         dest_conn.close()
