@@ -8,7 +8,6 @@ from db_condenser.subset_utils import (
     columns_tupled,
     fully_qualified_table,
     quoter,
-    redact_relationships,
     schema_name,
     table_name,
 )
@@ -154,12 +153,6 @@ def source_db_temp_table(target_table):
     return temp_db + "." + schema_name(target_table) + "_" + table_name(target_table)
 
 
-def get_redacted_table_references(table_name, tables, conn):
-    relationships = get_unredacted_fk_relationships(tables, conn)
-    redacted = redact_relationships(relationships)
-    return [r for r in redacted if r["target_table"] == table_name]
-
-
 def get_unredacted_fk_relationships(tables, conn):
     cur = conn.cursor()
 
@@ -237,6 +230,15 @@ def get_table_count_estimate(table_name, schema, conn):
                AND table_name='{}'
             """.format(schema, table_name)
         )
+        return cur.fetchone()[0]
+    finally:
+        cur.close()
+
+
+def get_table_count(table_name, schema, conn):
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT count(*) FROM `{}`.`{}`".format(schema, table_name))
         return cur.fetchone()[0]
     finally:
         cur.close()

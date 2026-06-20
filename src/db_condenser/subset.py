@@ -8,7 +8,6 @@ from db_condenser.db_connect import DbConnect
 from db_condenser.subset_utils import (
     columns_joined,
     columns_to_copy,
-    columns_tupled,
     compute_batch_size,
     compute_disconnected_tables,
     compute_downstream_strata,
@@ -318,15 +317,24 @@ class Subset:
                 future.result()
 
     def __copy_table_worker(self, table):
-        q = "SELECT * FROM {}".format(fully_qualified_table(table))
-        if self.config.max_rows_per_table is not None:
-            q += " LIMIT {}".format(self.config.max_rows_per_table)
-        self.__copy_rows(
-            self.__source_conn,
-            self.__destination_conn,
-            q,
-            mysql_db_name_hack(table, self.__destination_conn),
-        )
+        source_conn = self.__source_dbc.get_db_connection(read_repeatable=True)
+        dest_conn = self.__destination_dbc.get_db_connection()
+        # no-op on Postgres; preserves prior MySQL behavior where this path
+        # used the shared dest connection that had constraints disabled
+        self.__db_helper.turn_off_constraints(dest_conn)
+        try:
+            q = "SELECT * FROM {}".format(fully_qualified_table(table))
+            if self.config.max_rows_per_table is not None:
+                q += " LIMIT {}".format(self.config.max_rows_per_table)
+            self.__copy_rows(
+                source_conn,
+                dest_conn,
+                q,
+                mysql_db_name_hack(table, dest_conn),
+            )
+        finally:
+            source_conn.close()
+            dest_conn.close()
 
     def __copy_tables_concurrent(self, tables, max_workers=4):
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -338,10 +346,21 @@ class Subset:
 
     def __subset_direct_concurrent(self, relationships, max_workers=4):
         targets = self.config.initial_targets
+
+        def direct_worker(target):
+            source_conn = self.__source_dbc.get_db_connection(read_repeatable=True)
+            dest_conn = self.__destination_dbc.get_db_connection()
+            # no-op on Postgres; preserves prior MySQL behavior where this path
+            # used the shared dest connection that had constraints disabled
+            self.__db_helper.turn_off_constraints(dest_conn)
+            try:
+                self.__subset_direct(target, relationships, source_conn, dest_conn)
+            finally:
+                source_conn.close()
+                dest_conn.close()
+
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {
-                pool.submit(self.__subset_direct, t, relationships): t for t in targets
-            }
+            futures = {pool.submit(direct_worker, t): t for t in targets}
             for idx, future in enumerate(as_completed(futures)):
                 target = futures[future]
                 print_progress(target, idx + 1, len(targets))
@@ -473,9 +492,13 @@ class Subset:
             select_expr, fqt, id_temp, join_conditions
         )
 
-    def __subset_direct(self, target: InitialTarget, relationships):
+    def __subset_direct(
+        self, target: InitialTarget, relationships, source_conn=None, dest_conn=None
+    ):
+        source_conn = source_conn or self.__source_conn
+        dest_conn = dest_conn or self.__destination_conn
         t = target.table
-        columns_query = columns_to_copy(t, relationships, self.__source_conn)
+        columns_query = columns_to_copy(t, relationships, source_conn)
         if target.where is not None:
             q = "SELECT {} FROM {} WHERE {}".format(
                 columns_query, fully_qualified_table(t), target.where
@@ -507,10 +530,10 @@ class Subset:
             )
             params = [pre_filter_info[1]]
         self.__copy_rows(
-            self.__source_conn,
-            self.__destination_conn,
+            source_conn,
+            dest_conn,
             q,
-            mysql_db_name_hack(t, self.__destination_conn),
+            mysql_db_name_hack(t, dest_conn),
             params,
         )
 
@@ -809,9 +832,9 @@ class Subset:
     def subset_downstream(self, table, relationships, source_conn=None, dest_conn=None):
         source_conn = source_conn or self.__source_conn
         dest_conn = dest_conn or self.__destination_conn
-        referencing_tables = self.__db_helper.get_redacted_table_references(
-            table, self.__all_tables, source_conn
-        )
+        referencing_tables = [
+            r for r in redact_relationships(relationships) if r["target_table"] == table
+        ]
 
         if len(referencing_tables) > 0:
             pk_columns = referencing_tables[0]["target_columns"]
@@ -824,13 +847,23 @@ class Subset:
             fk_table = r["fk_table"]
             fk_columns = r["fk_columns"]
 
+            fk_qualified = fully_qualified_table(
+                mysql_db_name_hack(fk_table, dest_conn)
+            )
+            target_qualified = fully_qualified_table(
+                mysql_db_name_hack(table, dest_conn)
+            )
+            exists_conditions = " AND ".join(
+                "_t.{} = _fk.{}".format(quoter(pc), quoter(fc))
+                for pc, fc in zip(pk_columns, fk_columns)
+            )
             select_q = (
-                "SELECT DISTINCT {} FROM {} WHERE {} NOT IN (SELECT {} FROM {})".format(
+                "SELECT DISTINCT {} FROM {} _fk"
+                " WHERE NOT EXISTS (SELECT 1 FROM {} _t WHERE {})".format(
                     columns_joined(fk_columns),
-                    fully_qualified_table(mysql_db_name_hack(fk_table, dest_conn)),
-                    columns_tupled(fk_columns),
-                    columns_joined(pk_columns),
-                    fully_qualified_table(mysql_db_name_hack(table, dest_conn)),
+                    fk_qualified,
+                    target_qualified,
+                    exists_conditions,
                 )
             )
             insert_q = 'INSERT INTO "{}" {}'.format(temp_table, select_q)
