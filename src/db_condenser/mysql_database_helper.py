@@ -235,15 +235,6 @@ def get_table_count_estimate(table_name, schema, conn):
         cur.close()
 
 
-def get_table_count(table_name, schema, conn):
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT count(*) FROM `{}`.`{}`".format(schema, table_name))
-        return cur.fetchone()[0]
-    finally:
-        cur.close()
-
-
 def get_table_datatypes(table, schema, conn):
     with conn.cursor() as cur:
         cur.execute(

@@ -124,22 +124,18 @@ def copy_rows(
 def copy_rows_copy_protocol(
     source, destination, query, destination_table, params=None, batch_size=None
 ):
+    # batch_size is accepted for interface parity with copy_rows (both are used
+    # as self.__copy_rows) but is unused here: the COPY stream self-chunks.
     datatypes = get_table_datatypes(
         table_name(destination_table), schema_name(destination_table), destination
     )
-    if batch_size is None:
-        batch_size = compute_batch_size(len(datatypes))
 
     non_generated_columns = [dt[0] for _, dt in enumerate(datatypes) if dt[2] != "s"]
-    generated_columns_positions = {i for i, dt in enumerate(datatypes) if "s" in dt[2]}
-    json_positions = {i for i, dt in enumerate(datatypes) if dt[1] in ("json", "jsonb")}
-
     column_list = ", ".join('"' + col + '"' for col in non_generated_columns)
     dest_table = fully_qualified_table(destination_table)
     temp_table = '"_copy_staging_' + str(uuid.uuid4()).replace("-", "") + '"'
 
-    cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
-    cursor = source.cursor(name=cursor_name)
+    source_cursor = source.cursor().inner_cursor
     dest_cursor = destination.cursor().inner_cursor
     try:
         dest_cursor.execute(
@@ -148,29 +144,18 @@ def copy_rows_copy_protocol(
             )
         )
 
-        copy_command = "COPY {} ({}) FROM STDIN".format(temp_table, column_list)
-        cursor.execute(query, params)
-
-        with dest_cursor.copy(copy_command) as copy:
-            while True:
-                rows = cursor.fetchmany(batch_size)
-                if not rows:
-                    break
-
-                if generated_columns_positions or json_positions:
-                    for row in rows:
-                        copy.write_row(
-                            tuple(
-                                val.decode("utf-8")
-                                if isinstance(val, bytes) and i in json_positions
-                                else val
-                                for i, val in enumerate(row)
-                                if i not in generated_columns_positions
-                            )
-                        )
-                else:
-                    for row in rows:
-                        copy.write_row(row)
+        # Block-level COPY streaming: pipe raw COPY data straight from the source
+        # into the staging table, avoiding a per-row Python loop. Selecting just the
+        # non-generated columns keeps the stream aligned with the staging column
+        # list (generated columns are excluded; the cap, joins, etc. live in query).
+        copy_out = "COPY (SELECT {} FROM ({}) AS _src) TO STDOUT".format(
+            column_list, query
+        )
+        copy_in = "COPY {} ({}) FROM STDIN".format(temp_table, column_list)
+        with source_cursor.copy(copy_out, params) as src_copy:
+            with dest_cursor.copy(copy_in) as dest_copy:
+                for data in src_copy:
+                    dest_copy.write(data)
 
         dest_cursor.execute(
             "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT DO NOTHING".format(
@@ -180,7 +165,7 @@ def copy_rows_copy_protocol(
         dest_cursor.execute("DROP TABLE {}".format(temp_table))
     finally:
         dest_cursor.close()
-        cursor.close()
+        source_cursor.close()
         destination.commit()
 
 
@@ -363,12 +348,6 @@ def get_table_count_estimate(table_name, schema, conn):
              WHERE oid=\'"{}"."{}"\'::regclass
              """.format(schema, table_name)
         )
-        return cur.fetchone()[0]
-
-
-def get_table_count(table_name, schema, conn):
-    with conn.cursor() as cur:
-        cur.execute('SELECT count(*) FROM "{}"."{}"'.format(schema, table_name))
         return cur.fetchone()[0]
 
 
