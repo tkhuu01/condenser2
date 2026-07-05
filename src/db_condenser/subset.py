@@ -3,7 +3,12 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from db_condenser import database_helper
-from db_condenser.config_reader import DbType, InitialTarget, get_config
+from db_condenser.config_reader import (
+    DbType,
+    DestinationMode,
+    InitialTarget,
+    get_config,
+)
 from db_condenser.db_connect import DbConnect
 from db_condenser.subset_utils import (
     columns_joined,
@@ -67,6 +72,15 @@ class Subset:
 
         if self.config.use_temp_tables:
             self.__check_source_writable()
+
+        # topup means the destination already exists: track PKs inserted this
+        # run and drive upstream subsetting off those deltas instead of full
+        # destination tables
+        self.__incremental = (
+            self.config.destination_mode == DestinationMode.TOPUP
+            and self.config.db_type == DbType.POSTGRES
+        )
+        self.__dropped_fks = []
 
         self.__source_pool = []
         if (
@@ -238,9 +252,30 @@ class Subset:
 
     def prep_temp_dbs(self):
         self.__db_helper.prep_temp_dbs(self.__source_conn, self.__destination_conn)
+        if self.__incremental:
+            self.__db_helper.prep_incremental(
+                self.__destination_conn, self.__all_tables
+            )
+            # constraints are live on an existing destination, but middle-out
+            # load order inserts referencing rows before referenced ones
+            self.__dropped_fks = self.__db_helper.drop_fk_constraints(
+                self.__destination_conn
+            )
 
     def unprep_temp_dbs(self):
         self.__db_helper.unprep_temp_dbs(self.__source_conn, self.__destination_conn)
+        if self.__incremental:
+            self.__db_helper.unprep_incremental(self.__destination_conn)
+            try:
+                self.__db_helper.restore_fk_constraints(
+                    self.__destination_conn, self.__dropped_fks
+                )
+            except Exception as ex:
+                print(
+                    "WARNING: failed to restore destination FK constraints ({})."
+                    " Definitions were saved to SQL/incremental_fk_backup.sql;"
+                    " re-apply them manually once the data is consistent.".format(ex)
+                )
 
     def close_connections(self):
         self.__source_conn.close()
@@ -537,6 +572,52 @@ class Subset:
             params,
         )
 
+    def __upstream_delta_plan(self, relevant_key_constraints, dest_conn):
+        """Decide the upstream ID sources for an incremental (top-up) run.
+
+        Returns (skip, delta_plan):
+        - skip=True: every parent's delta is empty, no new child rows possible
+        - delta_plan: {parent_table: (delta_table, pk_cols)} for parents with
+          rows added this run. None means full (non-incremental) behavior,
+          either because this isn't an incremental run or a parent has no PK
+          so its inserts weren't tracked.
+        """
+        if not self.__incremental:
+            return False, None
+        parents = {kc["target_table"] for kc in relevant_key_constraints}
+        deltas = {p: self.__db_helper.delta_for(p) for p in parents}
+        if not all(deltas.values()):
+            return False, None
+        nonempty = {}
+        with dest_conn.cursor() as cur:
+            for p, (delta_table, _) in deltas.items():
+                cur.execute("SELECT EXISTS (SELECT 1 FROM {})".format(delta_table))
+                nonempty[p] = cur.fetchone()[0]
+        if not any(nonempty.values()):
+            return True, None
+        return False, {p: deltas[p] for p in parents if nonempty[p]}
+
+    def __upstream_ids_query(self, kc_target, target_cols, dest_conn, delta_plan):
+        """Build the destination-side query for a parent's referenced columns.
+
+        With a delta plan entry for the parent, reads only the rows added this
+        run (parent joined to its delta table on PK); otherwise the full table.
+        """
+        qualified = fully_qualified_table(mysql_db_name_hack(kc_target, dest_conn))
+        delta = delta_plan.get(kc_target) if delta_plan else None
+        if delta is None:
+            return "SELECT DISTINCT {} FROM {}".format(
+                columns_joined(target_cols), qualified
+            )
+        delta_table, pk_cols = delta
+        cols = ",".join("_t.{}".format(quoter(c)) for c in target_cols)
+        join_cond = " AND ".join(
+            "_t.{} = _d.{}".format(quoter(c), quoter(c)) for c in pk_cols
+        )
+        return "SELECT DISTINCT {} FROM {} _t JOIN {} _d ON {}".format(
+            cols, qualified, delta_table, join_cond
+        )
+
     def __subset_upstream(
         self, target, processed_tables, relationships, source_conn, dest_conn
     ):
@@ -552,6 +633,12 @@ class Subset:
         if len(relevant_key_constraints) == 0 or target in processed_tables:
             return False
 
+        skip, delta_plan = self.__upstream_delta_plan(
+            relevant_key_constraints, dest_conn
+        )
+        if skip:
+            return True
+
         table_columns = self.__db_helper.get_table_columns(
             table_name(target), schema_name(target), source_conn
         )
@@ -564,6 +651,7 @@ class Subset:
                 upstream_filters,
                 source_conn,
                 dest_conn,
+                delta_plan,
             )
         else:
             self.__subset_upstream_unnest(
@@ -572,6 +660,7 @@ class Subset:
                 upstream_filters,
                 source_conn,
                 dest_conn,
+                delta_plan,
             )
 
         return True
@@ -583,6 +672,7 @@ class Subset:
         upstream_filters,
         source_conn,
         dest_conn,
+        delta_plan=None,
     ):
         fk_datatypes = {
             col: typ
@@ -596,73 +686,98 @@ class Subset:
             groups.setdefault(key, []).append(kc)
 
         group_temps = {}
+        delta_temps = {}
         for kc_target, target_cols in groups:
-            qualified_table = fully_qualified_table(
-                mysql_db_name_hack(kc_target, dest_conn)
-            )
-            dest_query = "SELECT {} FROM {}".format(
-                columns_joined(target_cols), qualified_table
+            dest_query = self.__upstream_ids_query(
+                kc_target, list(target_cols), dest_conn, None
             )
             group_temps[(kc_target, target_cols)] = self.__stream_ids_to_source_temp(
                 dest_query, target_cols, source_conn, dest_conn
             )
-
-        fqt = fully_qualified_table(target)
-        joins = ""
-        for idx, kc in enumerate(relevant_key_constraints):
-            key = (kc["target_table"], tuple(kc["target_columns"]))
-            id_temp = group_temps[key]
-            fk_cols = kc["fk_columns"]
-            alias = "_ids{}".format(idx)
-            join_conditions = " AND ".join(
-                "{}.{} = {}.col{}::{}".format(
-                    fqt, quoter(col), alias, i, fk_datatypes[col]
+            if delta_plan and kc_target in delta_plan:
+                delta_query = self.__upstream_ids_query(
+                    kc_target, list(target_cols), dest_conn, delta_plan
                 )
-                for i, col in enumerate(fk_cols)
-            )
-            joins += ' JOIN "{}" AS {} ON {}'.format(id_temp, alias, join_conditions)
-
-        q = "SELECT {}.* FROM {}{}".format(fqt, fqt, joins)
-        if upstream_filters:
-            q += " WHERE {}".format(" AND ".join(upstream_filters))
-        if self.config.max_rows_per_table is not None:
-            q += " LIMIT {}".format(self.config.max_rows_per_table)
-        self.__copy_rows(
-            source_conn,
-            dest_conn,
-            q,
-            target,
-            batch_size=compute_batch_size(len(fk_datatypes)),
-        )
-
-    def __build_upstream_unnest_query(
-        self, fqt, groups, fk_datatypes, upstream_filters, group_rows_map
-    ):
-        joins = ""
-        all_params = []
-        join_idx = 0
-        for group_key, kcs in groups.items():
-            rows = group_rows_map[group_key]
-            for kc in kcs:
-                fk_cols = kc["fk_columns"]
-                unnest_args = ", ".join(
-                    "%s::{}[]".format(fk_datatypes[col]) for col in fk_cols
-                )
-                join_cols = ", ".join("col{}".format(i) for i in range(len(fk_cols)))
-                join_conditions = " AND ".join(
-                    "{}.{} = ids{}.col{}".format(fqt, quoter(col), join_idx, i)
-                    for i, col in enumerate(fk_cols)
-                )
-                joins += (
-                    " JOIN unnest({unnest}) AS ids{idx}({join_cols}) ON {conds}".format(
-                        unnest=unnest_args,
-                        idx=join_idx,
-                        join_cols=join_cols,
-                        conds=join_conditions,
+                delta_temps[(kc_target, target_cols)] = (
+                    self.__stream_ids_to_source_temp(
+                        delta_query, target_cols, source_conn, dest_conn
                     )
                 )
-                all_params.extend([row[i] for row in rows] for i in range(len(fk_cols)))
-                join_idx += 1
+
+        kcs = relevant_key_constraints
+        if delta_plan is None:
+            passes = [None]
+        else:
+            # one pass per constraint whose parent gained rows this run: that
+            # constraint joins the delta, the others join the full ID sets
+            # (AND semantics must hold against everything already imported)
+            passes = [
+                j
+                for j, kc in enumerate(kcs)
+                if (kc["target_table"], tuple(kc["target_columns"])) in delta_temps
+            ]
+            if not passes:
+                return
+
+        fqt = fully_qualified_table(target)
+        for pass_j in passes:
+            joins = ""
+            for idx, kc in enumerate(kcs):
+                key = (kc["target_table"], tuple(kc["target_columns"]))
+                if pass_j is not None and pass_j == idx:
+                    id_temp = delta_temps[key]
+                else:
+                    id_temp = group_temps[key]
+                fk_cols = kc["fk_columns"]
+                alias = "_ids{}".format(idx)
+                join_conditions = " AND ".join(
+                    "{}.{} = {}.col{}::{}".format(
+                        fqt, quoter(col), alias, i, fk_datatypes[col]
+                    )
+                    for i, col in enumerate(fk_cols)
+                )
+                joins += ' JOIN "{}" AS {} ON {}'.format(
+                    id_temp, alias, join_conditions
+                )
+
+            q = "SELECT {}.* FROM {}{}".format(fqt, fqt, joins)
+            if upstream_filters:
+                q += " WHERE {}".format(" AND ".join(upstream_filters))
+            if self.config.max_rows_per_table is not None:
+                q += " LIMIT {}".format(self.config.max_rows_per_table)
+            self.__copy_rows(
+                source_conn,
+                dest_conn,
+                q,
+                target,
+                batch_size=compute_batch_size(len(fk_datatypes)),
+            )
+
+    def __build_upstream_unnest_query(
+        self, fqt, kc_rows, fk_datatypes, upstream_filters
+    ):
+        """Build the source-side join for (constraint, id_rows) pairs."""
+        joins = ""
+        all_params = []
+        for join_idx, (kc, rows) in enumerate(kc_rows):
+            fk_cols = kc["fk_columns"]
+            unnest_args = ", ".join(
+                "%s::{}[]".format(fk_datatypes[col]) for col in fk_cols
+            )
+            join_cols = ", ".join("col{}".format(i) for i in range(len(fk_cols)))
+            join_conditions = " AND ".join(
+                "{}.{} = ids{}.col{}".format(fqt, quoter(col), join_idx, i)
+                for i, col in enumerate(fk_cols)
+            )
+            joins += (
+                " JOIN unnest({unnest}) AS ids{idx}({join_cols}) ON {conds}".format(
+                    unnest=unnest_args,
+                    idx=join_idx,
+                    join_cols=join_cols,
+                    conds=join_conditions,
+                )
+            )
+            all_params.extend([row[i] for row in rows] for i in range(len(fk_cols)))
 
         q = "SELECT {}.* FROM {}{}".format(fqt, fqt, joins)
         if upstream_filters:
@@ -676,6 +791,7 @@ class Subset:
         upstream_filters,
         source_conn,
         dest_conn,
+        delta_plan=None,
     ):
         fk_datatypes = {
             col: typ
@@ -692,7 +808,13 @@ class Subset:
         fqt = fully_qualified_table(target)
         batch_size = compute_batch_size(len(fk_datatypes))
 
-        if len(groups) == 1 and self.config.max_rows_per_table is None:
+        # streaming handles one ID stream; incremental multi-constraint tables
+        # need one pass per constraint, so they take the multi-group path
+        streaming_ok = len(groups) == 1 and self.config.max_rows_per_table is None
+        if delta_plan is not None:
+            streaming_ok = streaming_ok and len(relevant_key_constraints) == 1
+
+        if streaming_ok:
             self.__upstream_unnest_streamed(
                 target,
                 fqt,
@@ -702,6 +824,7 @@ class Subset:
                 batch_size,
                 source_conn,
                 dest_conn,
+                delta_plan,
             )
             return
 
@@ -714,7 +837,23 @@ class Subset:
             batch_size,
             source_conn,
             dest_conn,
+            delta_plan,
         )
+
+    def __fetch_dest_rows(self, query, batch_size, dest_conn):
+        cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
+        dest_cursor = dest_conn.cursor(name=cursor_name, withhold=True)
+        try:
+            dest_cursor.execute(query)
+            rows = []
+            while True:
+                batch = dest_cursor.fetchmany(batch_size)
+                if not batch:
+                    break
+                rows.extend(row for row in batch if all(c is not None for c in row))
+        finally:
+            dest_cursor.close()
+        return rows
 
     def __upstream_unnest_streamed(
         self,
@@ -726,15 +865,13 @@ class Subset:
         batch_size,
         source_conn,
         dest_conn,
+        delta_plan=None,
     ):
         group_key = next(iter(groups))
         kc_target, target_cols = group_key
 
-        qualified_table = fully_qualified_table(
-            mysql_db_name_hack(kc_target, dest_conn)
-        )
-        query = "SELECT DISTINCT {} FROM {}".format(
-            columns_joined(target_cols), qualified_table
+        query = self.__upstream_ids_query(
+            kc_target, list(target_cols), dest_conn, delta_plan
         )
 
         cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
@@ -751,10 +888,9 @@ class Subset:
 
                 q, params = self.__build_upstream_unnest_query(
                     fqt,
-                    groups,
+                    [(kc, valid_rows) for kc in groups[group_key]],
                     fk_datatypes,
                     upstream_filters,
-                    {group_key: valid_rows},
                 )
                 self.__copy_rows(
                     source_conn,
@@ -777,57 +913,81 @@ class Subset:
         batch_size,
         source_conn,
         dest_conn,
+        delta_plan=None,
     ):
-        group_rows = {}
-        cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
-        dest_cursor = dest_conn.cursor(name=cursor_name, withhold=True)
-        try:
-            for kc_target, target_cols in groups:
-                qualified_table = fully_qualified_table(
-                    mysql_db_name_hack(kc_target, dest_conn)
+        full_rows = {}
+        delta_rows = {}
+        for kc_target, target_cols in groups:
+            group_key = (kc_target, target_cols)
+            full_rows[group_key] = self.__fetch_dest_rows(
+                self.__upstream_ids_query(
+                    kc_target, list(target_cols), dest_conn, None
+                ),
+                batch_size,
+                dest_conn,
+            )
+            if delta_plan and kc_target in delta_plan:
+                delta_rows[group_key] = self.__fetch_dest_rows(
+                    self.__upstream_ids_query(
+                        kc_target, list(target_cols), dest_conn, delta_plan
+                    ),
+                    batch_size,
+                    dest_conn,
                 )
-                query = "SELECT DISTINCT {} FROM {}".format(
-                    columns_joined(target_cols), qualified_table
-                )
-                dest_cursor.execute(query)
-                rows = []
-                while True:
-                    batch = dest_cursor.fetchmany(batch_size)
-                    if not batch:
-                        break
-                    rows.extend(row for row in batch if all(c is not None for c in row))
-                group_rows[(kc_target, target_cols)] = rows
-        finally:
-            dest_cursor.close()
 
-        if not any(group_rows.values()):
-            return
-
-        largest_key = max(group_rows, key=lambda k: len(group_rows[k]))
-        largest_rows = group_rows[largest_key]
+        kcs = [kc for group in groups.values() for kc in group]
+        if delta_plan is None:
+            if not any(full_rows.values()):
+                return
+            passes = [None]
+        else:
+            # one pass per constraint whose parent gained rows this run: that
+            # constraint uses the delta IDs, the others use the full ID sets
+            # (AND semantics must hold against everything already imported)
+            passes = [
+                j
+                for j, kc in enumerate(kcs)
+                if delta_rows.get((kc["target_table"], tuple(kc["target_columns"])))
+            ]
+            if not passes:
+                return
 
         copy_batch = compute_batch_size(len(fk_datatypes))
-        if len(largest_rows) <= batch_size:
-            q, params = self.__build_upstream_unnest_query(
-                fqt, groups, fk_datatypes, upstream_filters, group_rows
-            )
-            if self.config.max_rows_per_table is not None:
-                q += " LIMIT {}".format(self.config.max_rows_per_table)
-            self.__copy_rows(
-                source_conn, dest_conn, q, target, params, batch_size=copy_batch
-            )
-            return
+        for pass_j in passes:
+            kc_rows = []
+            for j, kc in enumerate(kcs):
+                group_key = (kc["target_table"], tuple(kc["target_columns"]))
+                if pass_j is not None and pass_j == j:
+                    kc_rows.append((kc, delta_rows[group_key]))
+                else:
+                    kc_rows.append((kc, full_rows[group_key]))
 
-        for i in range(0, len(largest_rows), batch_size):
-            batch_rows = largest_rows[i : i + batch_size]
-            batch_map = dict(group_rows)
-            batch_map[largest_key] = batch_rows
-            q, params = self.__build_upstream_unnest_query(
-                fqt, groups, fk_datatypes, upstream_filters, batch_map
-            )
-            self.__copy_rows(
-                source_conn, dest_conn, q, target, params, batch_size=copy_batch
-            )
+            largest_idx = max(range(len(kc_rows)), key=lambda i: len(kc_rows[i][1]))
+            largest_rows = kc_rows[largest_idx][1]
+
+            if len(largest_rows) <= batch_size:
+                q, params = self.__build_upstream_unnest_query(
+                    fqt, kc_rows, fk_datatypes, upstream_filters
+                )
+                if self.config.max_rows_per_table is not None:
+                    q += " LIMIT {}".format(self.config.max_rows_per_table)
+                self.__copy_rows(
+                    source_conn, dest_conn, q, target, params, batch_size=copy_batch
+                )
+                continue
+
+            for i in range(0, len(largest_rows), batch_size):
+                batch_kc_rows = list(kc_rows)
+                batch_kc_rows[largest_idx] = (
+                    kc_rows[largest_idx][0],
+                    largest_rows[i : i + batch_size],
+                )
+                q, params = self.__build_upstream_unnest_query(
+                    fqt, batch_kc_rows, fk_datatypes, upstream_filters
+                )
+                self.__copy_rows(
+                    source_conn, dest_conn, q, target, params, batch_size=copy_batch
+                )
 
     def subset_downstream(self, table, relationships, source_conn=None, dest_conn=None):
         source_conn = source_conn or self.__source_conn

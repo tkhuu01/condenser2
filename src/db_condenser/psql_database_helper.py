@@ -1,3 +1,5 @@
+import hashlib
+import os
 import uuid
 from dataclasses import asdict
 
@@ -30,6 +32,140 @@ def _conn_cache_key(conn):
     # different servers don't share cache entries
     info = conn.connection.info
     return (info.host, info.port, info.dbname)
+
+
+# Incremental (top-up) state: when destination_mode is "topup", each destination
+# table with a primary key gets a delta table in the _condenser schema that
+# records the PKs inserted during this run. Upstream subsetting joins against
+# these deltas instead of full tables, so re-runs cost O(new rows).
+DELTA_SCHEMA = "_condenser"
+_incremental_deltas: dict = {}
+
+
+def get_tables_primary_keys(tables, conn):
+    """Map each fully-qualified table to its ordered PK column list ([] if none)."""
+    q = """
+        SELECT ns.nspname || '.' || cl.relname,
+               array_agg(att.attname ORDER BY x.ord)
+          FROM pg_index i
+          JOIN pg_class cl ON cl.oid = i.indrelid
+          JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+          JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS x(attnum, ord) ON true
+          JOIN pg_attribute att ON att.attrelid = cl.oid AND att.attnum = x.attnum
+         WHERE i.indisprimary
+         GROUP BY 1
+    """
+    with conn.cursor() as cur:
+        cur.execute(q)
+        pk_map = dict(cur.fetchall())
+    return {t: pk_map.get(t, []) for t in tables}
+
+
+def prep_incremental(conn, tables):
+    _incremental_deltas.clear()
+    with conn.cursor() as cur:
+        cur.execute('DROP SCHEMA IF EXISTS "{}" CASCADE'.format(DELTA_SCHEMA))
+        cur.execute('CREATE SCHEMA "{}"'.format(DELTA_SCHEMA))
+    pk_map = get_tables_primary_keys(tables, conn)
+    no_pk = []
+    for t in tables:
+        pk = pk_map.get(t) or []
+        if not pk:
+            no_pk.append(t)
+            continue
+        name = "new_ids_" + t.replace(".", "_")
+        if len(name) > 63:
+            name = "new_ids_" + hashlib.md5(t.encode()).hexdigest()
+        qualified = '"{}"."{}"'.format(DELTA_SCHEMA, name)
+        q = "CREATE UNLOGGED TABLE {} AS SELECT {} FROM {} WITH NO DATA".format(
+            qualified, columns_joined(pk), fully_qualified_table(t)
+        )
+        with conn.cursor() as cur:
+            cur.execute(q)
+        _incremental_deltas[t] = (qualified, pk)
+    conn.commit()
+    if no_pk:
+        print(
+            "WARNING: tables without a primary key are processed"
+            " non-incrementally and may accumulate duplicate rows on re-runs: "
+            + ", ".join(no_pk)
+        )
+
+
+def unprep_incremental(conn):
+    _incremental_deltas.clear()
+    with conn.cursor() as cur:
+        cur.execute('DROP SCHEMA IF EXISTS "{}" CASCADE'.format(DELTA_SCHEMA))
+    conn.commit()
+
+
+def drop_fk_constraints(conn):
+    """Capture and drop all FK constraints on the destination.
+
+    Incremental runs load into a destination whose constraints are live
+    (added at the end of the first run), but middle-out ordering inserts
+    upstream rows before the downstream rows they reference. FKs are dropped
+    for the duration of the run and restored afterwards; PKs and unique
+    indexes stay so ON CONFLICT dedup keeps working. Returns the dropped
+    definitions for restore_fk_constraints.
+    """
+    q = """
+        SELECT ns.nspname, cl.relname, con.conname, pg_get_constraintdef(con.oid)
+          FROM pg_constraint con
+          JOIN pg_class cl ON cl.oid = con.conrelid
+          JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+         WHERE con.contype = 'f'
+           AND ns.nspname NOT IN ('pg_catalog', 'information_schema')
+    """
+    with conn.cursor() as cur:
+        cur.execute(q)
+        fks = cur.fetchall()
+
+    if fks:
+        backup_dir = os.path.join(os.getcwd(), "SQL")
+        os.makedirs(backup_dir, exist_ok=True)
+        backup_path = os.path.join(backup_dir, "incremental_fk_backup.sql")
+        with open(backup_path, "w") as fp:
+            for nsp, rel, name, defn in fks:
+                fp.write(
+                    'ALTER TABLE "{}"."{}" ADD CONSTRAINT "{}" {};\n'.format(
+                        nsp, rel, name, defn
+                    )
+                )
+
+    with conn.cursor() as cur:
+        for nsp, rel, name, _ in fks:
+            cur.execute(
+                'ALTER TABLE "{}"."{}" DROP CONSTRAINT "{}"'.format(nsp, rel, name)
+            )
+    conn.commit()
+    return fks
+
+
+def restore_fk_constraints(conn, fks):
+    with conn.cursor() as cur:
+        for nsp, rel, name, defn in fks:
+            cur.execute(
+                'ALTER TABLE "{}"."{}" ADD CONSTRAINT "{}" {}'.format(
+                    nsp, rel, name, defn
+                )
+            )
+    conn.commit()
+
+
+def delta_for(table):
+    """Return (qualified_delta_table, pk_columns) or None."""
+    return _incremental_deltas.get(table)
+
+
+def _wrap_insert_with_delta(insert_query, destination_table):
+    delta = _incremental_deltas.get(destination_table)
+    if not delta:
+        return insert_query
+    qualified, pk = delta
+    return "WITH ins AS ({} RETURNING {}) INSERT INTO {} SELECT * FROM ins".format(
+        insert_query, columns_joined(pk), qualified
+    )
 
 
 def prep_temp_dbs(_, __):
@@ -106,6 +242,7 @@ def copy_rows(
             insert_query = "INSERT INTO {} {} OVERRIDING SYSTEM VALUE VALUES {} ON CONFLICT DO NOTHING".format(
                 fully_qualified_table(destination_table), columns, template
             )
+        insert_query = _wrap_insert_with_delta(insert_query, destination_table)
 
         while True:
             rows = cursor.fetchmany(batch_size)
@@ -173,11 +310,12 @@ def copy_rows_copy_protocol(
                 for data in src_copy:
                     dest_copy.write(data)
 
-        dest_cursor.execute(
+        insert_query = (
             "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT DO NOTHING".format(
                 dest_table, column_list, column_list, temp_table
             )
         )
+        dest_cursor.execute(_wrap_insert_with_delta(insert_query, destination_table))
         # release the staging rows' disk immediately; otherwise the last
         # result set per table lingers until the session closes
         dest_cursor.execute("TRUNCATE {}".format(temp_table))

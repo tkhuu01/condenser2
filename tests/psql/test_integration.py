@@ -43,7 +43,7 @@ def _query_one(conn, sql):
 def _run_subsetter(
     use_temp_tables: bool,
     use_copy_protocol: bool = False,
-    skip_schema_setup: bool = False,
+    topup: bool = False,
     suffix_override: str | None = None,
     parallel_read_workers: int = 1,
 ) -> tuple[str, str]:
@@ -54,7 +54,7 @@ def _run_subsetter(
     source_db = SOURCE_DB + suffix
     dest_db = DEST_DB + suffix
 
-    if not skip_schema_setup:
+    if not topup:
         admin = _admin_conn()
         with admin.cursor() as cur:
             cur.execute(f"DROP DATABASE IF EXISTS {source_db}")
@@ -74,7 +74,7 @@ def _run_subsetter(
     raw_config["destination_db_connection_info"]["db_name"] = dest_db
     raw_config["use_temp_tables"] = use_temp_tables
     raw_config["use_copy_protocol"] = use_copy_protocol
-    raw_config["skip_schema_setup"] = skip_schema_setup
+    raw_config["destination_mode"] = "topup" if topup else "recreate"
     raw_config["parallel_read_workers"] = parallel_read_workers
 
     config_reader.reset_config()
@@ -86,7 +86,7 @@ def _run_subsetter(
     destination_dbc = DbConnect(db_type, config.destination_db_connection_info)
 
     database = db_creator(db_type, source_dbc, destination_dbc)
-    if not skip_schema_setup:
+    if not topup:
         database.teardown()
         database.create()
 
@@ -99,7 +99,7 @@ def _run_subsetter(
         subsetter.prep_temp_dbs()
         subsetter.run_middle_out()
 
-        if not skip_schema_setup:
+        if not topup:
             for sql_stmt in config.pre_constraint_sql:
                 db_helper.run_query(sql_stmt, destination_dbc.get_db_connection())
 
@@ -396,9 +396,9 @@ def test_sequences_reset(subsetter_dbs):
     ids=["unnest_rerun", "temp_tables_rerun", "copy_protocol_rerun"],
 )
 def rerun_dbs(request):
-    """Run the subsetter twice on the same destination with skip_schema_setup."""
+    """Run the subsetter twice on the same destination in topup mode."""
     source_db, dest_db = _run_subsetter(**request.param)
-    _run_subsetter(**request.param, skip_schema_setup=True)
+    _run_subsetter(**request.param, topup=True)
 
     dest = psycopg.connect(
         dbname=dest_db,
@@ -616,3 +616,201 @@ def test_pre_filter_limits_rows(pre_filter_dbs):
         "SELECT COUNT(DISTINCT region) FROM sales.customers",
     )
     assert regions == 1
+
+
+# ============================================================
+# INCREMENTAL (TOP-UP) RE-RUNS
+# ============================================================
+
+
+@pytest.fixture(
+    scope="module",
+    params=[
+        {
+            "use_temp_tables": False,
+            "use_copy_protocol": False,
+            "suffix_override": "_incr",
+        },
+        {
+            "use_temp_tables": True,
+            "use_copy_protocol": False,
+            "suffix_override": "_incr_tt",
+        },
+        {
+            "use_temp_tables": False,
+            "use_copy_protocol": True,
+            "suffix_override": "_incr_cp",
+        },
+    ],
+    ids=["unnest_incremental", "temp_tables_incremental", "copy_protocol_incremental"],
+)
+def incremental_dbs(request):
+    """Run once, add rows to the source, then re-run in topup mode.
+
+    New source rows:
+    - customer 11 (Kate, 2025) matches the target WHERE -> should arrive
+    - order 31 belongs to Kate -> should arrive (children of new parents)
+    - order 32 belongs to customer 6 (imported in run 1) -> should NOT
+      arrive (top-up semantics: existing entities stay frozen)
+    - order_lines for each follow their order
+    - product 21 is referenced only by order 31's line -> downstream pull
+    - transfer 31->16 pairs a new order with a run-1 order -> should arrive
+      (multi-FK AND semantics against delta + full sets)
+    - transfer 32->16 references a never-imported order -> should NOT arrive
+    """
+    source_db, dest_db = _run_subsetter(**request.param)
+
+    src = psycopg.connect(
+        dbname=source_db,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT,
+    )
+    with src.cursor() as cur:
+        cur.execute(
+            "INSERT INTO sales.customers (name, email, region, created_at)"
+            " VALUES ('Kate', 'kate@example.com', 'US-W', '2025-09-01')"
+        )
+        cur.execute(
+            "INSERT INTO inventory.products (name, price, metadata)"
+            " VALUES ('Widget Z', 19.99, NULL)"
+        )
+        cur.execute(
+            "INSERT INTO sales.orders (customer_id, warehouse_id, ordered_at)"
+            " VALUES (11, 1, '2025-09-02'), (6, 2, '2025-09-03')"
+        )
+        cur.execute(
+            "INSERT INTO sales.order_lines (order_id, product_id, quantity, unit_price)"
+            " VALUES (31, 21, 1, 19.99), (32, 1, 1, 9.99)"
+        )
+        cur.execute(
+            "INSERT INTO sales.order_transfers (from_order_id, to_order_id, reason)"
+            " VALUES (31, 16, 'new to old'), (32, 16, 'not imported')"
+        )
+    src.commit()
+    src.close()
+
+    _run_subsetter(**request.param, topup=True)
+
+    dest = psycopg.connect(
+        dbname=dest_db,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT,
+    )
+    yield dest
+    dest.close()
+
+    admin = _admin_conn()
+    with admin.cursor() as cur:
+        for db in (source_db, dest_db):
+            cur.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid()",
+                (db,),
+            )
+            cur.execute(f"DROP DATABASE IF EXISTS {db}")
+    admin.close()
+
+
+def test_incremental_new_rows_arrive(incremental_dbs):
+    """New target rows, their descendants, and new downstream references."""
+    dest = incremental_dbs
+    assert _query_one(dest, "SELECT COUNT(*) FROM sales.customers WHERE id = 11") == 1
+    # run 1 imported customers 6-10; Kate makes 6 total
+    assert _query_one(dest, "SELECT COUNT(*) FROM sales.customers") == 6
+    assert _query_one(dest, "SELECT COUNT(*) FROM sales.orders WHERE id = 31") == 1
+    assert (
+        _query_one(dest, "SELECT COUNT(*) FROM sales.order_lines WHERE order_id = 31")
+        == 1
+    )
+    assert (
+        _query_one(dest, "SELECT COUNT(*) FROM inventory.products WHERE id = 21") == 1
+    )
+
+
+def test_incremental_existing_entities_frozen(incremental_dbs):
+    """Top-up semantics: new children of already-imported parents stay out."""
+    dest = incremental_dbs
+    # order 32 belongs to an already-imported customer: top-up leaves it out
+    assert _query_one(dest, "SELECT COUNT(*) FROM sales.orders WHERE id = 32") == 0
+    assert (
+        _query_one(dest, "SELECT COUNT(*) FROM sales.order_lines WHERE order_id = 32")
+        == 0
+    )
+    assert _query_one(dest, "SELECT COUNT(*) FROM sales.orders") == 16
+
+
+def test_incremental_multi_fk_new_to_old(incremental_dbs):
+    """Multi-FK AND semantics: new order paired with a run-1 order arrives."""
+    dest = incremental_dbs
+    assert (
+        _query_one(
+            dest,
+            "SELECT COUNT(*) FROM sales.order_transfers"
+            " WHERE from_order_id = 31 AND to_order_id = 16",
+        )
+        == 1
+    )
+    assert (
+        _query_one(
+            dest,
+            "SELECT COUNT(*) FROM sales.order_transfers WHERE from_order_id = 32",
+        )
+        == 0
+    )
+    # run 1's three transfers plus the new one
+    assert _query_one(dest, "SELECT COUNT(*) FROM sales.order_transfers") == 4
+
+
+def test_incremental_integrity_and_cleanup(incremental_dbs):
+    """No duplicates, no FK orphans, and the delta schema is dropped."""
+    dest = incremental_dbs
+    for table in ["sales.customers", "sales.orders", "sales.order_lines"]:
+        total = _query_one(dest, f"SELECT COUNT(*) FROM {table}")
+        distinct = _query_one(dest, f"SELECT COUNT(DISTINCT id) FROM {table}")
+        assert total == distinct, f"{table}: duplicate rows after incremental run"
+    orphans = _query_one(
+        dest,
+        """
+        SELECT COUNT(*) FROM sales.orders o
+        WHERE NOT EXISTS (
+            SELECT 1 FROM sales.customers c WHERE c.id = o.customer_id
+        )
+        """,
+    )
+    assert orphans == 0
+    line_orphans = _query_one(
+        dest,
+        """
+        SELECT COUNT(*) FROM sales.order_lines ol
+        WHERE NOT EXISTS (SELECT 1 FROM sales.orders o WHERE o.id = ol.order_id)
+           OR NOT EXISTS (SELECT 1 FROM inventory.products p WHERE p.id = ol.product_id)
+        """,
+    )
+    assert line_orphans == 0
+    leftover = _query_one(
+        dest,
+        "SELECT COUNT(*) FROM pg_namespace WHERE nspname = '_condenser'",
+    )
+    assert leftover == 0
+
+
+def test_skip_schema_setup_alias_maps_to_destination_mode():
+    with open(CONFIG_JSON, "r") as fp:
+        raw = json.load(fp)
+    raw.pop("destination_mode", None)
+
+    raw["skip_schema_setup"] = True
+    cfg = config_reader._raw_dict_to_config(raw)
+    assert cfg.destination_mode == config_reader.DestinationMode.TOPUP
+
+    raw["skip_schema_setup"] = False
+    cfg = config_reader._raw_dict_to_config(raw)
+    assert cfg.destination_mode == config_reader.DestinationMode.RECREATE
+
+    del raw["skip_schema_setup"]
+    cfg = config_reader._raw_dict_to_config(raw)
+    assert cfg.destination_mode == config_reader.DestinationMode.RECREATE

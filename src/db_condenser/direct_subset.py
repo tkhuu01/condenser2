@@ -3,7 +3,7 @@ import sys
 import time
 
 from db_condenser import config_reader, database_helper, result_tabulator
-from db_condenser.config_reader import DbConnectInfo, DbType
+from db_condenser.config_reader import DbConnectInfo, DbType, DestinationMode
 from db_condenser.db_connect import DbConnect, MySqlConnection, PsqlConnection
 from db_condenser.mysql_database_creator import MySqlDatabaseCreator
 from db_condenser.psql_database_creator import PsqlDatabaseCreator
@@ -74,7 +74,7 @@ def main():
 
     database = db_creator(db_type, source_dbc, destination_dbc)
 
-    if not config.skip_schema_setup:
+    if config.destination_mode == DestinationMode.RECREATE:
         database.teardown()
         database.create()
 
@@ -100,7 +100,10 @@ def main():
         )
 
         print("Adding database constraints")
-        if not args.no_constraints and not config.skip_schema_setup:
+        if (
+            not args.no_constraints
+            and config.destination_mode == DestinationMode.RECREATE
+        ):
             database.add_constraints()
 
         print("Beginning post-subset SQL calls")

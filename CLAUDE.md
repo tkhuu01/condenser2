@@ -133,7 +133,7 @@ Shared helpers in `subset.py`:
 Row transfer from source to destination uses `copy_rows` in `psql_database_helper.py`, selected by the `use_copy_protocol` config flag:
 
 - **`use_copy_protocol: false` (default)** — `copy_rows` uses `executemany` with per-row INSERT statements. Handles JSON columns via `psycopg.Json` wrapping and identity columns via `OVERRIDING SYSTEM VALUE`.
-- **`use_copy_protocol: true`** — `copy_rows_copy_protocol` uses PostgreSQL's `COPY ... FROM STDIN` protocol with `write_row`. Significantly faster (5-10x for bulk inserts). JSON values pass through as text strings (no wrapping needed thanks to `set_json_loads(lambda s: s)`). COPY writes to identity columns natively (no override clause needed). Generated columns are excluded via the `COPY table(col_list)` column list.
+- **`use_copy_protocol: true`** — `copy_rows_copy_protocol` pipes block-level `COPY ... TO STDOUT` straight into `COPY ... FROM STDIN` via a staging table (for `ON CONFLICT` dedup). Significantly faster (5-10x for bulk inserts). JSON values pass through as raw COPY text. Generated columns are excluded via the COPY column list; identity columns are written natively.
 
 The copy function is selected once in `Subset.__init__` and stored as `self.__copy_rows`, used by all 8 call sites.
 
@@ -162,6 +162,16 @@ Named queries executed once at subset start, cached in memory, and applied as `A
 - Works on read-only replicas (no writes to source)
 - Practical limit: ~2M cached values (~140MB memory); beyond that, consider a materialized view
 
+### Incremental (Top-Up) Re-Runs
+
+When `destination_mode: "topup"` (PostgreSQL only; default is `"recreate"`, and the deprecated `skip_schema_setup: true` maps to `"topup"`), the destination is treated as an existing subset and the run tops it up instead of re-transferring everything:
+
+- Destination FK constraints are dropped for the duration of the run (middle-out load order inserts referencing rows before referenced ones) and restored at the end; definitions are backed up to `SQL/incremental_fk_backup.sql`. PKs and unique indexes stay so `ON CONFLICT DO NOTHING` dedups re-read rows.
+- Every insert records its new PKs into a per-table delta table in the `_condenser` schema on the destination (unlogged, dropped at run end) via `WITH ins AS (INSERT ... RETURNING <pk>) INSERT INTO <delta> ...`.
+- Upstream subsetting joins children against delta parent IDs instead of full destination tables, so a re-run costs O(new rows). Multi-FK tables run one pass per constraint: that constraint joins its delta, the others join the full ID sets (preserves AND semantics). Tables whose parent deltas are all empty are skipped entirely.
+- Top-up semantics: new initial-target matches and their descendants arrive; already-imported entities stay frozen (new children of old parents are not picked up).
+- Tables without a primary key fall back to full (non-incremental) behavior with a warning and may accumulate duplicates on re-runs.
+
 ### Database Support
 - **PostgreSQL:** Full support including sequence reset, named cursors, JSON casting
 - **MySQL:** Functional but limited (no sequence reset, no constraint re-application, no cross-db FKs)
@@ -188,5 +198,6 @@ Named queries executed once at subset start, cached in memory, and applied as `A
 - Requires PostgreSQL 18 service (see docker-compose.yml or CI config)
 - Test DB seeded from `tests/psql/seed.sql`, config in `tests/psql/test_config.json`
 - Fixture `subsetter_dbs` is parameterized: every test runs three times (`[unnest]`, `[temp_tables]`, and `[copy_protocol]`)
+- Fixtures `rerun_dbs` and `incremental_dbs` cover re-runs into an existing destination (idempotency and top-up semantics), also across all three variants
 - Each variant gets its own databases (e.g. `condenser_test_source`, `condenser_test_source_temp`, `condenser_test_source_copy`)
 - CI runs on GitHub Actions: ruff lint + pytest with Postgres 18 service container
