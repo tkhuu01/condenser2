@@ -18,6 +18,19 @@ from db_condenser.subset_utils import (
 
 set_json_loads(lambda s: s)
 
+# Table shapes never change during a run (schema is created before subsetting;
+# constraints added after don't alter columns), so metadata lookups are cached
+# per database. Saves a catalog round trip per copy_rows call, which the
+# streamed upstream/downstream paths invoke once per ID batch.
+_metadata_cache: dict = {}
+
+
+def _conn_cache_key(conn):
+    # host+port included so same-named source and destination databases on
+    # different servers don't share cache entries
+    info = conn.connection.info
+    return (info.host, info.port, info.dbname)
+
 
 def prep_temp_dbs(_, __):
     pass
@@ -133,16 +146,19 @@ def copy_rows_copy_protocol(
     non_generated_columns = [dt[0] for _, dt in enumerate(datatypes) if dt[2] != "s"]
     column_list = ", ".join('"' + col + '"' for col in non_generated_columns)
     dest_table = fully_qualified_table(destination_table)
-    temp_table = '"_copy_staging_' + str(uuid.uuid4()).replace("-", "") + '"'
+    # deterministic name so batched calls for the same table reuse one
+    # session-local staging table instead of CREATE/DROP catalog churn per call
+    temp_table = '"_copy_staging_{}"'.format(destination_table.replace(".", "_"))
 
     source_cursor = source.cursor().inner_cursor
     dest_cursor = destination.cursor().inner_cursor
     try:
         dest_cursor.execute(
-            "CREATE TEMPORARY TABLE {} (LIKE {} INCLUDING DEFAULTS)".format(
+            "CREATE TEMPORARY TABLE IF NOT EXISTS {} (LIKE {} INCLUDING DEFAULTS)".format(
                 temp_table, dest_table
             )
         )
+        dest_cursor.execute("TRUNCATE {}".format(temp_table))
 
         # Block-level COPY streaming: pipe raw COPY data straight from the source
         # into the staging table, avoiding a per-row Python loop. Selecting just the
@@ -162,7 +178,9 @@ def copy_rows_copy_protocol(
                 dest_table, column_list, column_list, temp_table
             )
         )
-        dest_cursor.execute("DROP TABLE {}".format(temp_table))
+        # release the staging rows' disk immediately; otherwise the last
+        # result set per table lingers until the session closes
+        dest_cursor.execute("TRUNCATE {}".format(temp_table))
     finally:
         dest_cursor.close()
         source_cursor.close()
@@ -352,6 +370,10 @@ def get_table_count_estimate(table_name, schema, conn):
 
 
 def get_table_columns(table, schema, conn):
+    cache_key = ("columns", _conn_cache_key(conn), schema, table)
+    cached = _metadata_cache.get(cache_key)
+    if cached is not None:
+        return cached
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -362,7 +384,9 @@ def get_table_columns(table, schema, conn):
                AND NOT attisdropped
              ORDER BY attnum;""".format(schema, table)
         )
-        return [r[0] for r in cur.fetchall()]
+        result = [r[0] for r in cur.fetchall()]
+    _metadata_cache[cache_key] = result
+    return result
 
 
 def list_all_user_schemas(conn):
@@ -405,6 +429,10 @@ def get_table_page_count(table, schema, conn):
 
 
 def get_table_datatypes(table, schema, conn):
+    cache_key = ("datatypes", _conn_cache_key(conn), schema, table)
+    cached = _metadata_cache.get(cache_key)
+    if cached is not None:
+        return cached
     if not schema:
         table_clause = "cl.relname = '{}'".format(table)
     else:
@@ -427,7 +455,9 @@ def get_table_datatypes(table, schema, conn):
         """.format(table_clause)
         )
 
-        return [(r[0], r[1], r[2], r[3]) for r in cur.fetchall()]
+        result = [(r[0], r[1], r[2], r[3]) for r in cur.fetchall()]
+    _metadata_cache[cache_key] = result
+    return result
 
 
 def truncate_table(target_table, conn):
