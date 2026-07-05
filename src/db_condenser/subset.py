@@ -1019,79 +1019,148 @@ class Subset:
         dest_conn,
         delta_plan=None,
     ):
-        full_rows = {}
-        delta_rows = {}
-        for kc_target, target_cols in groups:
-            group_key = (kc_target, target_cols)
-            full_rows[group_key] = self.__fetch_dest_rows(
-                self.__upstream_ids_query(
-                    kc_target, list(target_cols), dest_conn, None
-                ),
-                batch_size,
-                dest_conn,
-            )
-            if delta_plan and kc_target in delta_plan:
-                delta_rows[group_key] = self.__fetch_dest_rows(
-                    self.__upstream_ids_query(
-                        kc_target, list(target_cols), dest_conn, delta_plan
-                    ),
-                    batch_size,
-                    dest_conn,
-                )
-
         kcs = [kc for group in groups.values() for kc in group]
+
+        def group_of(kc):
+            return (kc["target_table"], tuple(kc["target_columns"]))
+
+        kcs_per_group = {}
+        for kc in kcs:
+            kcs_per_group[group_of(kc)] = kcs_per_group.get(group_of(kc), 0) + 1
+
+        delta_rows = {}
+        if delta_plan:
+            for kc_target, target_cols in groups:
+                if kc_target in delta_plan:
+                    delta_rows[(kc_target, target_cols)] = self.__fetch_dest_rows(
+                        self.__upstream_ids_query(
+                            kc_target, list(target_cols), dest_conn, delta_plan
+                        ),
+                        batch_size,
+                        dest_conn,
+                    )
+
         if delta_plan is None:
-            if not any(full_rows.values()):
-                return
             passes = [None]
         else:
             # one pass per constraint whose parent gained rows this run: that
             # constraint uses the delta IDs, the others use the full ID sets
             # (AND semantics must hold against everything already imported)
-            passes = [
-                j
-                for j, kc in enumerate(kcs)
-                if delta_rows.get((kc["target_table"], tuple(kc["target_columns"])))
-            ]
+            passes = [j for j, kc in enumerate(kcs) if delta_rows.get(group_of(kc))]
             if not passes:
                 return
 
+        # count each group's IDs so the largest set can be streamed through a
+        # cursor instead of held in memory. Only a group referenced by a single
+        # constraint can stream: a shared group must stay resident so every
+        # constraint joins its full set (batching two constraints against the
+        # same batch would drop cross-batch pairs).
+        full_counts = {}
+        with dest_conn.cursor() as cur:
+            for kc_target, target_cols in groups:
+                q = self.__upstream_ids_query(
+                    kc_target, list(target_cols), dest_conn, None
+                )
+                cur.execute("SELECT COUNT(*) FROM ({}) _ids".format(q))
+                full_counts[(kc_target, target_cols)] = cur.fetchone()[0]
+
+        full_rows = {}  # loaded lazily, only for groups that must stay resident
+
+        def resident_rows(group_key):
+            if group_key not in full_rows:
+                full_rows[group_key] = self.__fetch_dest_rows(
+                    self.__upstream_ids_query(
+                        group_key[0], list(group_key[1]), dest_conn, None
+                    ),
+                    batch_size,
+                    dest_conn,
+                )
+            return full_rows[group_key]
+
         copy_batch = compute_batch_size(len(fk_datatypes))
+
+        def copy_kc_rows(kc_rows, single_shot):
+            q, params = self.__build_upstream_unnest_query(
+                fqt, kc_rows, fk_datatypes, upstream_filters
+            )
+            if single_shot and self.config.max_rows_per_table is not None:
+                q += " LIMIT {}".format(self.config.max_rows_per_table)
+            self.__copy_rows(
+                source_conn, dest_conn, q, target, params, batch_size=copy_batch
+            )
+
         for pass_j in passes:
-            kc_rows = []
-            for j, kc in enumerate(kcs):
-                group_key = (kc["target_table"], tuple(kc["target_columns"]))
+            # groups whose full set this pass doesn't need: the delta
+            # constraint's own group, when no other constraint shares it
+            stream_candidates = [
+                gk
+                for gk in groups
+                if kcs_per_group[gk] == 1
+                and not (pass_j is not None and group_of(kcs[pass_j]) == gk)
+            ]
+            stream_gk = (
+                max(stream_candidates, key=lambda gk: full_counts[gk])
+                if stream_candidates
+                else None
+            )
+
+            def rows_for(j, kc):
                 if pass_j is not None and pass_j == j:
-                    kc_rows.append((kc, delta_rows[group_key]))
-                else:
-                    kc_rows.append((kc, full_rows[group_key]))
+                    return delta_rows[group_of(kc)]
+                return resident_rows(group_of(kc))
 
-            largest_idx = max(range(len(kc_rows)), key=lambda i: len(kc_rows[i][1]))
-            largest_rows = kc_rows[largest_idx][1]
-
-            if len(largest_rows) <= batch_size:
-                q, params = self.__build_upstream_unnest_query(
-                    fqt, kc_rows, fk_datatypes, upstream_filters
-                )
-                if self.config.max_rows_per_table is not None:
-                    q += " LIMIT {}".format(self.config.max_rows_per_table)
-                self.__copy_rows(
-                    source_conn, dest_conn, q, target, params, batch_size=copy_batch
-                )
+            if stream_gk is None:
+                # every group is shared (or delta-sourced): all resident,
+                # batching the largest set as before
+                kc_rows = [(kc, rows_for(j, kc)) for j, kc in enumerate(kcs)]
+                if not any(rows for _, rows in kc_rows):
+                    continue
+                largest_idx = max(range(len(kc_rows)), key=lambda i: len(kc_rows[i][1]))
+                largest_rows = kc_rows[largest_idx][1]
+                if len(largest_rows) <= batch_size:
+                    copy_kc_rows(kc_rows, single_shot=True)
+                    continue
+                for i in range(0, len(largest_rows), batch_size):
+                    batch_kc_rows = list(kc_rows)
+                    batch_kc_rows[largest_idx] = (
+                        kc_rows[largest_idx][0],
+                        largest_rows[i : i + batch_size],
+                    )
+                    copy_kc_rows(batch_kc_rows, single_shot=False)
                 continue
 
-            for i in range(0, len(largest_rows), batch_size):
-                batch_kc_rows = list(kc_rows)
-                batch_kc_rows[largest_idx] = (
-                    kc_rows[largest_idx][0],
-                    largest_rows[i : i + batch_size],
+            # stream the largest single-constraint group; everything else
+            # (small groups, deltas) stays resident
+            stream_idx = next(
+                j for j, kc in enumerate(kcs) if group_of(kc) == stream_gk
+            )
+            cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
+            dest_cursor = dest_conn.cursor(name=cursor_name, withhold=True)
+            try:
+                dest_cursor.execute(
+                    self.__upstream_ids_query(
+                        stream_gk[0], list(stream_gk[1]), dest_conn, None
+                    )
                 )
-                q, params = self.__build_upstream_unnest_query(
-                    fqt, batch_kc_rows, fk_datatypes, upstream_filters
-                )
-                self.__copy_rows(
-                    source_conn, dest_conn, q, target, params, batch_size=copy_batch
-                )
+                first = True
+                while True:
+                    batch = dest_cursor.fetchmany(batch_size)
+                    if not batch:
+                        break
+                    valid_rows = [
+                        row for row in batch if all(c is not None for c in row)
+                    ]
+                    single_shot = first and len(batch) < batch_size
+                    first = False
+                    if not valid_rows:
+                        continue
+                    kc_rows = [
+                        (kc, valid_rows if j == stream_idx else rows_for(j, kc))
+                        for j, kc in enumerate(kcs)
+                    ]
+                    copy_kc_rows(kc_rows, single_shot=single_shot)
+            finally:
+                dest_cursor.close()
 
     def subset_downstream(
         self,

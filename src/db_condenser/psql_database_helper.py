@@ -42,6 +42,16 @@ DELTA_SCHEMA = "_condenser"
 _incremental_deltas: dict = {}
 
 
+def _prefixed_identifier(prefix, qualified_table):
+    """Build '<prefix><schema>_<table>', hashing when it would exceed
+    Postgres's 63-byte identifier limit (which truncates silently and could
+    collide across long table names)."""
+    name = prefix + qualified_table.replace(".", "_")
+    if len(name) > 63:
+        name = prefix + hashlib.md5(qualified_table.encode()).hexdigest()
+    return name
+
+
 def get_tables_primary_keys(tables, conn):
     """Map each fully-qualified table to its ordered PK column list ([] if none)."""
     q = """
@@ -73,9 +83,7 @@ def prep_incremental(conn, tables):
         if not pk:
             no_pk.append(t)
             continue
-        name = "new_ids_" + t.replace(".", "_")
-        if len(name) > 63:
-            name = "new_ids_" + hashlib.md5(t.encode()).hexdigest()
+        name = _prefixed_identifier("new_ids_", t)
         qualified = '"{}"."{}"'.format(DELTA_SCHEMA, name)
         q = "CREATE UNLOGGED TABLE {} AS SELECT {} FROM {} WITH NO DATA".format(
             qualified, columns_joined(pk), fully_qualified_table(t)
@@ -169,7 +177,10 @@ def _wrap_insert_with_delta(insert_query, destination_table):
 
 
 def prep_temp_dbs(_, __):
-    pass
+    # runs once at the start of every subset run: drop metadata cached from
+    # any prior run in this process, in case a same-named database was
+    # dropped and recreated with a different shape in between
+    _metadata_cache.clear()
 
 
 def unprep_temp_dbs(_, __):
@@ -282,10 +293,13 @@ def copy_rows_copy_protocol(
 
     non_generated_columns = [dt[0] for _, dt in enumerate(datatypes) if dt[2] != "s"]
     column_list = ", ".join('"' + col + '"' for col in non_generated_columns)
+    always_generated_id = any(dt[3] == "a" for dt in datatypes)
     dest_table = fully_qualified_table(destination_table)
     # deterministic name so batched calls for the same table reuse one
     # session-local staging table instead of CREATE/DROP catalog churn per call
-    temp_table = '"_copy_staging_{}"'.format(destination_table.replace(".", "_"))
+    temp_table = '"{}"'.format(
+        _prefixed_identifier("_copy_staging_", destination_table)
+    )
 
     source_cursor = source.cursor().inner_cursor
     dest_cursor = destination.cursor().inner_cursor
@@ -311,8 +325,12 @@ def copy_rows_copy_protocol(
                     dest_copy.write(data)
 
         insert_query = (
-            "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT DO NOTHING".format(
-                dest_table, column_list, column_list, temp_table
+            "INSERT INTO {} ({}){} SELECT {} FROM {} ON CONFLICT DO NOTHING".format(
+                dest_table,
+                column_list,
+                " OVERRIDING SYSTEM VALUE" if always_generated_id else "",
+                column_list,
+                temp_table,
             )
         )
         dest_cursor.execute(_wrap_insert_with_delta(insert_query, destination_table))

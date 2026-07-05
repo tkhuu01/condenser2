@@ -132,7 +132,7 @@ Shared helpers in `subset.py`:
 
 Row transfer from source to destination uses `copy_rows` in `psql_database_helper.py`, selected by the `use_copy_protocol` config flag:
 
-- **`use_copy_protocol: true` (default)** — `copy_rows_copy_protocol` pipes block-level `COPY ... TO STDOUT` straight into `COPY ... FROM STDIN` via a staging table (for `ON CONFLICT` dedup). Significantly faster (5-10x for bulk inserts). JSON values pass through as raw COPY text. Generated columns are excluded via the COPY column list; identity columns are written natively.
+- **`use_copy_protocol: true` (default)** — `copy_rows_copy_protocol` pipes block-level `COPY ... TO STDOUT` straight into `COPY ... FROM STDIN` via a staging table (for `ON CONFLICT` dedup). Significantly faster (5-10x for bulk inserts). JSON values pass through as raw COPY text. Generated columns are excluded via the COPY column list; identity values are preserved via `OVERRIDING SYSTEM VALUE` on the staging insert.
 - **`use_copy_protocol: false`** — `copy_rows` uses `executemany` with per-row INSERT statements. Handles JSON columns via `psycopg.Json` wrapping and identity columns via `OVERRIDING SYSTEM VALUE`. Fallback for cases where COPY is unavailable.
 
 The copy function is selected once in `Subset.__init__` and stored as `self.__copy_rows`, used by all 8 call sites.
@@ -154,7 +154,7 @@ ctid page-range splitting:
 - Falls back to single-threaded if the table has fewer pages than `workers * 10`
 - Works for any PK type (UUID, text, composite, or no PK at all) — splits by physical storage, not key values
 
-Designed for read-only replicas where parallel reads are safe (AccessShareLock only). Requires PostgreSQL 12+ for TID Range Scan support.
+Designed for read-only replicas where parallel reads are safe (AccessShareLock only). Requires PostgreSQL 14+ for TID Range Scan support.
 
 ### Unified Source Snapshot
 
