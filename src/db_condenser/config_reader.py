@@ -107,7 +107,7 @@ class Config:
     fk_augmentation: list[FkAugmentation] = field(default_factory=list)
     max_rows_per_table: int | Literal["ALL"] | None = None
     use_temp_tables: bool = False
-    use_copy_protocol: bool = False
+    use_copy_protocol: bool = True
     destination_mode: DestinationMode = DestinationMode.RECREATE
     parallel_read_workers: int = 1
     pre_filters: list[PreFilter] = field(default_factory=list)
@@ -204,7 +204,7 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
     post_subset_sql = [sql for sql in raw_config.get("post_subset_sql", [])]
     max_rows_per_table = raw_config.get("max_rows_per_table", None)
     use_temp_tables = bool(raw_config.get("use_temp_tables", False))
-    use_copy_protocol = bool(raw_config.get("use_copy_protocol", False))
+    use_copy_protocol = bool(raw_config.get("use_copy_protocol", True))
     mode_raw = raw_config.get("destination_mode")
     if mode_raw is None and "skip_schema_setup" in raw_config:
         print(

@@ -48,7 +48,7 @@
     ],
     "max_rows_per_table": 100000,
     "use_temp_tables": false,
-    "use_copy_protocol": false,
+    "use_copy_protocol": true,
     "destination_mode": "recreate",
     "parallel_read_workers": 4,
     "excluded_tables": [

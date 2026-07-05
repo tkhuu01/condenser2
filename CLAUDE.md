@@ -132,14 +132,20 @@ Shared helpers in `subset.py`:
 
 Row transfer from source to destination uses `copy_rows` in `psql_database_helper.py`, selected by the `use_copy_protocol` config flag:
 
-- **`use_copy_protocol: false` (default)** — `copy_rows` uses `executemany` with per-row INSERT statements. Handles JSON columns via `psycopg.Json` wrapping and identity columns via `OVERRIDING SYSTEM VALUE`.
-- **`use_copy_protocol: true`** — `copy_rows_copy_protocol` pipes block-level `COPY ... TO STDOUT` straight into `COPY ... FROM STDIN` via a staging table (for `ON CONFLICT` dedup). Significantly faster (5-10x for bulk inserts). JSON values pass through as raw COPY text. Generated columns are excluded via the COPY column list; identity columns are written natively.
+- **`use_copy_protocol: true` (default)** — `copy_rows_copy_protocol` pipes block-level `COPY ... TO STDOUT` straight into `COPY ... FROM STDIN` via a staging table (for `ON CONFLICT` dedup). Significantly faster (5-10x for bulk inserts). JSON values pass through as raw COPY text. Generated columns are excluded via the COPY column list; identity columns are written natively.
+- **`use_copy_protocol: false`** — `copy_rows` uses `executemany` with per-row INSERT statements. Handles JSON columns via `psycopg.Json` wrapping and identity columns via `OVERRIDING SYSTEM VALUE`. Fallback for cases where COPY is unavailable.
 
 The copy function is selected once in `Subset.__init__` and stored as `self.__copy_rows`, used by all 8 call sites.
 
-### Parallel Read (Direct Targets)
+### Parallel Read
 
-When `parallel_read_workers` > 1, direct target tables are read in parallel using ctid page-range splitting:
+When `parallel_read_workers` > 1, reads are parallelized in three places:
+
+- **Direct targets and pass-through tables** are split by ctid page ranges (below)
+- **Upstream/downstream tables that sit alone in their stratum** fan their ID batches out across the source connection pool (`__parallel_id_batches`), instead of processing batches sequentially
+- **Table-level concurrency** (multi-table strata, fallback pass-through copies) uses `parallel_read_workers` threads instead of the default 4
+
+ctid page-range splitting:
 
 - Queries `pg_class.relpages` to get total heap pages (instant, no table scan)
 - Divides pages evenly among N workers; each worker reads its page range via TID Range Scan
@@ -148,7 +154,11 @@ When `parallel_read_workers` > 1, direct target tables are read in parallel usin
 - Falls back to single-threaded if the table has fewer pages than `workers * 10`
 - Works for any PK type (UUID, text, composite, or no PK at all) — splits by physical storage, not key values
 
-Designed for read-only replicas where parallel reads are safe (AccessShareLock only). Source connections use `REPEATABLE READ` isolation for consistent snapshots across workers. Requires PostgreSQL 12+ for TID Range Scan support.
+Designed for read-only replicas where parallel reads are safe (AccessShareLock only). Requires PostgreSQL 12+ for TID Range Scan support.
+
+### Unified Source Snapshot
+
+On PostgreSQL, the main source connection exports a snapshot at startup (`pg_export_snapshot()`) and every other source connection — the parallel-read pool and all per-table worker connections — imports it via `SET TRANSACTION SNAPSHOT`, so the entire run reads the source as of one instant regardless of concurrent writes. The main connection's transaction stays open for the whole run to keep the snapshot importable (source-side work is never committed; temp-table contents are session-visible). Works on hot standbys (PostgreSQL 10+).
 
 Config: `"parallel_read_workers": 4` (default `1` = sequential, current behavior)
 

@@ -82,15 +82,39 @@ class Subset:
         )
         self.__dropped_fks = []
 
+        # export one snapshot from the main source connection; every other
+        # source connection imports it so all reads see the database as of
+        # the same instant. The main connection's transaction must stay open
+        # for the whole run to keep the snapshot importable.
+        self.__snapshot_id = None
+        if self.config.db_type == DbType.POSTGRES:
+            with self.__source_conn.cursor() as cur:
+                cur.execute("SELECT pg_export_snapshot()")
+                self.__snapshot_id = cur.fetchone()[0]
+
+        # table-level concurrency follows parallel_read_workers when set,
+        # otherwise keeps the historical 4 threads
+        self.__table_workers = (
+            self.config.parallel_read_workers
+            if self.config.parallel_read_workers > 1
+            else 4
+        )
+
         self.__source_pool = []
         if (
             self.config.parallel_read_workers > 1
             and self.config.db_type == DbType.POSTGRES
         ):
             for _ in range(self.config.parallel_read_workers):
-                self.__source_pool.append(
-                    source_dbc.get_db_connection(read_repeatable=True)
-                )
+                self.__source_pool.append(self.__get_source_connection())
+
+    def __get_source_connection(self):
+        """Open a source connection pinned to the run's exported snapshot."""
+        conn = self.__source_dbc.get_db_connection(read_repeatable=True)
+        if self.__snapshot_id is not None:
+            with conn.cursor() as cur:
+                cur.execute("SET TRANSACTION SNAPSHOT '{}'".format(self.__snapshot_id))
+        return conn
 
     def __check_source_writable(self):
         if self.config.db_type == DbType.POSTGRES:
@@ -296,13 +320,16 @@ class Subset:
                     relationships,
                     self.__source_conn,
                     self.__destination_conn,
+                    # a lone table in its stratum serializes the run, so let
+                    # it fan its ID batches out across the source pool
+                    allow_chunk=True,
                 )
                 if data_added:
                     added.add(t)
             return added
 
         def upstream_worker(table):
-            source_conn = self.__source_dbc.get_db_connection(read_repeatable=True)
+            source_conn = self.__get_source_connection()
             dest_conn = self.__destination_dbc.get_db_connection()
             try:
                 return self.__subset_upstream(
@@ -312,7 +339,7 @@ class Subset:
                 source_conn.close()
                 dest_conn.close()
 
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=self.__table_workers) as pool:
             futures = {}
             for idx, t in enumerate(stratum):
                 print_progress(t, start_idx + idx + 1, total_count)
@@ -330,12 +357,16 @@ class Subset:
             for t in stratum:
                 print_progress(t, start_idx + 1, total_count)
                 self.subset_downstream(
-                    t, relationships, self.__source_conn, self.__destination_conn
+                    t,
+                    relationships,
+                    self.__source_conn,
+                    self.__destination_conn,
+                    allow_chunk=True,
                 )
             return
 
         def downstream_worker(table):
-            source_conn = self.__source_dbc.get_db_connection(read_repeatable=True)
+            source_conn = self.__get_source_connection()
             dest_conn = self.__destination_dbc.get_db_connection()
             try:
                 self.subset_downstream(table, relationships, source_conn, dest_conn)
@@ -343,7 +374,7 @@ class Subset:
                 source_conn.close()
                 dest_conn.close()
 
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=self.__table_workers) as pool:
             futures = {}
             for idx, t in enumerate(stratum):
                 print_progress(t, start_idx + idx + 1, total_count)
@@ -352,7 +383,7 @@ class Subset:
                 future.result()
 
     def __copy_table_worker(self, table):
-        source_conn = self.__source_dbc.get_db_connection(read_repeatable=True)
+        source_conn = self.__get_source_connection()
         dest_conn = self.__destination_dbc.get_db_connection()
         # no-op on Postgres; preserves prior MySQL behavior where this path
         # used the shared dest connection that had constraints disabled
@@ -371,19 +402,28 @@ class Subset:
             source_conn.close()
             dest_conn.close()
 
-    def __copy_tables_concurrent(self, tables, max_workers=4):
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    def __copy_tables_concurrent(self, tables):
+        if self.__source_pool and self.config.max_rows_per_table is None:
+            # split each table across the pool by ctid page ranges; tables too
+            # small to split fall back to a plain single-connection copy
+            for idx, t in enumerate(tables):
+                print_progress(t, idx + 1, len(tables))
+                if not self.__copy_table_ctid_parallel(t):
+                    self.__copy_table_worker(t)
+            return
+
+        with ThreadPoolExecutor(max_workers=self.__table_workers) as pool:
             futures = {pool.submit(self.__copy_table_worker, t): t for t in tables}
             for idx, future in enumerate(as_completed(futures)):
                 table = futures[future]
                 print_progress(table, idx + 1, len(tables))
                 future.result()  # raises if the worker failed
 
-    def __subset_direct_concurrent(self, relationships, max_workers=4):
+    def __subset_direct_concurrent(self, relationships):
         targets = self.config.initial_targets
 
         def direct_worker(target):
-            source_conn = self.__source_dbc.get_db_connection(read_repeatable=True)
+            source_conn = self.__get_source_connection()
             dest_conn = self.__destination_dbc.get_db_connection()
             # no-op on Postgres; preserves prior MySQL behavior where this path
             # used the shared dest connection that had constraints disabled
@@ -394,7 +434,7 @@ class Subset:
                 source_conn.close()
                 dest_conn.close()
 
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        with ThreadPoolExecutor(max_workers=self.__table_workers) as pool:
             futures = {pool.submit(direct_worker, t): t for t in targets}
             for idx, future in enumerate(as_completed(futures)):
                 target = futures[future]
@@ -415,22 +455,25 @@ class Subset:
             return None
         return (pf.column, values)
 
-    def __subset_direct_parallel(self, target: InitialTarget, relationships):
-        """Subset a direct target using parallel ctid page-range splitting."""
-        t = target.table
-        num_workers = self.config.parallel_read_workers
+    def __copy_table_ctid_parallel(
+        self, table, columns_query="*", extra_conditions=None, params=None
+    ):
+        """Copy a table split across the source pool by ctid page ranges.
 
+        Returns False when not applicable (no pool, or table too small to be
+        worth splitting), leaving the caller to fall back.
+        """
+        if not self.__source_pool:
+            return False
+        num_workers = len(self.__source_pool)
         page_count = self.__db_helper.get_table_page_count(
-            table_name(t), schema_name(t), self.__source_conn
+            table_name(table), schema_name(table), self.__source_conn
         )
         if page_count < num_workers * 10:
-            self.__subset_direct(target, relationships)
-            return
+            return False
 
-        columns_query = columns_to_copy(t, relationships, self.__source_conn)
-        fqt = fully_qualified_table(t)
+        fqt = fully_qualified_table(table)
         pages_per_worker = page_count // num_workers
-        pre_filter_info = self.__get_pre_filter_info(target)
 
         def worker(idx, start_page, end_page):
             source_conn = self.__source_pool[idx]
@@ -441,22 +484,11 @@ class Subset:
                         fqt, start_page, fqt, end_page
                     )
                 )
-                conditions = [ctid_filter]
-                if target.where is not None:
-                    conditions.append("({})".format(target.where))
-                elif target.percent is not None:
-                    conditions.append(
-                        "random() < {}".format(float(target.percent) / 100)
-                    )
-                if pre_filter_info:
-                    conditions.append(
-                        '{}."{}" = ANY(%s)'.format(fqt, pre_filter_info[0])
-                    )
+                conditions = [ctid_filter] + list(extra_conditions or [])
                 q = "SELECT {} FROM {} WHERE {}".format(
                     columns_query, fqt, " AND ".join(conditions)
                 )
-                params = [pre_filter_info[1]] if pre_filter_info else None
-                self.__copy_rows(source_conn, dest_conn, q, t, params)
+                self.__copy_rows(source_conn, dest_conn, q, table, params)
             finally:
                 dest_conn.close()
 
@@ -472,6 +504,61 @@ class Subset:
                 futures.append(pool.submit(worker, idx, start_page, end_page))
             for future in as_completed(futures):
                 future.result()
+        return True
+
+    def __subset_direct_parallel(self, target: InitialTarget, relationships):
+        """Subset a direct target using parallel ctid page-range splitting."""
+        t = target.table
+        columns_query = columns_to_copy(t, relationships, self.__source_conn)
+        fqt = fully_qualified_table(t)
+
+        conditions = []
+        if target.where is not None:
+            conditions.append("({})".format(target.where))
+        elif target.percent is not None:
+            conditions.append("random() < {}".format(float(target.percent) / 100))
+        pre_filter_info = self.__get_pre_filter_info(target)
+        params = None
+        if pre_filter_info:
+            conditions.append('{}."{}" = ANY(%s)'.format(fqt, pre_filter_info[0]))
+            params = [pre_filter_info[1]]
+
+        if not self.__copy_table_ctid_parallel(t, columns_query, conditions, params):
+            self.__subset_direct(target, relationships)
+
+    def __parallel_id_batches(self, dest_cursor, batch_size, copy_batch_fn):
+        """Fan ID batches from a destination cursor out across the source pool.
+
+        copy_batch_fn(valid_rows, source_conn, dest_conn) runs one batch; the
+        cursor is only read from this thread, so batches stay disjoint.
+        """
+        dest_conns = [
+            self.__destination_dbc.get_db_connection() for _ in self.__source_pool
+        ]
+        try:
+            with ThreadPoolExecutor(max_workers=len(self.__source_pool)) as pool:
+                exhausted = False
+                while not exhausted:
+                    futures = []
+                    for src_conn, dst_conn in zip(self.__source_pool, dest_conns):
+                        rows = dest_cursor.fetchmany(batch_size)
+                        if not rows:
+                            exhausted = True
+                            break
+                        valid_rows = [
+                            row for row in rows if all(c is not None for c in row)
+                        ]
+                        if valid_rows:
+                            futures.append(
+                                pool.submit(
+                                    copy_batch_fn, valid_rows, src_conn, dst_conn
+                                )
+                            )
+                    for future in as_completed(futures):
+                        future.result()
+        finally:
+            for conn in dest_conns:
+                conn.close()
 
     def __stream_ids_to_source_temp(
         self, dest_query, columns, source_conn=None, dest_conn=None
@@ -495,7 +582,9 @@ class Subset:
                 valid_rows = [row for row in rows if all(c is not None for c in row)]
                 if valid_rows:
                     src_insert_cur.executemany(insert_q, valid_rows)
-            source_conn.commit()
+            # no source commit: temp table contents are session-visible, and
+            # committing would end the transaction that keeps this
+            # connection's (or the run's exported) snapshot alive
         finally:
             src_insert_cur.close()
             dest_cursor.close()
@@ -619,7 +708,13 @@ class Subset:
         )
 
     def __subset_upstream(
-        self, target, processed_tables, relationships, source_conn, dest_conn
+        self,
+        target,
+        processed_tables,
+        relationships,
+        source_conn,
+        dest_conn,
+        allow_chunk=False,
     ):
         redacted_relationships = redact_relationships(relationships)
         relevant_key_constraints = list(
@@ -661,6 +756,7 @@ class Subset:
                 source_conn,
                 dest_conn,
                 delta_plan,
+                allow_chunk,
             )
 
         return True
@@ -792,6 +888,7 @@ class Subset:
         source_conn,
         dest_conn,
         delta_plan=None,
+        allow_chunk=False,
     ):
         fk_datatypes = {
             col: typ
@@ -825,6 +922,7 @@ class Subset:
                 source_conn,
                 dest_conn,
                 delta_plan,
+                allow_chunk,
             )
             return
 
@@ -866,6 +964,7 @@ class Subset:
         source_conn,
         dest_conn,
         delta_plan=None,
+        allow_chunk=False,
     ):
         group_key = next(iter(groups))
         kc_target, target_cols = group_key
@@ -874,10 +973,29 @@ class Subset:
             kc_target, list(target_cols), dest_conn, delta_plan
         )
 
+        def copy_batch(valid_rows, batch_source_conn, batch_dest_conn):
+            q, params = self.__build_upstream_unnest_query(
+                fqt,
+                [(kc, valid_rows) for kc in groups[group_key]],
+                fk_datatypes,
+                upstream_filters,
+            )
+            self.__copy_rows(
+                batch_source_conn,
+                batch_dest_conn,
+                q,
+                target,
+                params,
+                batch_size=compute_batch_size(len(fk_datatypes)),
+            )
+
         cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
         dest_cursor = dest_conn.cursor(name=cursor_name, withhold=True)
         try:
             dest_cursor.execute(query)
+            if allow_chunk and self.__source_pool:
+                self.__parallel_id_batches(dest_cursor, batch_size, copy_batch)
+                return
             while True:
                 batch = dest_cursor.fetchmany(batch_size)
                 if not batch:
@@ -885,21 +1003,7 @@ class Subset:
                 valid_rows = [row for row in batch if all(c is not None for c in row)]
                 if not valid_rows:
                     continue
-
-                q, params = self.__build_upstream_unnest_query(
-                    fqt,
-                    [(kc, valid_rows) for kc in groups[group_key]],
-                    fk_datatypes,
-                    upstream_filters,
-                )
-                self.__copy_rows(
-                    source_conn,
-                    dest_conn,
-                    q,
-                    target,
-                    params,
-                    batch_size=compute_batch_size(len(fk_datatypes)),
-                )
+                copy_batch(valid_rows, source_conn, dest_conn)
         finally:
             dest_cursor.close()
 
@@ -989,7 +1093,14 @@ class Subset:
                     source_conn, dest_conn, q, target, params, batch_size=copy_batch
                 )
 
-    def subset_downstream(self, table, relationships, source_conn=None, dest_conn=None):
+    def subset_downstream(
+        self,
+        table,
+        relationships,
+        source_conn=None,
+        dest_conn=None,
+        allow_chunk=False,
+    ):
         source_conn = source_conn or self.__source_conn
         dest_conn = dest_conn or self.__destination_conn
         referencing_tables = [
@@ -1039,7 +1150,13 @@ class Subset:
             )
         else:
             self.__subset_downstream_unnest(
-                table, temp_table, pk_columns, columns_query, source_conn, dest_conn
+                table,
+                temp_table,
+                pk_columns,
+                columns_query,
+                source_conn,
+                dest_conn,
+                allow_chunk,
             )
 
     def __subset_downstream_temp_tables(
@@ -1069,7 +1186,14 @@ class Subset:
         )
 
     def __subset_downstream_unnest(
-        self, table, dest_temp_table, pk_columns, columns_query, source_conn, dest_conn
+        self,
+        table,
+        dest_temp_table,
+        pk_columns,
+        columns_query,
+        source_conn,
+        dest_conn,
+        allow_chunk=False,
     ):
         downstream_datatypes = {
             col: typ
@@ -1077,6 +1201,36 @@ class Subset:
                 table_name(table), schema_name(table), source_conn
             )
         }
+
+        def copy_batch(valid_rows, batch_source_conn, batch_dest_conn):
+            unnest_args = ", ".join(
+                "%s::{}[]".format(downstream_datatypes[col]) for col in pk_columns
+            )
+            join_cols = ", ".join("col{}".format(i) for i in range(len(pk_columns)))
+            join_conditions = " AND ".join(
+                "{}.{} = ids.col{}".format(fully_qualified_table(table), quoter(col), i)
+                for i, col in enumerate(pk_columns)
+            )
+            q = (
+                "SELECT {cols} FROM {tbl}"
+                " JOIN unnest({unnest}) AS ids({join_cols})"
+                " ON {conditions}"
+            ).format(
+                cols=columns_query,
+                tbl=fully_qualified_table(table),
+                unnest=unnest_args,
+                join_cols=join_cols,
+                conditions=join_conditions,
+            )
+            params = [[row[i] for row in valid_rows] for i in range(len(pk_columns))]
+            self.__copy_rows(
+                batch_source_conn,
+                batch_dest_conn,
+                q,
+                mysql_db_name_hack(table, batch_dest_conn),
+                params,
+                batch_size=compute_batch_size(len(downstream_datatypes)),
+            )
 
         cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
         cursor = dest_conn.cursor(name=cursor_name, withhold=True)
@@ -1086,6 +1240,9 @@ class Subset:
             )
             cursor.execute(cursor_query)
             batch_size = compute_batch_size(len(pk_columns))
+            if allow_chunk and self.__source_pool:
+                self.__parallel_id_batches(cursor, batch_size, copy_batch)
+                return
             while True:
                 rows = cursor.fetchmany(batch_size)
                 if not rows:
@@ -1093,39 +1250,6 @@ class Subset:
                 valid_rows = [row for row in rows if all(c is not None for c in row)]
                 if not valid_rows:
                     continue
-
-                unnest_args = ", ".join(
-                    "%s::{}[]".format(downstream_datatypes[col]) for col in pk_columns
-                )
-                join_cols = ", ".join("col{}".format(i) for i in range(len(pk_columns)))
-                join_conditions = " AND ".join(
-                    "{}.{} = ids.col{}".format(
-                        fully_qualified_table(table), quoter(col), i
-                    )
-                    for i, col in enumerate(pk_columns)
-                )
-                q = (
-                    "SELECT {cols} FROM {tbl}"
-                    " JOIN unnest({unnest}) AS ids({join_cols})"
-                    " ON {conditions}"
-                ).format(
-                    cols=columns_query,
-                    tbl=fully_qualified_table(table),
-                    unnest=unnest_args,
-                    join_cols=join_cols,
-                    conditions=join_conditions,
-                )
-
-                params = [
-                    [row[i] for row in valid_rows] for i in range(len(pk_columns))
-                ]
-                self.__copy_rows(
-                    source_conn,
-                    dest_conn,
-                    q,
-                    mysql_db_name_hack(table, dest_conn),
-                    params,
-                    batch_size=compute_batch_size(len(downstream_datatypes)),
-                )
+                copy_batch(valid_rows, source_conn, dest_conn)
         finally:
             cursor.close()
