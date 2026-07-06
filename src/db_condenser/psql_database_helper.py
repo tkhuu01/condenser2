@@ -6,7 +6,7 @@ from dataclasses import asdict
 from psycopg import sql
 from psycopg.types.json import Json, set_json_loads
 
-from db_condenser.config_reader import get_config
+from db_condenser.config_reader import DestinationMode, get_config
 from db_condenser.db_connect import PsqlConnection
 from db_condenser.subset_utils import (
     columns_joined,
@@ -301,42 +301,65 @@ def copy_rows_copy_protocol(
         _prefixed_identifier("_copy_staging_", destination_table)
     )
 
+    # On a recreate run the destination was just built from the pre-data
+    # schema, so no unique indexes exist during load and ON CONFLICT cannot
+    # dedup anything: the staging pass would be a pure second write of every
+    # row. COPY straight into the target instead. Top-up runs keep staging
+    # for real dedup and delta capture.
+    direct_copy = get_config().destination_mode == DestinationMode.RECREATE
+
     source_cursor = source.cursor().inner_cursor
     dest_cursor = destination.cursor().inner_cursor
     try:
-        dest_cursor.execute(
-            "CREATE TEMPORARY TABLE IF NOT EXISTS {} (LIKE {} INCLUDING DEFAULTS)".format(
-                temp_table, dest_table
+        if not direct_copy:
+            dest_cursor.execute(
+                "CREATE TEMPORARY TABLE IF NOT EXISTS {} (LIKE {} INCLUDING DEFAULTS)".format(
+                    temp_table, dest_table
+                )
             )
-        )
-        dest_cursor.execute("TRUNCATE {}".format(temp_table))
+            dest_cursor.execute("TRUNCATE {}".format(temp_table))
 
         # Block-level COPY streaming: pipe raw COPY data straight from the source
-        # into the staging table, avoiding a per-row Python loop. Selecting just the
-        # non-generated columns keeps the stream aligned with the staging column
+        # into the destination, avoiding a per-row Python loop. Selecting just the
+        # non-generated columns keeps the stream aligned with the target column
         # list (generated columns are excluded; the cap, joins, etc. live in query).
+        # COPY FROM inserts supplied values into identity columns natively.
         copy_out = "COPY (SELECT {} FROM ({}) AS _src) TO STDOUT".format(
             column_list, query
         )
-        copy_in = "COPY {} ({}) FROM STDIN".format(temp_table, column_list)
+        copy_in = "COPY {} ({}) FROM STDIN".format(
+            dest_table if direct_copy else temp_table, column_list
+        )
+        # psycopg yields one buffer per row; writing each individually caps
+        # throughput on Python loop overhead (~2x), so coalesce into ~1MB
+        # chunks before writing
         with source_cursor.copy(copy_out, params) as src_copy:
             with dest_cursor.copy(copy_in) as dest_copy:
+                buf = bytearray()
                 for data in src_copy:
-                    dest_copy.write(data)
+                    buf += data
+                    if len(buf) >= 1 << 20:
+                        dest_copy.write(bytes(buf))
+                        buf.clear()
+                if buf:
+                    dest_copy.write(bytes(buf))
 
-        insert_query = (
-            "INSERT INTO {} ({}){} SELECT {} FROM {} ON CONFLICT DO NOTHING".format(
-                dest_table,
-                column_list,
-                " OVERRIDING SYSTEM VALUE" if always_generated_id else "",
-                column_list,
-                temp_table,
+        if not direct_copy:
+            insert_query = (
+                "INSERT INTO {} ({}){} SELECT {} FROM {} ON CONFLICT DO NOTHING".format(
+                    dest_table,
+                    column_list,
+                    " OVERRIDING SYSTEM VALUE" if always_generated_id else "",
+                    column_list,
+                    temp_table,
+                )
             )
-        )
-        dest_cursor.execute(_wrap_insert_with_delta(insert_query, destination_table))
-        # release the staging rows' disk immediately; otherwise the last
-        # result set per table lingers until the session closes
-        dest_cursor.execute("TRUNCATE {}".format(temp_table))
+            dest_cursor.execute(
+                _wrap_insert_with_delta(insert_query, destination_table)
+            )
+            # release the staging rows' disk immediately; otherwise the last
+            # result set per table lingers until the session closes
+            dest_cursor.execute("TRUNCATE {}".format(temp_table))
     finally:
         dest_cursor.close()
         source_cursor.close()

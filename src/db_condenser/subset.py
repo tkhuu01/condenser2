@@ -328,6 +328,21 @@ class Subset:
                     added.add(t)
             return added
 
+        # genuinely large tables (~100MB+) get the whole source pool to
+        # themselves, one at a time, chunked internally; everything else
+        # shares the table-level thread pool as before
+        small_tables = list(stratum)
+        big_tables = []
+        if self.__source_pool:
+            threshold = 12_800  # heap pages, ~100MB
+            for t in list(small_tables):
+                pages = self.__db_helper.get_table_page_count(
+                    table_name(t), schema_name(t), self.__source_conn
+                )
+                if pages >= threshold:
+                    small_tables.remove(t)
+                    big_tables.append(t)
+
         def upstream_worker(table):
             source_conn = self.__get_source_connection()
             dest_conn = self.__destination_dbc.get_db_connection()
@@ -341,13 +356,25 @@ class Subset:
 
         with ThreadPoolExecutor(max_workers=self.__table_workers) as pool:
             futures = {}
-            for idx, t in enumerate(stratum):
+            for idx, t in enumerate(small_tables):
                 print_progress(t, start_idx + idx + 1, total_count)
                 futures[pool.submit(upstream_worker, t)] = t
             for future in as_completed(futures):
                 t = futures[future]
                 if future.result():
                     added.add(t)
+
+        for j, t in enumerate(big_tables):
+            print_progress(t, start_idx + len(small_tables) + j + 1, total_count)
+            if self.__subset_upstream(
+                t,
+                processed_tables,
+                relationships,
+                self.__source_conn,
+                self.__destination_conn,
+                allow_chunk=True,
+            ):
+                added.add(t)
         return added
 
     def __process_stratum_downstream(
@@ -526,28 +553,36 @@ class Subset:
         if not self.__copy_table_ctid_parallel(t, columns_query, conditions, params):
             self.__subset_direct(target, relationships)
 
-    def __parallel_id_batches(self, dest_cursor, batch_size, copy_batch_fn):
+    def __parallel_id_batches(
+        self, dest_cursor, batch_size, copy_batch_fn, initial_rows=None
+    ):
         """Fan ID batches from a destination cursor out across the source pool.
 
         copy_batch_fn(valid_rows, source_conn, dest_conn) runs one batch; the
         cursor is only read from this thread, so batches stay disjoint.
+        initial_rows carries a batch the caller already fetched (and filtered).
         """
         dest_conns = [
             self.__destination_dbc.get_db_connection() for _ in self.__source_pool
         ]
+        pending = initial_rows
         try:
             with ThreadPoolExecutor(max_workers=len(self.__source_pool)) as pool:
                 exhausted = False
                 while not exhausted:
                     futures = []
                     for src_conn, dst_conn in zip(self.__source_pool, dest_conns):
-                        rows = dest_cursor.fetchmany(batch_size)
-                        if not rows:
-                            exhausted = True
-                            break
-                        valid_rows = [
-                            row for row in rows if all(c is not None for c in row)
-                        ]
+                        if pending is not None:
+                            valid_rows = pending
+                            pending = None
+                        else:
+                            rows = dest_cursor.fetchmany(batch_size)
+                            if not rows:
+                                exhausted = True
+                                break
+                            valid_rows = [
+                                row for row in rows if all(c is not None for c in row)
+                            ]
                         if valid_rows:
                             futures.append(
                                 pool.submit(
@@ -994,7 +1029,36 @@ class Subset:
         try:
             dest_cursor.execute(query)
             if allow_chunk and self.__source_pool:
-                self.__parallel_id_batches(dest_cursor, batch_size, copy_batch)
+                first = dest_cursor.fetchmany(batch_size)
+                if not first:
+                    return
+                valid_first = [row for row in first if all(c is not None for c in row)]
+                kcs_in_group = groups[group_key]
+                fk_cols = kcs_in_group[0]["fk_columns"]
+                if (
+                    len(first) < batch_size
+                    and len(kcs_in_group) == 1
+                    and len(fk_cols) == 1
+                ):
+                    # the whole ID set fits one batch, so there are no
+                    # batches to fan out: split the child table read by
+                    # ctid ranges instead, with the IDs as a filter
+                    if not valid_first:
+                        return
+                    col = fk_cols[0]
+                    conditions = [
+                        "{}.{} = ANY(%s::{}[])".format(
+                            fqt, quoter(col), fk_datatypes[col]
+                        )
+                    ] + list(upstream_filters)
+                    ids = [row[0] for row in valid_first]
+                    if self.__copy_table_ctid_parallel(target, "*", conditions, [ids]):
+                        return
+                    copy_batch(valid_first, source_conn, dest_conn)
+                    return
+                self.__parallel_id_batches(
+                    dest_cursor, batch_size, copy_batch, initial_rows=valid_first
+                )
                 return
             while True:
                 batch = dest_cursor.fetchmany(batch_size)
