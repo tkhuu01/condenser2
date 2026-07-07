@@ -940,11 +940,15 @@ class Subset:
         fqt = fully_qualified_table(target)
         batch_size = compute_batch_size(len(fk_datatypes))
 
-        # streaming handles one ID stream; incremental multi-constraint tables
-        # need one pass per constraint, so they take the multi-group path
-        streaming_ok = len(groups) == 1 and self.config.max_rows_per_table is None
-        if delta_plan is not None:
-            streaming_ok = streaming_ok and len(relevant_key_constraints) == 1
+        # a single ID stream can only serve a single constraint: binding the
+        # same batch to two constraints (e.g. from/to FKs to one parent) drops
+        # AND-pairs whose IDs span two batches. Multi-constraint tables take
+        # the multi-group path, which joins each batched constraint against
+        # the other constraints' full ID sets.
+        streaming_ok = (
+            len(relevant_key_constraints) == 1
+            and self.config.max_rows_per_table is None
+        )
 
         if streaming_ok:
             self.__upstream_unnest_streamed(

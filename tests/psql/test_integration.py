@@ -814,3 +814,118 @@ def test_skip_schema_setup_alias_maps_to_destination_mode():
     del raw["skip_schema_setup"]
     cfg = config_reader._raw_dict_to_config(raw)
     assert cfg.destination_mode == config_reader.DestinationMode.RECREATE
+
+
+# ============================================================
+# MULTI-FK PAIRS ACROSS ID-BATCH BOUNDARIES (regression)
+# ============================================================
+
+
+@pytest.fixture(scope="module")
+def multi_fk_batch_dbs():
+    """Subset a two-FKs-to-one-parent table with a tiny ID batch size.
+
+    parent has 6 rows, link forms a ring (1-2, 2-3, ... 6-1). All parents are
+    imported, so AND semantics require every link. With batches of 2 parent
+    IDs, a streamed join that binds the same batch to both constraints drops
+    every ring edge whose ends fall in different batches.
+    """
+    import db_condenser.subset as subset_mod
+
+    source_db = SOURCE_DB + "_mfk"
+    dest_db = DEST_DB + "_mfk"
+    admin = _admin_conn()
+    with admin.cursor() as cur:
+        for db in (source_db, dest_db):
+            cur.execute(f"DROP DATABASE IF EXISTS {db}")
+            cur.execute(f"CREATE DATABASE {db}")
+    admin.close()
+
+    src = _admin_conn(source_db)
+    with src.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE parent (id INT PRIMARY KEY);
+            CREATE TABLE link (
+                id INT PRIMARY KEY,
+                from_id INT NOT NULL REFERENCES parent(id),
+                to_id   INT NOT NULL REFERENCES parent(id)
+            );
+            INSERT INTO parent SELECT generate_series(1, 6);
+            INSERT INTO link VALUES
+                (1, 1, 2), (2, 2, 3), (3, 3, 4),
+                (4, 4, 5), (5, 5, 6), (6, 6, 1);
+        """)
+    src.close()
+
+    raw_config = {
+        "db_type": "postgres",
+        "initial_targets": [{"table": "public.parent", "where": "id <= 6"}],
+        "source_db_connection_info": {
+            "user_name": DB_USER,
+            "password": DB_PASSWORD,
+            "host": DB_HOST,
+            "db_name": source_db,
+            "port": DB_PORT,
+        },
+        "destination_db_connection_info": {
+            "user_name": DB_USER,
+            "password": DB_PASSWORD,
+            "host": DB_HOST,
+            "db_name": dest_db,
+            "port": DB_PORT,
+        },
+    }
+    config_reader.reset_config()
+    config_reader.config = config_reader._raw_dict_to_config(raw_config)
+    config = config_reader.get_config()
+
+    real_batch_size = subset_mod.compute_batch_size
+    subset_mod.compute_batch_size = lambda column_count: 2
+    try:
+        source_dbc = DbConnect(config.db_type, config.source_db_connection_info)
+        destination_dbc = DbConnect(
+            config.db_type, config.destination_db_connection_info
+        )
+        database = db_creator(config.db_type, source_dbc, destination_dbc)
+        database.teardown()
+        database.create()
+        db_helper = database_helper.get_specific_helper()
+        all_tables = db_helper.list_all_tables(source_dbc)
+        subsetter = Subset(source_dbc, destination_dbc, all_tables)
+        try:
+            subsetter.prep_temp_dbs()
+            subsetter.run_middle_out()
+        finally:
+            subsetter.unprep_temp_dbs()
+            subsetter.close_connections()
+    finally:
+        subset_mod.compute_batch_size = real_batch_size
+
+    dest = psycopg.connect(
+        dbname=dest_db,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT,
+    )
+    yield dest
+    dest.close()
+
+    admin = _admin_conn()
+    with admin.cursor() as cur:
+        for db in (source_db, dest_db):
+            cur.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid()",
+                (db,),
+            )
+            cur.execute(f"DROP DATABASE IF EXISTS {db}")
+    admin.close()
+
+
+def test_multi_fk_pairs_survive_batch_boundaries(multi_fk_batch_dbs):
+    dest = multi_fk_batch_dbs
+    assert _query_one(dest, "SELECT COUNT(*) FROM parent") == 6
+    # every link's parents are imported, so every link must be included,
+    # regardless of which ID batch each parent landed in
+    assert _query_one(dest, "SELECT COUNT(*) FROM link") == 6
