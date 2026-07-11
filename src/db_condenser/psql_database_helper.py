@@ -596,12 +596,16 @@ def list_all_tables(db_connect):
 
 
 def get_table_page_count(table, schema, conn):
-    """Return the number of heap pages for a table from pg_class."""
+    """Return the number of heap pages for a table from pg_class.
+
+    Config-supplied table names may be unqualified (schema=None); those
+    resolve via search_path, matching how fully_qualified_table builds the
+    data queries.
+    """
+    regclass = '"{}"."{}"'.format(schema, table) if schema else '"{}"'.format(table)
     with conn.cursor() as cur:
         cur.execute(
-            """SELECT relpages FROM pg_class WHERE oid='"{}"."{}"'::regclass""".format(
-                schema, table
-            )
+            "SELECT relpages FROM pg_class WHERE oid='{}'::regclass".format(regclass)
         )
         row = cur.fetchone()
     return row[0] if row else 0
