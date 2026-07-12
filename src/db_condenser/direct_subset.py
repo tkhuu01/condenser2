@@ -1,6 +1,7 @@
 import argparse
 import sys
 import time
+from importlib import resources
 
 from db_condenser import config_reader, database_helper, result_tabulator
 from db_condenser.config_reader import DbConnectInfo, DbType, DestinationMode
@@ -37,7 +38,21 @@ def _parse_args():
         default=None,
         help="Specify a custom JSON config file name",
     )
+    parser.add_argument(
+        "--help-config",
+        action="store_true",
+        help="Print the full configuration reference and exit",
+    )
+    parser.add_argument(
+        "--example-config",
+        action="store_true",
+        help="Print an example config.json with all options and exit",
+    )
     return parser.parse_args()
+
+
+def _print_packaged_file(name: str):
+    print(resources.files("db_condenser").joinpath(name).read_text(), end="")
 
 
 def _confirm_destination(dest_info: DbConnectInfo):
@@ -54,10 +69,24 @@ def _confirm_destination(dest_info: DbConnectInfo):
 def main():
     args = _parse_args()
 
-    if args.config:
-        config_reader.initialize(args.config)
-    else:
-        config_reader.initialize("config.json")
+    if args.help_config:
+        _print_packaged_file("CONFIG.md")
+        return
+    if args.example_config:
+        _print_packaged_file("config.json.example_all")
+        return
+
+    config_file = args.config or "config.json"
+    try:
+        config_reader.initialize(config_file)
+    except FileNotFoundError:
+        print(
+            f"Config file '{config_file}' not found.\n"
+            "Run 'subset --help-config' for the configuration reference, or\n"
+            "'subset --example-config > config.json' to start from a template.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     config = config_reader.get_config()
 

@@ -70,7 +70,7 @@ and clarifying questions come before implementation rather than after mistakes.
 - **Language:** Python 3.10+
 - **Package manager:** uv (Astral)
 - **Entry point:** `src/db_condenser/direct_subset.py` → CLI command `subset`
-- **Config:** `config.json` (see `config.json.example_all` for all options)
+- **Config:** `config.json` (see `src/db_condenser/config.json.example_all` for all options)
 
 ## Commands
 
