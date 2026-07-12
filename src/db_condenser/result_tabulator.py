@@ -17,7 +17,7 @@ def tabulate(source_dbc, destination_dbc, tables, total_elapsed=None):
                 if isinstance(dest_conn, MySqlConnection)
                 else schema_name(table)
             )
-            n = db_helper.get_table_count(
+            n = db_helper.get_table_count_estimate(
                 table_name(table), dest_schema_name, dest_conn
             )
             row_counts.append((table, max(int(o), 0), max(int(n), 0)))

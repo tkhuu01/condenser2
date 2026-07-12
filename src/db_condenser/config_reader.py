@@ -42,6 +42,13 @@ class DbType(str, Enum):
     MYSQL = "mysql"
 
 
+class DestinationMode(str, Enum):
+    # tear down the destination schema and rebuild from scratch
+    RECREATE = "recreate"
+    # destination already exists: keep schema and data, add only new rows
+    TOPUP = "topup"
+
+
 @dataclass
 class DbConnectInfo:
     user_name: str
@@ -100,8 +107,8 @@ class Config:
     fk_augmentation: list[FkAugmentation] = field(default_factory=list)
     max_rows_per_table: int | Literal["ALL"] | None = None
     use_temp_tables: bool = False
-    use_copy_protocol: bool = False
-    skip_schema_setup: bool = False
+    use_copy_protocol: bool = True
+    destination_mode: DestinationMode = DestinationMode.RECREATE
     parallel_read_workers: int = 1
     pre_filters: list[PreFilter] = field(default_factory=list)
     pre_constraint_sql: list[str] = field(default_factory=list)
@@ -197,8 +204,16 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
     post_subset_sql = [sql for sql in raw_config.get("post_subset_sql", [])]
     max_rows_per_table = raw_config.get("max_rows_per_table", None)
     use_temp_tables = bool(raw_config.get("use_temp_tables", False))
-    use_copy_protocol = bool(raw_config.get("use_copy_protocol", False))
-    skip_schema_setup = bool(raw_config.get("skip_schema_setup", False))
+    use_copy_protocol = bool(raw_config.get("use_copy_protocol", True))
+    mode_raw = raw_config.get("destination_mode")
+    if mode_raw is None and "skip_schema_setup" in raw_config:
+        print(
+            "WARNING: 'skip_schema_setup' is deprecated; use"
+            ' "destination_mode": "topup" (true) or "recreate" (false) instead.',
+            file=sys.stderr,
+        )
+        mode_raw = "topup" if raw_config["skip_schema_setup"] else "recreate"
+    destination_mode = DestinationMode((mode_raw or "recreate").lower())
     parallel_read_workers = int(raw_config.get("parallel_read_workers", 1))
     pre_filters = [PreFilter(**pf) for pf in raw_config.get("pre_filters", [])]
     return Config(
@@ -217,7 +232,7 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
         max_rows_per_table=max_rows_per_table,
         use_temp_tables=use_temp_tables,
         use_copy_protocol=use_copy_protocol,
-        skip_schema_setup=skip_schema_setup,
+        destination_mode=destination_mode,
         parallel_read_workers=parallel_read_workers,
         pre_filters=pre_filters,
         pre_constraint_sql=pre_constraint_sql,

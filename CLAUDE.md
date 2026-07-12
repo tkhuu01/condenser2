@@ -132,14 +132,20 @@ Shared helpers in `subset.py`:
 
 Row transfer from source to destination uses `copy_rows` in `psql_database_helper.py`, selected by the `use_copy_protocol` config flag:
 
-- **`use_copy_protocol: false` (default)** — `copy_rows` uses `executemany` with per-row INSERT statements. Handles JSON columns via `psycopg.Json` wrapping and identity columns via `OVERRIDING SYSTEM VALUE`.
-- **`use_copy_protocol: true`** — `copy_rows_copy_protocol` uses PostgreSQL's `COPY ... FROM STDIN` protocol with `write_row`. Significantly faster (5-10x for bulk inserts). JSON values pass through as text strings (no wrapping needed thanks to `set_json_loads(lambda s: s)`). COPY writes to identity columns natively (no override clause needed). Generated columns are excluded via the `COPY table(col_list)` column list.
+- **`use_copy_protocol: true` (default)** — `copy_rows_copy_protocol` pipes block-level `COPY ... TO STDOUT` straight into `COPY ... FROM STDIN` via a staging table (for `ON CONFLICT` dedup). Significantly faster (5-10x for bulk inserts). JSON values pass through as raw COPY text. Generated columns are excluded via the COPY column list; identity values are preserved via `OVERRIDING SYSTEM VALUE` on the staging insert.
+- **`use_copy_protocol: false`** — `copy_rows` uses `executemany` with per-row INSERT statements. Handles JSON columns via `psycopg.Json` wrapping and identity columns via `OVERRIDING SYSTEM VALUE`. Fallback for cases where COPY is unavailable.
 
 The copy function is selected once in `Subset.__init__` and stored as `self.__copy_rows`, used by all 8 call sites.
 
-### Parallel Read (Direct Targets)
+### Parallel Read
 
-When `parallel_read_workers` > 1, direct target tables are read in parallel using ctid page-range splitting:
+When `parallel_read_workers` > 1, reads are parallelized in three places:
+
+- **Direct targets and pass-through tables** are split by ctid page ranges (below)
+- **Upstream/downstream tables that sit alone in their stratum** fan their ID batches out across the source connection pool (`__parallel_id_batches`), instead of processing batches sequentially
+- **Table-level concurrency** (multi-table strata, fallback pass-through copies) uses `parallel_read_workers` threads instead of the default 4
+
+ctid page-range splitting:
 
 - Queries `pg_class.relpages` to get total heap pages (instant, no table scan)
 - Divides pages evenly among N workers; each worker reads its page range via TID Range Scan
@@ -148,7 +154,11 @@ When `parallel_read_workers` > 1, direct target tables are read in parallel usin
 - Falls back to single-threaded if the table has fewer pages than `workers * 10`
 - Works for any PK type (UUID, text, composite, or no PK at all) — splits by physical storage, not key values
 
-Designed for read-only replicas where parallel reads are safe (AccessShareLock only). Source connections use `REPEATABLE READ` isolation for consistent snapshots across workers. Requires PostgreSQL 12+ for TID Range Scan support.
+Designed for read-only replicas where parallel reads are safe (AccessShareLock only). Requires PostgreSQL 14+ for TID Range Scan support.
+
+### Unified Source Snapshot
+
+On PostgreSQL, the main source connection exports a snapshot at startup (`pg_export_snapshot()`) and every other source connection — the parallel-read pool and all per-table worker connections — imports it via `SET TRANSACTION SNAPSHOT`, so the entire run reads the source as of one instant regardless of concurrent writes. The main connection's transaction stays open for the whole run to keep the snapshot importable (source-side work is never committed; temp-table contents are session-visible). Works on hot standbys (PostgreSQL 10+).
 
 Config: `"parallel_read_workers": 4` (default `1` = sequential, current behavior)
 
@@ -161,6 +171,16 @@ Named queries executed once at subset start, cached in memory, and applied as `A
 - Multiple targets can share the same pre-filter — query runs once regardless
 - Works on read-only replicas (no writes to source)
 - Practical limit: ~2M cached values (~140MB memory); beyond that, consider a materialized view
+
+### Incremental (Top-Up) Re-Runs
+
+When `destination_mode: "topup"` (PostgreSQL only; default is `"recreate"`, and the deprecated `skip_schema_setup: true` maps to `"topup"`), the destination is treated as an existing subset and the run tops it up instead of re-transferring everything:
+
+- Destination FK constraints are dropped for the duration of the run (middle-out load order inserts referencing rows before referenced ones) and restored at the end; definitions are backed up to `SQL/incremental_fk_backup.sql`. PKs and unique indexes stay so `ON CONFLICT DO NOTHING` dedups re-read rows.
+- Every insert records its new PKs into a per-table delta table in the `_condenser` schema on the destination (unlogged, dropped at run end) via `WITH ins AS (INSERT ... RETURNING <pk>) INSERT INTO <delta> ...`.
+- Upstream subsetting joins children against delta parent IDs instead of full destination tables, so a re-run costs O(new rows). Multi-FK tables run one pass per constraint: that constraint joins its delta, the others join the full ID sets (preserves AND semantics). Tables whose parent deltas are all empty are skipped entirely.
+- Top-up semantics: new initial-target matches and their descendants arrive; already-imported entities stay frozen (new children of old parents are not picked up).
+- Tables without a primary key fall back to full (non-incremental) behavior with a warning and may accumulate duplicates on re-runs.
 
 ### Database Support
 - **PostgreSQL:** Full support including sequence reset, named cursors, JSON casting
@@ -188,5 +208,6 @@ Named queries executed once at subset start, cached in memory, and applied as `A
 - Requires PostgreSQL 18 service (see docker-compose.yml or CI config)
 - Test DB seeded from `tests/psql/seed.sql`, config in `tests/psql/test_config.json`
 - Fixture `subsetter_dbs` is parameterized: every test runs three times (`[unnest]`, `[temp_tables]`, and `[copy_protocol]`)
+- Fixtures `rerun_dbs` and `incremental_dbs` cover re-runs into an existing destination (idempotency and top-up semantics), also across all three variants
 - Each variant gets its own databases (e.g. `condenser_test_source`, `condenser_test_source_temp`, `condenser_test_source_copy`)
 - CI runs on GitHub Actions: ruff lint + pytest with Postgres 18 service container

@@ -5,10 +5,10 @@ Tonic's Condenser.
 
 Some changes from the original Condenser:
 
-* Concurrent thread pool usage to speed up subsetting
+* Concurrent thread pool usage to speed up subsetting throughout the whole process
 * Optional temp-table strategy for memory-efficient ID batching
-* Optional Postgres COPY protocol for faster transfer
-* Incremental subsetting (skip schema setup and keep existing data)
+* Postgres COPY protocol for faster transfer set on by default
+* Incremental subsetting (skip schema setup and extend the subset)
 * Automatic sequence reset after subsetting
 * Built on psycopg3 and managed with astral's uv
 
@@ -31,7 +31,7 @@ You can find more about the original Condenser details
 
 ## Installation
 
-Six steps to set up from source, assuming Python 3.10+:
+Six steps to set up from source. Python 3.10+ and Postgres 14+:
 
 1. Install [astral-uv](https://docs.astral.sh/uv/getting-started/installation/)
 
