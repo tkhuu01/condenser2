@@ -506,11 +506,11 @@ class Subset:
             source_conn = self.__source_pool[idx]
             dest_conn = self.__destination_dbc.get_db_connection()
             try:
-                ctid_filter = (
-                    "{}.ctid >= '({},0)'::tid AND {}.ctid < '({},0)'::tid".format(
-                        fqt, start_page, fqt, end_page
-                    )
-                )
+                # relpages can undercount (only refreshed by VACUUM/ANALYZE),
+                # so the last worker scans to the actual heap end.
+                ctid_filter = "{}.ctid >= '({},0)'::tid".format(fqt, start_page)
+                if end_page is not None:
+                    ctid_filter += " AND {}.ctid < '({},0)'::tid".format(fqt, end_page)
                 conditions = [ctid_filter] + list(extra_conditions or [])
                 q = "SELECT {} FROM {} WHERE {}".format(
                     columns_query, fqt, " AND ".join(conditions)
@@ -524,9 +524,7 @@ class Subset:
             for idx in range(num_workers):
                 start_page = idx * pages_per_worker
                 end_page = (
-                    page_count
-                    if idx == num_workers - 1
-                    else (idx + 1) * pages_per_worker
+                    None if idx == num_workers - 1 else (idx + 1) * pages_per_worker
                 )
                 futures.append(pool.submit(worker, idx, start_page, end_page))
             for future in as_completed(futures):
