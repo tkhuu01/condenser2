@@ -172,14 +172,17 @@ Named queries executed once at subset start, cached in memory, and applied as `A
 - Works on read-only replicas (no writes to source)
 - Practical limit: ~2M cached values (~140MB memory); beyond that, consider a materialized view
 
-### Incremental (Top-Up) Re-Runs
+### Incremental Re-Runs (Top-Up and Grow)
 
-When `destination_mode: "topup"` (PostgreSQL only; default is `"recreate"`, and the deprecated `skip_schema_setup: true` maps to `"topup"`), the destination is treated as an existing subset and the run tops it up instead of re-transferring everything:
+When `destination_mode` is `"topup"` or `"grow"` (PostgreSQL only; default is `"recreate"`, and the deprecated `skip_schema_setup: true` maps to `"topup"`), the destination is treated as an existing subset and the run adds to it instead of re-transferring everything:
 
-- Destination FK constraints are dropped for the duration of the run (middle-out load order inserts referencing rows before referenced ones) and restored at the end; definitions are backed up to `SQL/incremental_fk_backup.sql`. PKs and unique indexes stay so `ON CONFLICT DO NOTHING` dedups re-read rows.
-- Every insert records its new PKs into a per-table delta table in the `_condenser` schema on the destination (unlogged, dropped at run end) via `WITH ins AS (INSERT ... RETURNING <pk>) INSERT INTO <delta> ...`.
-- Upstream subsetting joins children against delta parent IDs instead of full destination tables, so a re-run costs O(new rows). Multi-FK tables run one pass per constraint: that constraint joins its delta, the others join the full ID sets (preserves AND semantics). Tables whose parent deltas are all empty are skipped entirely.
-- Top-up semantics: new initial-target matches and their descendants arrive; already-imported entities stay frozen (new children of old parents are not picked up).
+- Destination FK constraints are dropped for the duration of the run (middle-out load order inserts referencing rows before referenced ones) and restored at the end; definitions are backed up to `SQL/incremental_fk_backup.sql`. PKs and unique indexes stay for conflict handling.
+- Incremental inserts upsert: `ON CONFLICT (<pk>) DO UPDATE`, guarded by `IS DISTINCT FROM` so unchanged rows write nothing. Re-read rows therefore refresh in place (history `enddate`s, soft-delete flags). The COPY-protocol staging insert dedups on the PK (`DISTINCT ON`) first, since one upsert statement cannot affect a row twice.
+- Within each incremental batch, refreshes of existing rows are applied before new-row inserts (staging path: `ORDER BY EXISTS(...) DESC`; executemany path: a dest PK lookup partitions the batch). This lets deactivate-and-replace patterns load under a live partial unique index (e.g. one active history row per entity): the stale row is switched off before its replacement arrives. The guarantee covers rows that share an ID batch — which deactivate-and-replace pairs do, since they share the parent entity. It cannot cover a stale row whose source counterpart was hard-deleted (nothing refreshes it); that still errors loudly and needs a recreate. In incremental runs, ctid-parallel splitting of tables with a secondary unique index or exclusion constraint (detected at `prep_incremental`, see `has_secondary_unique`) runs in two phases: every worker stages its page range and applies refreshes, all workers meet at a barrier, then inserts run (`stage_rows`/`apply_staged`) — same guarantee as a sequential copy at full worker count. PK-only tables keep the single-pass split. The two-phase path needs `use_copy_protocol` and a PK-tracked delta; otherwise those tables fall back to a sequential copy.
+- Every insert records PKs into a per-table delta table in the `_condenser` schema (unlogged, dropped at run end) via `WITH ins AS (INSERT ... RETURNING <pk>, (xmax = 0) AS _inserted) INSERT INTO <delta> ...`. The `_inserted` flag distinguishes genuine inserts from upsert refreshes.
+- Upstream subsetting in `"topup"` joins children against delta parent IDs (`_inserted` only, so refreshed old parents don't unfreeze their children) instead of full destination tables — a re-run costs O(new rows). Multi-FK tables run one pass per constraint: that constraint joins its delta, the others join the full ID sets (preserves AND semantics). Tables whose parent deltas have no inserted rows are skipped entirely. In `"grow"`, upstream reads full destination parent ID sets instead, so new children of already-imported parents are picked up — a run costs O(existing subset).
+- Downstream subsetting (both modes) joins each child scan against the child's delta — including upsert-refreshed rows, since an update can repoint an FK column at a parent not yet present — so the missing-parent scan also costs O(new rows). Children with empty deltas are skipped; a parent whose children all have empty deltas is skipped entirely.
+- Top-up semantics: new initial-target matches and their descendants arrive; already-imported entities stay frozen (new children of old parents are not picked up). Grow semantics: frozen entities are unfrozen — new children/descendants of resident rows arrive too. Hard deletes never propagate in either mode.
 - Tables without a primary key fall back to full (non-incremental) behavior with a warning and may accumulate duplicates on re-runs.
 
 ### Database Support
@@ -208,6 +211,6 @@ When `destination_mode: "topup"` (PostgreSQL only; default is `"recreate"`, and 
 - Requires PostgreSQL 18 service (see docker-compose.yml or CI config)
 - Test DB seeded from `tests/psql/seed.sql`, config in `tests/psql/test_config.json`
 - Fixture `subsetter_dbs` is parameterized: every test runs three times (`[unnest]`, `[temp_tables]`, and `[copy_protocol]`)
-- Fixtures `rerun_dbs` and `incremental_dbs` cover re-runs into an existing destination (idempotency and top-up semantics), also across all three variants
+- Fixtures `rerun_dbs`, `incremental_dbs`, and `grow_dbs` cover re-runs into an existing destination (idempotency, top-up, and grow semantics), also across all three variants; `incremental_composite_dbs` covers the composite-PK downstream delta join
 - Each variant gets its own databases (e.g. `condenser_test_source`, `condenser_test_source_temp`, `condenser_test_source_copy`)
 - CI runs on GitHub Actions: ruff lint + pytest with Postgres 18 service container

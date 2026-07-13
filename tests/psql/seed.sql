@@ -68,6 +68,15 @@ CREATE TABLE sales.order_transfers (
     reason VARCHAR NOT NULL
 );
 
+-- History table with an active-flag pattern: at most one active row per
+-- customer, enforced by a partial unique index
+CREATE TABLE sales.customer_status_history (
+    id SERIAL PRIMARY KEY,
+    customer_id INT NOT NULL REFERENCES sales.customers(id),
+    status VARCHAR NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT true
+);
+
 -- ============================================================
 -- PUBLIC SCHEMA (passthrough + disconnected)
 -- ============================================================
@@ -93,6 +102,7 @@ CREATE INDEX idx_orders_ordered_at ON sales.orders (ordered_at);
 CREATE INDEX idx_order_lines_order_id ON sales.order_lines (order_id);
 CREATE INDEX idx_order_lines_product_id ON sales.order_lines (product_id);
 CREATE UNIQUE INDEX idx_order_transfers_pair ON sales.order_transfers (from_order_id, to_order_id);
+CREATE UNIQUE INDEX idx_status_history_active ON sales.customer_status_history (customer_id) WHERE active;
 ALTER TABLE sales.order_lines ADD CONSTRAINT chk_quantity_positive CHECK (quantity > 0);
 ALTER TABLE sales.order_lines ADD CONSTRAINT chk_unit_price_positive CHECK (unit_price >= 0);
 ALTER TABLE inventory.products ADD CONSTRAINT chk_price_positive CHECK (price >= 0);
@@ -221,6 +231,15 @@ INSERT INTO sales.order_transfers (from_order_id, to_order_id, reason) VALUES
 INSERT INTO sales.order_transfers (from_order_id, to_order_id, reason) VALUES
     (1, 2, 'old transfer'),
     (3, 5, 'old transfer 2');
+
+-- Status history (11): one active row per customer, customer 6 has a
+-- retired prior row
+INSERT INTO sales.customer_status_history (customer_id, status, active) VALUES
+    (1, 'bronze', true), (2, 'bronze', true), (3, 'bronze', true),
+    (4, 'bronze', true), (5, 'bronze', true),
+    (6, 'bronze', false), (6, 'silver', true),
+    (7, 'bronze', true), (8, 'bronze', true),
+    (9, 'bronze', true), (10, 'bronze', true);
 
 -- Regions (5, passthrough)
 INSERT INTO public.regions (code, name, tax_rate) VALUES

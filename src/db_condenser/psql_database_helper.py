@@ -34,12 +34,20 @@ def _conn_cache_key(conn):
     return (info.host, info.port, info.dbname)
 
 
-# Incremental (top-up) state: when destination_mode is "topup", each destination
-# table with a primary key gets a delta table in the _condenser schema that
-# records the PKs inserted during this run. Upstream subsetting joins against
-# these deltas instead of full tables, so re-runs cost O(new rows).
+# Incremental state: when destination_mode is "topup" or "grow", each
+# destination table with a primary key gets a delta table in the _condenser
+# schema that records the PKs inserted during this run. Upstream subsetting
+# (topup only) and downstream subsetting join against these deltas instead of
+# full tables, so re-runs cost O(new rows). Incremental inserts also upsert on
+# the PK so re-read rows refresh in place.
 DELTA_SCHEMA = "_condenser"
 _incremental_deltas: dict = {}
+# destination tables carrying a secondary unique index (or exclusion
+# constraint): their incremental copies need refreshes to land before
+# new-row inserts, so ctid-parallel splits run in two phases (stage_rows /
+# apply_staged with a barrier) instead of a single pass — page-range
+# workers can't order across connections. Populated by prep_incremental.
+_secondary_unique_tables: set = set()
 
 
 def _prefixed_identifier(prefix, qualified_table):
@@ -73,9 +81,26 @@ def get_tables_primary_keys(tables, conn):
 
 def prep_incremental(conn, tables):
     _incremental_deltas.clear()
+    _secondary_unique_tables.clear()
     with conn.cursor() as cur:
         cur.execute('DROP SCHEMA IF EXISTS "{}" CASCADE'.format(DELTA_SCHEMA))
         cur.execute('CREATE SCHEMA "{}"'.format(DELTA_SCHEMA))
+        cur.execute(
+            """
+            SELECT ns.nspname || '.' || cl.relname
+              FROM pg_index i
+              JOIN pg_class cl ON cl.oid = i.indrelid
+              JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+             WHERE i.indisunique AND NOT i.indisprimary
+            UNION
+            SELECT ns.nspname || '.' || cl.relname
+              FROM pg_constraint con
+              JOIN pg_class cl ON cl.oid = con.conrelid
+              JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+             WHERE con.contype = 'x'
+            """
+        )
+        _secondary_unique_tables.update(row[0] for row in cur.fetchall())
     pk_map = get_tables_primary_keys(tables, conn)
     no_pk = []
     for t in tables:
@@ -85,8 +110,14 @@ def prep_incremental(conn, tables):
             continue
         name = _prefixed_identifier("new_ids_", t)
         qualified = '"{}"."{}"'.format(DELTA_SCHEMA, name)
-        q = "CREATE UNLOGGED TABLE {} AS SELECT {} FROM {} WITH NO DATA".format(
-            qualified, columns_joined(pk), fully_qualified_table(t)
+        # _inserted distinguishes rows inserted this run from rows refreshed
+        # by an upsert: upstream (frozen) semantics join only inserted rows,
+        # downstream scans both since an update can repoint an FK column
+        q = (
+            "CREATE UNLOGGED TABLE {} AS SELECT {}, false AS _inserted"
+            " FROM {} WITH NO DATA".format(
+                qualified, columns_joined(pk), fully_qualified_table(t)
+            )
         )
         with conn.cursor() as cur:
             cur.execute(q)
@@ -102,9 +133,16 @@ def prep_incremental(conn, tables):
 
 def unprep_incremental(conn):
     _incremental_deltas.clear()
+    _secondary_unique_tables.clear()
     with conn.cursor() as cur:
         cur.execute('DROP SCHEMA IF EXISTS "{}" CASCADE'.format(DELTA_SCHEMA))
     conn.commit()
+
+
+def has_secondary_unique(table):
+    """True when the destination table has a unique index beyond its PK
+    (or an exclusion constraint), so incremental copy order matters."""
+    return table in _secondary_unique_tables
 
 
 def drop_fk_constraints(conn):
@@ -171,8 +209,41 @@ def _wrap_insert_with_delta(insert_query, destination_table):
     if not delta:
         return insert_query
     qualified, pk = delta
-    return "WITH ins AS ({} RETURNING {}) INSERT INTO {} SELECT * FROM ins".format(
-        insert_query, columns_joined(pk), qualified
+    # upserts RETURN updated rows too; xmax = 0 identifies genuine inserts
+    # (updates whose values were unchanged are skipped by the upsert guard
+    # and don't appear at all)
+    return (
+        "WITH ins AS ({} RETURNING {}, (xmax = 0) AS _inserted)"
+        " INSERT INTO {} SELECT {}, _inserted FROM ins".format(
+            insert_query, columns_joined(pk), qualified, columns_joined(pk)
+        )
+    )
+
+
+def _conflict_clause(destination_table, insert_columns):
+    """ON CONFLICT clause for destination inserts. Incremental runs upsert on
+    the PK so re-read rows refresh in place; the IS DISTINCT FROM guard skips
+    rows whose values are unchanged. Recreate runs (no deltas registered) and
+    untracked (no-PK) tables keep DO NOTHING.
+
+    Returns (clause, pk_columns); pk_columns is None unless upserting.
+    Upsert clauses reference the insert target via the alias _dest.
+    """
+    delta = _incremental_deltas.get(destination_table)
+    if not delta:
+        return " ON CONFLICT DO NOTHING", None
+    _, pk = delta
+    non_pk = [c for c in insert_columns if c not in pk]
+    if not non_pk:
+        return " ON CONFLICT DO NOTHING", None
+    sets = ", ".join('"{0}" = EXCLUDED."{0}"'.format(c) for c in non_pk)
+    dest_row = ", ".join('_dest."{}"'.format(c) for c in non_pk)
+    excl_row = ", ".join('EXCLUDED."{}"'.format(c) for c in non_pk)
+    return (
+        " ON CONFLICT ({}) DO UPDATE SET {} WHERE ({}) IS DISTINCT FROM ({})".format(
+            columns_joined(pk), sets, dest_row, excl_row
+        ),
+        pk,
     )
 
 
@@ -246,14 +317,50 @@ def copy_rows(
     try:
         cursor.execute(query, params)
 
-        insert_query = "INSERT INTO {} {} VALUES {} ON CONFLICT DO NOTHING".format(
-            fully_qualified_table(destination_table), columns, template
+        conflict_clause, upsert_pk = _conflict_clause(
+            destination_table, [dt[0] for dt in non_generated_columns]
         )
-        if always_generated_id:
-            insert_query = "INSERT INTO {} {} OVERRIDING SYSTEM VALUE VALUES {} ON CONFLICT DO NOTHING".format(
-                fully_qualified_table(destination_table), columns, template
-            )
+        insert_query = "INSERT INTO {} AS _dest {}{} VALUES {}{}".format(
+            fully_qualified_table(destination_table),
+            columns,
+            " OVERRIDING SYSTEM VALUE" if always_generated_id else "",
+            template,
+            conflict_clause,
+        )
         insert_query = _wrap_insert_with_delta(insert_query, destination_table)
+
+        pk_positions = None
+        if upsert_pk is not None:
+            col_pos = {dt[0]: i for i, dt in enumerate(non_generated_columns)}
+            pk_positions = [col_pos[c] for c in upsert_pk]
+
+        def _order_refreshes_first(batch):
+            # refreshes of existing rows must execute before new-row inserts
+            # so a new row never trips a secondary unique index (e.g. one
+            # active history row per entity) against a stale row it displaces
+            keys = [tuple(row[i] for i in pk_positions) for row in batch]
+            if len(pk_positions) == 1:
+                q = 'SELECT "{0}" FROM {1} WHERE "{0}" = ANY(%s)'.format(
+                    upsert_pk[0], fully_qualified_table(destination_table)
+                )
+                qparams = ([k[0] for k in keys],)
+            else:
+                placeholders = ",".join(
+                    ["({})".format(",".join(["%s"] * len(pk_positions)))] * len(keys)
+                )
+                q = "SELECT {} FROM {} WHERE ({}) IN ({})".format(
+                    columns_joined(upsert_pk),
+                    fully_qualified_table(destination_table),
+                    columns_joined(upsert_pk),
+                    placeholders,
+                )
+                qparams = [v for k in keys for v in k]
+            destination_cursor.execute(q, qparams)
+            existing = {tuple(r) for r in destination_cursor.fetchall()}
+            return sorted(
+                batch,
+                key=lambda row: tuple(row[i] for i in pk_positions) not in existing,
+            )
 
         while True:
             rows = cursor.fetchmany(batch_size)
@@ -274,6 +381,9 @@ def copy_rows(
             else:
                 updated_rows = (_adapt_row(row) for row in rows)
 
+            if pk_positions is not None:
+                updated_rows = _order_refreshes_first(list(updated_rows))
+
             destination_cursor.executemany(insert_query, updated_rows)
 
     finally:
@@ -282,16 +392,12 @@ def copy_rows(
         destination.commit()
 
 
-def copy_rows_copy_protocol(
-    source, destination, query, destination_table, params=None, batch_size=None
-):
-    # batch_size is accepted for interface parity with copy_rows (both are used
-    # as self.__copy_rows) but is unused here: the COPY stream self-chunks.
+def _copy_metadata(destination_table, destination):
+    """Shared column/naming metadata for the COPY-protocol paths."""
     datatypes = get_table_datatypes(
         table_name(destination_table), schema_name(destination_table), destination
     )
-
-    non_generated_columns = [dt[0] for _, dt in enumerate(datatypes) if dt[2] != "s"]
+    non_generated_columns = [dt[0] for dt in datatypes if dt[2] != "s"]
     column_list = ", ".join('"' + col + '"' for col in non_generated_columns)
     always_generated_id = any(dt[3] == "a" for dt in datatypes)
     dest_table = fully_qualified_table(destination_table)
@@ -300,12 +406,129 @@ def copy_rows_copy_protocol(
     temp_table = '"{}"'.format(
         _prefixed_identifier("_copy_staging_", destination_table)
     )
+    return (
+        non_generated_columns,
+        column_list,
+        always_generated_id,
+        dest_table,
+        temp_table,
+    )
+
+
+def _pipe_copy(source_cursor, dest_cursor, query, params, column_list, copy_target):
+    # Block-level COPY streaming: pipe raw COPY data straight from the source
+    # into the destination, avoiding a per-row Python loop. Selecting just the
+    # non-generated columns keeps the stream aligned with the target column
+    # list (generated columns are excluded; the cap, joins, etc. live in query).
+    # COPY FROM inserts supplied values into identity columns natively.
+    copy_out = "COPY (SELECT {} FROM ({}) AS _src) TO STDOUT".format(column_list, query)
+    copy_in = "COPY {} ({}) FROM STDIN".format(copy_target, column_list)
+    # psycopg yields one buffer per row; writing each individually caps
+    # throughput on Python loop overhead (~2x), so coalesce into ~1MB
+    # chunks before writing
+    with source_cursor.copy(copy_out, params) as src_copy:
+        with dest_cursor.copy(copy_in) as dest_copy:
+            buf = bytearray()
+            for data in src_copy:
+                buf += data
+                if len(buf) >= 1 << 20:
+                    dest_copy.write(bytes(buf))
+                    buf.clear()
+            if buf:
+                dest_copy.write(bytes(buf))
+
+
+def stage_rows(source, destination, query, destination_table, params=None):
+    """Two-phase parallel copy, step 1: stream a worker's rows into its
+    session-local staging table without applying them. The caller applies
+    them later with apply_staged (refresh phase, barrier, insert phase)."""
+    _, column_list, _, dest_table, temp_table = _copy_metadata(
+        destination_table, destination
+    )
+    source_cursor = source.cursor().inner_cursor
+    dest_cursor = destination.cursor().inner_cursor
+    try:
+        dest_cursor.execute(
+            "CREATE TEMPORARY TABLE IF NOT EXISTS {} (LIKE {} INCLUDING DEFAULTS)".format(
+                temp_table, dest_table
+            )
+        )
+        dest_cursor.execute("TRUNCATE {}".format(temp_table))
+        _pipe_copy(source_cursor, dest_cursor, query, params, column_list, temp_table)
+    finally:
+        dest_cursor.close()
+        source_cursor.close()
+        destination.commit()
+
+
+def apply_staged(destination, destination_table, phase):
+    """Two-phase parallel copy, step 2: apply this session's staged rows.
+
+    phase='refresh' upserts only rows whose PKs already exist (any order is
+    safe: each refresh moves its own row toward the source's valid state);
+    phase='insert' adds the remaining rows and clears the staging table.
+    Callers must run every worker's refresh phase to completion (and commit,
+    which this function does) before any insert phase starts — that barrier
+    is what lets new rows land under a live secondary unique index.
+    """
+    (
+        non_generated_columns,
+        column_list,
+        always_generated_id,
+        dest_table,
+        temp_table,
+    ) = _copy_metadata(destination_table, destination)
+    conflict_clause, upsert_pk = _conflict_clause(
+        destination_table, non_generated_columns
+    )
+    pk_match = " AND ".join('_t."{0}" = _s."{0}"'.format(c) for c in upsert_pk)
+    select_src = (
+        "SELECT {} FROM (SELECT DISTINCT ON ({}) {} FROM {}) _s"
+        " WHERE {} (SELECT 1 FROM {} _t WHERE {})".format(
+            column_list,
+            columns_joined(upsert_pk),
+            column_list,
+            temp_table,
+            "EXISTS" if phase == "refresh" else "NOT EXISTS",
+            dest_table,
+            pk_match,
+        )
+    )
+    insert_query = "INSERT INTO {} AS _dest ({}){} {}{}".format(
+        dest_table,
+        column_list,
+        " OVERRIDING SYSTEM VALUE" if always_generated_id else "",
+        select_src,
+        conflict_clause,
+    )
+    dest_cursor = destination.cursor().inner_cursor
+    try:
+        dest_cursor.execute(_wrap_insert_with_delta(insert_query, destination_table))
+        if phase == "insert":
+            dest_cursor.execute("TRUNCATE {}".format(temp_table))
+    finally:
+        dest_cursor.close()
+        destination.commit()
+
+
+def copy_rows_copy_protocol(
+    source, destination, query, destination_table, params=None, batch_size=None
+):
+    # batch_size is accepted for interface parity with copy_rows (both are used
+    # as self.__copy_rows) but is unused here: the COPY stream self-chunks.
+    (
+        non_generated_columns,
+        column_list,
+        always_generated_id,
+        dest_table,
+        temp_table,
+    ) = _copy_metadata(destination_table, destination)
 
     # On a recreate run the destination was just built from the pre-data
     # schema, so no unique indexes exist during load and ON CONFLICT cannot
     # dedup anything: the staging pass would be a pure second write of every
-    # row. COPY straight into the target instead. Top-up runs keep staging
-    # for real dedup and delta capture.
+    # row. COPY straight into the target instead. Top-up/grow runs keep
+    # staging for dedup/upsert and delta capture.
     direct_copy = get_config().destination_mode == DestinationMode.RECREATE
 
     source_cursor = source.cursor().inner_cursor
@@ -319,40 +542,49 @@ def copy_rows_copy_protocol(
             )
             dest_cursor.execute("TRUNCATE {}".format(temp_table))
 
-        # Block-level COPY streaming: pipe raw COPY data straight from the source
-        # into the destination, avoiding a per-row Python loop. Selecting just the
-        # non-generated columns keeps the stream aligned with the target column
-        # list (generated columns are excluded; the cap, joins, etc. live in query).
-        # COPY FROM inserts supplied values into identity columns natively.
-        copy_out = "COPY (SELECT {} FROM ({}) AS _src) TO STDOUT".format(
-            column_list, query
+        _pipe_copy(
+            source_cursor,
+            dest_cursor,
+            query,
+            params,
+            column_list,
+            dest_table if direct_copy else temp_table,
         )
-        copy_in = "COPY {} ({}) FROM STDIN".format(
-            dest_table if direct_copy else temp_table, column_list
-        )
-        # psycopg yields one buffer per row; writing each individually caps
-        # throughput on Python loop overhead (~2x), so coalesce into ~1MB
-        # chunks before writing
-        with source_cursor.copy(copy_out, params) as src_copy:
-            with dest_cursor.copy(copy_in) as dest_copy:
-                buf = bytearray()
-                for data in src_copy:
-                    buf += data
-                    if len(buf) >= 1 << 20:
-                        dest_copy.write(bytes(buf))
-                        buf.clear()
-                if buf:
-                    dest_copy.write(bytes(buf))
 
         if not direct_copy:
-            insert_query = (
-                "INSERT INTO {} ({}){} SELECT {} FROM {} ON CONFLICT DO NOTHING".format(
-                    dest_table,
-                    column_list,
-                    " OVERRIDING SYSTEM VALUE" if always_generated_id else "",
-                    column_list,
-                    temp_table,
+            conflict_clause, upsert_pk = _conflict_clause(
+                destination_table, non_generated_columns
+            )
+            if upsert_pk is not None:
+                # dedupe on the PK (an upsert statement cannot affect the same
+                # row twice), then arbitrate refreshes of existing rows before
+                # new-row inserts: a new row may only satisfy a secondary
+                # unique index (e.g. one active history row per entity) once
+                # the stale row it displaces has been refreshed. The ORDER BY
+                # sorts before any row is inserted, so the EXISTS classifies
+                # every row against the pre-statement destination state.
+                exists_cond = " AND ".join(
+                    '_t."{0}" = _s."{0}"'.format(c) for c in upsert_pk
                 )
+                select_src = (
+                    "SELECT {} FROM (SELECT DISTINCT ON ({}) {} FROM {}) _s"
+                    " ORDER BY (EXISTS (SELECT 1 FROM {} _t WHERE {})) DESC".format(
+                        column_list,
+                        columns_joined(upsert_pk),
+                        column_list,
+                        temp_table,
+                        dest_table,
+                        exists_cond,
+                    )
+                )
+            else:
+                select_src = "SELECT {} FROM {}".format(column_list, temp_table)
+            insert_query = "INSERT INTO {} AS _dest ({}){} {}{}".format(
+                dest_table,
+                column_list,
+                " OVERRIDING SYSTEM VALUE" if always_generated_id else "",
+                select_src,
+                conflict_clause,
             )
             dest_cursor.execute(
                 _wrap_insert_with_delta(insert_query, destination_table)
