@@ -3,13 +3,13 @@
 A config-driven database subsetting tool for PostgreSQL and MySQL, forked from
 Tonic's Condenser.
 
-Some changes from the original Condenser:
+Major changes from the original Condenser:
 
-* Concurrent thread pool usage to speed up subsetting throughout the whole process
-* Optional temp-table strategy for memory-efficient ID batching
+* Concurrent thread pool usage to speed up subsetting throughout the whole algorithm
 * Postgres COPY protocol for faster transfer set on by default
 * Incremental subsetting (skip schema setup and extend the subset)
 * Automatic sequence reset after subsetting
+* Subset larger DB schemas over 10 GB, which the original code struggled with
 * Built on psycopg3 and managed with astral's uv
 
 Subsetting data is the process of taking a representative sample of your data
@@ -29,9 +29,14 @@ You can find more about the original Condenser details
 [here](https://www.tonic.ai/blog/condenser-a-database-subsetting-tool) and
 [here](https://www.tonic.ai/blog/condenser-v2/).
 
+## Requirements
+
+* Python 3.10+
+* Postgres 14+ 
+
 ## Installation
 
-Six steps to set up from source. Python 3.10+ and Postgres 14+:
+Six steps to set up from source:
 
 1. Install [astral-uv](https://docs.astral.sh/uv/getting-started/installation/)
 
@@ -60,8 +65,10 @@ named `public.target_table`.
     ```
 
     There may be more required configuration depending on your database, but
-    simple databases should be easy. See the CONFIG.md for more details,
-    and `config.json.example_all` for all of the options in a single config file.
+    simple databases should be easy. Run `subset --help-config` for the full
+    configuration reference (also in
+    [src/db_condenser/CONFIG.md](src/db_condenser/CONFIG.md)), and
+    `subset --example-config` for all of the options in a single config file.
 
 6. Run! `$ uv run subset`
 
@@ -83,7 +90,13 @@ Almost all the configuration is in the `config.json` file, so running it is as s
 uv run subset
 ```
 
-Four command-line arguments are supported:
+If you installed from PyPI:
+
+```bash
+subset --config config.local.json
+```
+
+These command-line arguments are supported:
 
 `-v`: Verbose output. Useful for performance debugging. Lists almost every
 query made, and its speed.
@@ -96,3 +109,8 @@ or 127.0.0.1
 
 `--config <file>`: Use a custom JSON config file instead of the default
 `config.json`.
+
+`--help-config`: Print the full configuration reference and exit.
+
+`--example-config`: Print an example `config.json` with all options and exit.
+Useful as a starting point: `subset --example-config > config.json`.

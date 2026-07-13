@@ -1,8 +1,9 @@
 # Config
 
-Configuration must exist in `config.json`. There is a minimal example in
-`config.json.example` and a comprehensive example with all options in
-`config.json.example_all`. Most of the configuration is straightforward:
+Configuration must exist in `config.json`. Run `subset --example-config` to
+print a comprehensive example with all options (redirect it to get started:
+`subset --example-config > config.json`). Most of the configuration is
+straightforward:
 source and destination DB connection details and subsetting settings.
 There are three fields that deserve some additional attention.
 
@@ -25,7 +26,7 @@ For a subsetter to create useful subsets it needs to know about these implicit
 constraints. This field lets you add foreign keys to the subsetter that the DB
 doesn't have listed as a constraint.
 
-Below we describe all configuration parameters. See `config.json.example_all`
+Below we describe all configuration parameters. Run `subset --example-config`
 for the exact format.
 
 ## Required
@@ -107,7 +108,7 @@ Default is `false`.
 
 `use_copy_protocol`: If `true`, uses PostgreSQL's `COPY ... FROM STDIN`
 protocol for row transfer instead of per-row INSERT statements. Significantly
-faster (5-10x for bulk inserts). Postgres only. Default is `false`.
+faster (5-10x for bulk inserts). Postgres only. Default is `true`.
 
 `parallel_read_workers`: Number of parallel connections used to read direct
 target tables from the source. Splits work by physical page ranges (ctid),
@@ -129,11 +130,13 @@ to the target's query.
 
 ## Incremental subsetting
 
-`skip_schema_setup`: If `true`, the tool will not drop/recreate the destination
-schema or run `pg_dump`. Use this when re-running the subsetter against an
-existing destination database — for example, to add rows from different initial
-targets across multiple runs. Duplicate rows are silently skipped via
-`ON CONFLICT DO NOTHING`. Default is `false`.
+`destination_mode`: Either `"recreate"` (default) or `"topup"`. With
+`"recreate"`, the destination schema is dropped and recreated from the source
+on every run. With `"topup"` (Postgres only), the destination is treated as an
+existing subset and the run adds to it — for example, to add rows from
+different initial targets across multiple runs. Duplicate rows are silently
+skipped via `ON CONFLICT DO NOTHING`. The deprecated `skip_schema_setup: true`
+is equivalent to `"topup"`.
 
 ## Post-processing
 

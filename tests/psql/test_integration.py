@@ -99,19 +99,19 @@ def _run_subsetter(
         subsetter.prep_temp_dbs()
         subsetter.run_middle_out()
 
-        if not topup:
-            for sql_stmt in config.pre_constraint_sql:
-                db_helper.run_query(sql_stmt, destination_dbc.get_db_connection())
+        for sql_stmt in config.pre_constraint_sql:
+            db_helper.run_query(sql_stmt, destination_dbc.get_db_connection())
 
+        if not topup:
             database.add_constraints()
 
-            for sql_stmt in config.post_subset_sql:
-                db_helper.run_query(sql_stmt, destination_dbc.get_db_connection())
+        for sql_stmt in config.post_subset_sql:
+            db_helper.run_query(sql_stmt, destination_dbc.get_db_connection())
 
-            all_tables_no_pg = [t for t in all_tables if "pgbench" not in t]
-            dest_conn = destination_dbc.get_db_connection()
-            assert isinstance(dest_conn, PsqlConnection)
-            db_helper.update_sequence_numbering(dest_conn, all_tables_no_pg)
+        all_tables_no_pg = [t for t in all_tables if "pgbench" not in t]
+        dest_conn = destination_dbc.get_db_connection()
+        assert isinstance(dest_conn, PsqlConnection)
+        db_helper.update_sequence_numbering(dest_conn, all_tables_no_pg)
     finally:
         subsetter.unprep_temp_dbs()
         subsetter.close_connections()
