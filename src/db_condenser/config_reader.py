@@ -125,6 +125,11 @@ class Config:
             or self.parallel_read_workers < 1
         ):
             raise ValueError("parallel_read_workers must be an integer >= 1")
+        if (
+            self.destination_mode == DestinationMode.GROW
+            and self.db_type != DbType.POSTGRES
+        ):
+            raise ValueError('destination_mode "grow" is only supported on PostgreSQL')
 
     @property
     def is_incremental(self) -> bool:

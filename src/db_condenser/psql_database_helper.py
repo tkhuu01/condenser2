@@ -320,47 +320,34 @@ def copy_rows(
         conflict_clause, upsert_pk = _conflict_clause(
             destination_table, [dt[0] for dt in non_generated_columns]
         )
-        insert_query = "INSERT INTO {} AS _dest {}{} VALUES {}{}".format(
-            fully_qualified_table(destination_table),
-            columns,
-            " OVERRIDING SYSTEM VALUE" if always_generated_id else "",
-            template,
-            conflict_clause,
-        )
-        insert_query = _wrap_insert_with_delta(insert_query, destination_table)
-
-        pk_positions = None
         if upsert_pk is not None:
-            col_pos = {dt[0]: i for i, dt in enumerate(non_generated_columns)}
-            pk_positions = [col_pos[c] for c in upsert_pk]
-
-        def _order_refreshes_first(batch):
-            # refreshes of existing rows must execute before new-row inserts
-            # so a new row never trips a secondary unique index (e.g. one
-            # active history row per entity) against a stale row it displaces
-            keys = [tuple(row[i] for i in pk_positions) for row in batch]
-            if len(pk_positions) == 1:
-                q = 'SELECT "{0}" FROM {1} WHERE "{0}" = ANY(%s)'.format(
-                    upsert_pk[0], fully_qualified_table(destination_table)
-                )
-                qparams = ([k[0] for k in keys],)
-            else:
-                placeholders = ",".join(
-                    ["({})".format(",".join(["%s"] * len(pk_positions)))] * len(keys)
-                )
-                q = "SELECT {} FROM {} WHERE ({}) IN ({})".format(
-                    columns_joined(upsert_pk),
-                    fully_qualified_table(destination_table),
-                    columns_joined(upsert_pk),
-                    placeholders,
-                )
-                qparams = [v for k in keys for v in k]
-            destination_cursor.execute(q, qparams)
-            existing = {tuple(r) for r in destination_cursor.fetchall()}
-            return sorted(
-                batch,
-                key=lambda row: tuple(row[i] for i in pk_positions) not in existing,
+            # incremental upsert: per-batch ordering cannot cover a
+            # deactivate-and-replace pair that straddles a fetchmany
+            # boundary, so stage the whole copy into the session staging
+            # table first, then apply it with the same refresh-then-insert
+            # statements the COPY-protocol path uses
+            dest_table = fully_qualified_table(destination_table)
+            temp_table = '"{}"'.format(
+                _prefixed_identifier("_copy_staging_", destination_table)
             )
+            destination_cursor.execute(
+                "CREATE TEMPORARY TABLE IF NOT EXISTS {} (LIKE {} INCLUDING DEFAULTS)".format(
+                    temp_table, dest_table
+                )
+            )
+            destination_cursor.execute("TRUNCATE {}".format(temp_table))
+            insert_query = "INSERT INTO {} {} VALUES {}".format(
+                temp_table, columns, template
+            )
+        else:
+            insert_query = "INSERT INTO {} AS _dest {}{} VALUES {}{}".format(
+                fully_qualified_table(destination_table),
+                columns,
+                " OVERRIDING SYSTEM VALUE" if always_generated_id else "",
+                template,
+                conflict_clause,
+            )
+            insert_query = _wrap_insert_with_delta(insert_query, destination_table)
 
         while True:
             rows = cursor.fetchmany(batch_size)
@@ -381,10 +368,11 @@ def copy_rows(
             else:
                 updated_rows = (_adapt_row(row) for row in rows)
 
-            if pk_positions is not None:
-                updated_rows = _order_refreshes_first(list(updated_rows))
-
             destination_cursor.executemany(insert_query, updated_rows)
+
+        if upsert_pk is not None:
+            apply_staged(destination, destination_table, "refresh")
+            apply_staged(destination, destination_table, "insert")
 
     finally:
         destination_cursor.close()
@@ -478,15 +466,18 @@ def apply_staged(destination, destination_table, phase):
         dest_table,
         temp_table,
     ) = _copy_metadata(destination_table, destination)
-    conflict_clause, upsert_pk = _conflict_clause(
-        destination_table, non_generated_columns
-    )
-    pk_match = " AND ".join('_t."{0}" = _s."{0}"'.format(c) for c in upsert_pk)
+    conflict_clause, _ = _conflict_clause(destination_table, non_generated_columns)
+    # classify rows by the delta's PK, not _conflict_clause's upsert_pk: the
+    # latter is None for all-PK-column tables (nothing to refresh, so the
+    # clause is DO NOTHING), but the phase split still needs the key. The
+    # two-phase caller gate guarantees the delta exists.
+    _, pk = _incremental_deltas[destination_table]
+    pk_match = " AND ".join('_t."{0}" = _s."{0}"'.format(c) for c in pk)
     select_src = (
         "SELECT {} FROM (SELECT DISTINCT ON ({}) {} FROM {}) _s"
         " WHERE {} (SELECT 1 FROM {} _t WHERE {})".format(
             column_list,
-            columns_joined(upsert_pk),
+            columns_joined(pk),
             column_list,
             temp_table,
             "EXISTS" if phase == "refresh" else "NOT EXISTS",

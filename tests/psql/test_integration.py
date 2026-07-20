@@ -891,6 +891,20 @@ def test_grow_mode_parses_and_is_incremental():
     assert not config_reader._raw_dict_to_config(raw).is_incremental
 
 
+def test_grow_mode_rejected_on_mysql():
+    with open(CONFIG_JSON, "r") as fp:
+        raw = json.load(fp)
+    raw["db_type"] = "mysql"
+
+    raw["destination_mode"] = "grow"
+    with pytest.raises(ValueError, match="grow"):
+        config_reader._raw_dict_to_config(raw)
+
+    # topup keeps its historical degraded-but-allowed behavior on MySQL
+    raw["destination_mode"] = "topup"
+    config_reader._raw_dict_to_config(raw)
+
+
 # ============================================================
 # GROW MODE RE-RUNS
 # ============================================================
@@ -1189,8 +1203,24 @@ def grow_parallel_dbs():
         "setup_sql": [
             "INSERT INTO sales.customers (id, name, email, region, created_at)"
             " SELECT i, 'Bulk ' || i, 'bulk' || i || '@example.com', 'US-W',"
-            " '2025-05-01' FROM generate_series(1000, 20999) AS i"
+            " '2025-05-01' FROM generate_series(1000, 20999) AS i",
+            # all of this table's columns are PK members, and it carries a
+            # secondary unique index: the two-phase split must classify rows
+            # by the delta's PK (there is no upsert_pk for it). No FK — a
+            # passthrough table must not also be upstream-subsetted, or a
+            # recreate run would copy it twice with no index to dedup on.
+            "CREATE TABLE sales.customer_tags ("
+            " customer_id INT NOT NULL,"
+            " tag VARCHAR NOT NULL,"
+            " PRIMARY KEY (customer_id, tag))",
+            "CREATE UNIQUE INDEX idx_customer_tags_reverse"
+            " ON sales.customer_tags (tag, customer_id)",
+            "INSERT INTO sales.customer_tags"
+            " SELECT i, 'tag-' || (i % 7) FROM generate_series(1000, 20999) AS i",
         ],
+        "config_overrides": {
+            "passthrough_tables": ["public.regions", "sales.customer_tags"]
+        },
     }
     source_db, dest_db = _run_subsetter(**param)
 
@@ -1214,6 +1244,15 @@ def grow_parallel_dbs():
             " SELECT i, 'Bulk ' || i, 'bulk' || i || '@example.com', 'US-W',"
             " '2025-05-01' FROM generate_series(30000, 34999) AS i"
         )
+        cur.execute(
+            "INSERT INTO sales.customer_tags"
+            " SELECT i, 'tag-new' FROM generate_series(30000, 34999) AS i"
+        )
+        # the ctid split reads pg_class.relpages, which only VACUUM/ANALYZE
+        # refresh — without this the freshly bulked tables report 0 pages
+        # and the split silently falls back to sequential
+        cur.execute("ANALYZE sales.customers")
+        cur.execute("ANALYZE sales.customer_tags")
     src.commit()
     src.close()
 
@@ -1279,6 +1318,126 @@ def test_grow_parallel_two_phase_split(grow_parallel_dbs):
     )
     assert (
         _query_one(dest, "SELECT COUNT(DISTINCT email) FROM sales.customers") == 25006
+    )
+    # the all-PK-column passthrough table went through the same two-phase
+    # split (refresh phase is a no-op for it; insert phase adds the new rows)
+    assert _query_one(dest, "SELECT COUNT(*) FROM sales.customer_tags") == 25000
+    assert (
+        _query_one(
+            dest,
+            "SELECT COUNT(DISTINCT (customer_id, tag)) FROM sales.customer_tags",
+        )
+        == 25000
+    )
+
+
+@pytest.fixture(scope="module")
+def grow_batch_boundary_dbs():
+    """Deactivate-and-replace pair straddling a fetchmany boundary.
+
+    With compute_batch_size patched to 2, one copy of customer 6's history
+    rows spans multiple executemany batches, and the retired row's refresh
+    can land in a later batch than the new active row's insert. The
+    executemany path must stage the whole copy and apply refreshes before
+    inserts (like the COPY path) for this grow run to succeed under the
+    live partial unique index."""
+    import db_condenser.psql_database_helper as helper_mod
+    import db_condenser.subset as subset_mod
+
+    param = {
+        "use_temp_tables": False,
+        "use_copy_protocol": False,
+        "suffix_override": "_grow_bb",
+    }
+    source_db, dest_db = _run_subsetter(**param)
+
+    src = psycopg.connect(
+        dbname=source_db,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT,
+    )
+    with src.cursor() as cur:
+        cur.execute(
+            "UPDATE sales.customer_status_history SET active = false"
+            " WHERE customer_id = 6 AND active"
+        )
+        cur.execute(
+            "INSERT INTO sales.customer_status_history (customer_id, status, active)"
+            " VALUES (6, 'gold', true)"
+        )
+        # rewrite the retired row so its heap tuple follows the new row:
+        # scan order then yields gold before the refresh that unblocks it
+        cur.execute(
+            "DELETE FROM sales.customer_status_history"
+            " WHERE customer_id = 6 AND status = 'silver'"
+        )
+        cur.execute(
+            "INSERT INTO sales.customer_status_history"
+            " (id, customer_id, status, active)"
+            " VALUES (7, 6, 'silver-retired', false)"
+        )
+    src.commit()
+    src.close()
+
+    real_subset_batch = subset_mod.compute_batch_size
+    real_helper_batch = helper_mod.compute_batch_size
+    subset_mod.compute_batch_size = lambda column_count: 2
+    helper_mod.compute_batch_size = lambda column_count: 2
+    try:
+        _run_subsetter(**param, mode="grow")
+    finally:
+        subset_mod.compute_batch_size = real_subset_batch
+        helper_mod.compute_batch_size = real_helper_batch
+
+    dest = psycopg.connect(
+        dbname=dest_db,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT,
+    )
+    yield dest
+    dest.close()
+
+    admin = _admin_conn()
+    with admin.cursor() as cur:
+        for db in (source_db, dest_db):
+            cur.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid()",
+                (db,),
+            )
+            cur.execute(f"DROP DATABASE IF EXISTS {db}")
+    admin.close()
+
+
+def test_grow_history_pair_across_batch_boundary(grow_batch_boundary_dbs):
+    dest = grow_batch_boundary_dbs
+    assert (
+        _query_one(
+            dest,
+            "SELECT COUNT(*) FROM sales.customer_status_history"
+            " WHERE customer_id = 6 AND active",
+        )
+        == 1
+    )
+    assert (
+        _query_one(
+            dest,
+            "SELECT status FROM sales.customer_status_history"
+            " WHERE customer_id = 6 AND active",
+        )
+        == "gold"
+    )
+    assert (
+        _query_one(
+            dest,
+            "SELECT COUNT(*) FROM sales.customer_status_history"
+            " WHERE customer_id = 6 AND status = 'silver-retired' AND NOT active",
+        )
+        == 1
     )
 
 
