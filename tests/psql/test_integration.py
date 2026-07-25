@@ -5,7 +5,7 @@ from pathlib import Path
 import psycopg
 import pytest
 
-from db_condenser import config_reader, database_helper
+from db_condenser import config_reader, database_helper, result_tabulator
 from db_condenser.db_connect import DbConnect, PsqlConnection
 from db_condenser.direct_subset import db_creator
 from db_condenser.subset import Subset
@@ -855,6 +855,69 @@ def test_incremental_integrity_and_cleanup(incremental_dbs):
         "SELECT COUNT(*) FROM pg_namespace WHERE nspname = '_condenser'",
     )
     assert leftover == 0
+
+
+def test_incremental_report_handles_new_disconnected_source_table(capsys):
+    """A source-only table skipped by topup must not break final reporting."""
+    param = {
+        "use_temp_tables": False,
+        "use_copy_protocol": False,
+        "suffix_override": "_incr_report",
+        "config_overrides": {"keep_disconnected_tables": False},
+    }
+    source_db = SOURCE_DB + "_incr_report"
+    dest_db = DEST_DB + "_incr_report"
+    try:
+        source_db, dest_db = _run_subsetter(**param)
+
+        source = psycopg.connect(
+            dbname=source_db,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        with source.cursor() as cur:
+            cur.execute("CREATE TABLE public.later_unconfigured (note text)")
+            cur.execute("INSERT INTO public.later_unconfigured VALUES ('source only')")
+        source.commit()
+        source.close()
+
+        _run_subsetter(**param, mode="topup")
+
+        config = config_reader.get_config()
+        source_dbc = DbConnect(config.db_type, config.source_db_connection_info)
+        destination_dbc = DbConnect(
+            config.db_type, config.destination_db_connection_info
+        )
+        db_helper = database_helper.get_specific_helper()
+        all_tables = db_helper.list_all_tables(source_dbc)
+
+        result_tabulator.tabulate(source_dbc, destination_dbc, all_tables)
+
+        assert "public.later_unconfigured" in capsys.readouterr().out
+        dest = psycopg.connect(
+            dbname=dest_db,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        assert _query_one(
+            dest, "SELECT to_regclass('public.later_unconfigured') IS NULL"
+        )
+        dest.close()
+    finally:
+        admin = _admin_conn()
+        with admin.cursor() as cur:
+            for db in (source_db, dest_db):
+                cur.execute(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = %s AND pid <> pg_backend_pid()",
+                    (db,),
+                )
+                cur.execute(f"DROP DATABASE IF EXISTS {db}")
+        admin.close()
 
 
 def test_skip_schema_setup_alias_maps_to_destination_mode():

@@ -761,13 +761,31 @@ def update_sequence_numbering(conn: PsqlConnection, tables: list[str]):
 
 def get_table_count_estimate(table_name, schema, conn):
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT reltuples::BIGINT AS count
-              FROM pg_class
-             WHERE oid=\'"{}"."{}"\'::regclass
-             """.format(schema, table_name)
-        )
+        if schema is None:
+            cur.execute(
+                """
+                SELECT COALESCE((
+                    SELECT reltuples::BIGINT
+                      FROM pg_class
+                     WHERE oid = to_regclass(%s)
+                ), 0)
+                """,
+                (table_name,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT COALESCE((
+                    SELECT cls.reltuples::BIGINT
+                      FROM pg_class cls
+                      JOIN pg_namespace nsp
+                        ON nsp.oid = cls.relnamespace
+                     WHERE nsp.nspname = %s
+                       AND cls.relname = %s
+                ), 0)
+                """,
+                (schema, table_name),
+            )
         return cur.fetchone()[0]
 
 
