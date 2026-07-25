@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
