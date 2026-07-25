@@ -1,3 +1,4 @@
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -73,12 +74,17 @@ class Subset:
         if self.config.use_temp_tables:
             self.__check_source_writable()
 
-        # topup means the destination already exists: track PKs inserted this
-        # run and drive upstream subsetting off those deltas instead of full
-        # destination tables
+        # topup/grow mean the destination already exists: track PKs inserted
+        # this run in per-table delta tables and drop/restore FKs around the
+        # run
         self.__incremental = (
-            self.config.destination_mode == DestinationMode.TOPUP
-            and self.config.db_type == DbType.POSTGRES
+            self.config.is_incremental and self.config.db_type == DbType.POSTGRES
+        )
+        # topup restricts upstream parent ID reads to this run's deltas
+        # (already-imported entities stay frozen); grow reads full destination
+        # parent ID sets so new source children of old parents are picked up
+        self.__upstream_delta_reads = (
+            self.__incremental and self.config.destination_mode == DestinationMode.TOPUP
         )
         self.__dropped_fks = []
 
@@ -492,6 +498,24 @@ class Subset:
         """
         if not self.__source_pool:
             return False
+        # incremental upserts rely on refreshes landing before new-row
+        # inserts (see _conflict_clause), and page-range workers give no
+        # cross-worker ordering. Tables with a unique index beyond the PK
+        # split in two phases instead: every worker stages its rows and
+        # applies its refreshes, all workers meet at a barrier, then the
+        # inserts run — same guarantee as a sequential copy, full worker
+        # count. Needs the staging machinery and a PK-tracked delta;
+        # otherwise fall back to the sequential path. PK-only tables keep
+        # the single-pass split: ON CONFLICT arbitrates PK collisions
+        # regardless of order.
+        two_phase = False
+        if self.__incremental and self.__db_helper.has_secondary_unique(table):
+            two_phase = (
+                self.config.use_copy_protocol
+                and self.__db_helper.delta_for(table) is not None
+            )
+            if not two_phase:
+                return False
         num_workers = len(self.__source_pool)
         page_count = self.__db_helper.get_table_page_count(
             table_name(table), schema_name(table), self.__source_conn
@@ -501,6 +525,7 @@ class Subset:
 
         fqt = fully_qualified_table(table)
         pages_per_worker = page_count // num_workers
+        barrier = threading.Barrier(num_workers) if two_phase else None
 
         def worker(idx, start_page, end_page):
             source_conn = self.__source_pool[idx]
@@ -515,7 +540,21 @@ class Subset:
                 q = "SELECT {} FROM {} WHERE {}".format(
                     columns_query, fqt, " AND ".join(conditions)
                 )
-                self.__copy_rows(source_conn, dest_conn, q, table, params)
+                if two_phase:
+                    self.__db_helper.stage_rows(
+                        source_conn, dest_conn, q, table, params
+                    )
+                    self.__db_helper.apply_staged(dest_conn, table, "refresh")
+                    barrier.wait()
+                    self.__db_helper.apply_staged(dest_conn, table, "insert")
+                else:
+                    self.__copy_rows(source_conn, dest_conn, q, table, params)
+            except BaseException:
+                # a worker failing before the barrier would strand the rest
+                # at wait(); break the barrier so they fail fast too
+                if barrier is not None:
+                    barrier.abort()
+                raise
             finally:
                 dest_conn.close()
 
@@ -698,13 +737,16 @@ class Subset:
         """Decide the upstream ID sources for an incremental (top-up) run.
 
         Returns (skip, delta_plan):
-        - skip=True: every parent's delta is empty, no new child rows possible
+        - skip=True: no parent gained rows this run, no new child rows possible
         - delta_plan: {parent_table: (delta_table, pk_cols)} for parents with
-          rows added this run. None means full (non-incremental) behavior,
-          either because this isn't an incremental run or a parent has no PK
-          so its inserts weren't tracked.
+          rows inserted this run (upserted rows don't count: their children
+          were already considered when they first arrived). None means full
+          (non-incremental) behavior, either because this run doesn't
+          delta-restrict upstream reads (recreate, or grow which scans all
+          resident parents) or a parent has no PK so its inserts weren't
+          tracked.
         """
-        if not self.__incremental:
+        if not self.__upstream_delta_reads:
             return False, None
         parents = {kc["target_table"] for kc in relevant_key_constraints}
         deltas = {p: self.__db_helper.delta_for(p) for p in parents}
@@ -713,7 +755,11 @@ class Subset:
         nonempty = {}
         with dest_conn.cursor() as cur:
             for p, (delta_table, _) in deltas.items():
-                cur.execute("SELECT EXISTS (SELECT 1 FROM {})".format(delta_table))
+                cur.execute(
+                    "SELECT EXISTS (SELECT 1 FROM {} WHERE _inserted)".format(
+                        delta_table
+                    )
+                )
                 nonempty[p] = cur.fetchone()[0]
         if not any(nonempty.values()):
             return True, None
@@ -736,9 +782,40 @@ class Subset:
         join_cond = " AND ".join(
             "_t.{} = _d.{}".format(quoter(c), quoter(c)) for c in pk_cols
         )
-        return "SELECT DISTINCT {} FROM {} _t JOIN {} _d ON {}".format(
+        return "SELECT DISTINCT {} FROM {} _t JOIN {} _d ON {} AND _d._inserted".format(
             cols, qualified, delta_table, join_cond
         )
+
+    def __downstream_delta_plan(self, referencing_tables, dest_conn):
+        """Decide the child-scan sources for an incremental downstream step.
+
+        Returns (skip, child_plan):
+        - skip=True: every referencing child tracked a delta and all are
+          empty, so no row inserted this run can reference a missing parent
+        - child_plan: {fk_table: (delta_table, pk_cols) or None}. None means
+          scan the child fully (no PK, its inserts weren't tracked); a child
+          with an empty delta is left out entirely (nothing new to scan).
+          child_plan=None means full (non-incremental) behavior.
+
+        Unlike upstream, children contribute missing-parent IDs independently
+        (union semantics), so mixed per-child decisions are safe.
+        """
+        if not self.__incremental:
+            return False, None
+        children = {r["fk_table"] for r in referencing_tables}
+        plan = {}
+        with dest_conn.cursor() as cur:
+            for child in children:
+                delta = self.__db_helper.delta_for(child)
+                if delta is None:
+                    plan[child] = None
+                    continue
+                cur.execute("SELECT EXISTS (SELECT 1 FROM {})".format(delta[0]))
+                if cur.fetchone()[0]:
+                    plan[child] = delta
+        if not plan:
+            return True, None
+        return False, plan
 
     def __subset_upstream(
         self,
@@ -1247,11 +1324,20 @@ class Subset:
         else:
             return
 
+        skip, child_plan = self.__downstream_delta_plan(referencing_tables, dest_conn)
+        if skip:
+            return
+
         temp_table = self.__db_helper.create_id_temp_table(dest_conn, len(pk_columns))
 
         for r in referencing_tables:
             fk_table = r["fk_table"]
             fk_columns = r["fk_columns"]
+
+            if child_plan is not None and fk_table not in child_plan:
+                # no rows were inserted into this child this run
+                continue
+            delta = child_plan.get(fk_table) if child_plan else None
 
             fk_qualified = fully_qualified_table(
                 mysql_db_name_hack(fk_table, dest_conn)
@@ -1259,15 +1345,25 @@ class Subset:
             target_qualified = fully_qualified_table(
                 mysql_db_name_hack(table, dest_conn)
             )
+            delta_join = ""
+            if delta is not None:
+                delta_table, child_pk = delta
+                delta_join = " JOIN {} _d ON {}".format(
+                    delta_table,
+                    " AND ".join(
+                        "_fk.{} = _d.{}".format(quoter(c), quoter(c)) for c in child_pk
+                    ),
+                )
             exists_conditions = " AND ".join(
                 "_t.{} = _fk.{}".format(quoter(pc), quoter(fc))
                 for pc, fc in zip(pk_columns, fk_columns)
             )
             select_q = (
-                "SELECT DISTINCT {} FROM {} _fk"
+                "SELECT DISTINCT {} FROM {} _fk{}"
                 " WHERE NOT EXISTS (SELECT 1 FROM {} _t WHERE {})".format(
-                    columns_joined(fk_columns),
+                    ",".join("_fk.{}".format(quoter(c)) for c in fk_columns),
                     fk_qualified,
+                    delta_join,
                     target_qualified,
                     exists_conditions,
                 )

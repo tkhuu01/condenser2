@@ -230,7 +230,8 @@ def get_table_count_estimate(table_name, schema, conn):
                AND table_name='{}'
             """.format(schema, table_name)
         )
-        return cur.fetchone()[0]
+        row = cur.fetchone()
+        return row[0] if row is not None and row[0] is not None else 0
     finally:
         cur.close()
 

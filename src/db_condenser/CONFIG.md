@@ -130,13 +130,40 @@ to the target's query.
 
 ## Incremental subsetting
 
-`destination_mode`: Either `"recreate"` (default) or `"topup"`. With
-`"recreate"`, the destination schema is dropped and recreated from the source
-on every run. With `"topup"` (Postgres only), the destination is treated as an
-existing subset and the run adds to it — for example, to add rows from
-different initial targets across multiple runs. Duplicate rows are silently
-skipped via `ON CONFLICT DO NOTHING`. The deprecated `skip_schema_setup: true`
-is equivalent to `"topup"`.
+`destination_mode`: One of `"recreate"` (default), `"topup"`, or `"grow"`.
+
+With `"recreate"`, the destination schema is dropped and recreated from the
+source on every run. This is the only mode that yields a clean point-in-time
+snapshot (and the only way to drop rows deleted in the source).
+
+With `"topup"` (Postgres only), the destination is treated as an existing
+subset and the run adds to it — for example, to add rows from different
+initial targets across multiple runs. Already-imported entities stay frozen:
+new source children of previously imported rows are not picked up. Re-runs
+cost O(new rows). The deprecated `skip_schema_setup: true` is equivalent to
+`"topup"`.
+
+With `"grow"` (Postgres only), the run does everything `"topup"` does and
+also picks up new children/descendants of already-imported rows, so the
+subset keeps tracking source growth. This re-reads the children of every
+resident parent (deduplicated on insert), so a run costs O(existing subset)
+rather than O(new rows).
+
+In both incremental modes, any row the run re-reads is refreshed in place
+(upsert on the primary key): changed columns — soft-delete flags, history
+`enddate`s, statuses — heal on re-read. Refreshes are applied before new
+rows are inserted, so deactivate-and-replace patterns (a history table with
+a "one active row per entity" partial unique index) load correctly with the
+index live. Rows the run never re-reads keep their old values, and rows
+hard-deleted in the source are never removed — if a hard-deleted row blocks
+a unique index that a replacement row needs, the run fails with a unique
+violation and a `"recreate"` run is the fix.
+Both modes assume the destination is FK-consistent at run start; if a prior
+run failed to restore constraints, fix that (see
+`SQL/incremental_fk_backup.sql`) before re-running. Adding `fk_augmentation`
+entries between incremental runs may require one `"recreate"` run, since
+previously imported rows are not re-checked against new implicit
+relationships.
 
 ## Post-processing
 

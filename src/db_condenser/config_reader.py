@@ -45,8 +45,13 @@ class DbType(str, Enum):
 class DestinationMode(str, Enum):
     # tear down the destination schema and rebuild from scratch
     RECREATE = "recreate"
-    # destination already exists: keep schema and data, add only new rows
+    # destination already exists: keep schema and data, add only new rows;
+    # already-imported entities stay frozen (new children of old rows are
+    # not picked up)
     TOPUP = "topup"
+    # like topup, but also picks up new children/descendants of
+    # already-imported rows by re-reading full destination parent ID sets
+    GROW = "grow"
 
 
 @dataclass
@@ -120,6 +125,15 @@ class Config:
             or self.parallel_read_workers < 1
         ):
             raise ValueError("parallel_read_workers must be an integer >= 1")
+        if (
+            self.destination_mode == DestinationMode.GROW
+            and self.db_type != DbType.POSTGRES
+        ):
+            raise ValueError('destination_mode "grow" is only supported on PostgreSQL')
+
+    @property
+    def is_incremental(self) -> bool:
+        return self.destination_mode in (DestinationMode.TOPUP, DestinationMode.GROW)
 
     @property
     def dependency_break_set(self) -> set[tuple[str, str]]:
