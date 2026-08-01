@@ -99,6 +99,29 @@ class FkAugmentation:
 
 
 @dataclass
+class IncrementalKey:
+    table: str
+    columns: list[str]
+
+    def __post_init__(self):
+        if not isinstance(self.table, str) or not self.table.strip():
+            raise ValueError("Incremental key 'table' must be a non-empty string")
+        if (
+            not isinstance(self.columns, list)
+            or not self.columns
+            or any(
+                not isinstance(column, str) or not column.strip()
+                for column in self.columns
+            )
+        ):
+            raise ValueError(
+                "Incremental key 'columns' must be a non-empty string list"
+            )
+        if len(self.columns) != len(set(self.columns)):
+            raise ValueError("Incremental key columns must not contain duplicates")
+
+
+@dataclass
 class Config:
     db_type: DbType
     initial_targets: list[InitialTarget]
@@ -110,6 +133,7 @@ class Config:
     passthrough_tables: list[str] = field(default_factory=list)
     dependency_breaks: list[DependencyBreak] = field(default_factory=list)
     fk_augmentation: list[FkAugmentation] = field(default_factory=list)
+    incremental_keys: list[IncrementalKey] = field(default_factory=list)
     max_rows_per_table: int | Literal["ALL"] | None = None
     use_temp_tables: bool = False
     use_copy_protocol: bool = True
@@ -130,6 +154,13 @@ class Config:
             and self.db_type != DbType.POSTGRES
         ):
             raise ValueError('destination_mode "grow" is only supported on PostgreSQL')
+        if self.incremental_keys and self.db_type != DbType.POSTGRES:
+            raise ValueError("incremental_keys are only supported on PostgreSQL")
+        key_tables = [key.table for key in self.incremental_keys]
+        if len(key_tables) != len(set(key_tables)):
+            raise ValueError(
+                "incremental_keys must contain at most one entry per table"
+            )
 
     @property
     def is_incremental(self) -> bool:
@@ -150,6 +181,10 @@ class Config:
     @property
     def initial_target_tables(self) -> list[str]:
         return [target.table for target in self.initial_targets]
+
+    @property
+    def incremental_key_map(self) -> dict[str, list[str]]:
+        return {key.table: key.columns for key in self.incremental_keys}
 
 
 config: Config | None = None
@@ -213,6 +248,9 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
                 "target_columns": fka["target_columns"],
             }
         fk_augmentation.append(FkAugmentation(**fka))
+    incremental_keys = [
+        IncrementalKey(**key) for key in raw_config.get("incremental_keys", [])
+    ]
 
     pre_constraint_sql = [sql for sql in raw_config.get("pre_constraint_sql", [])]
     post_subset_sql = [sql for sql in raw_config.get("post_subset_sql", [])]
@@ -243,6 +281,7 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
         passthrough_tables=passthrough_tables,
         dependency_breaks=dependency_breaks,
         fk_augmentation=fk_augmentation,
+        incremental_keys=incremental_keys,
         max_rows_per_table=max_rows_per_table,
         use_temp_tables=use_temp_tables,
         use_copy_protocol=use_copy_protocol,

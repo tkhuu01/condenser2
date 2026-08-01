@@ -150,7 +150,7 @@ resident parent (deduplicated on insert), so a run costs O(existing subset)
 rather than O(new rows).
 
 In both incremental modes, any row the run re-reads is refreshed in place
-(upsert on the primary key): changed columns — soft-delete flags, history
+(upsert on its incremental identity): changed columns — soft-delete flags, history
 `enddate`s, statuses — heal on re-read. Refreshes are applied before new
 rows are inserted, so deactivate-and-replace patterns (a history table with
 a "one active row per entity" partial unique index) load correctly with the
@@ -158,12 +158,42 @@ index live. Rows the run never re-reads keep their old values, and rows
 hard-deleted in the source are never removed — if a hard-deleted row blocks
 a unique index that a replacement row needs, the run fails with a unique
 violation and a `"recreate"` run is the fix.
-Both modes assume the destination is FK-consistent at run start; if a prior
-run failed to restore constraints, fix that (see
-`SQL/incremental_fk_backup.sql`) before re-running. Adding `fk_augmentation`
-entries between incremental runs may require one `"recreate"` run, since
-previously imported rows are not re-checked against new implicit
-relationships.
+By default, the incremental identity is the table's primary key. A table with
+no primary key may use a unique index when it is valid, immediate, non-partial,
+non-expression, and all of its key columns are `NOT NULL` and non-generated.
+If exactly one such unique key exists it is inferred. If several exist, select
+one explicitly with `incremental_keys`:
+
+```json
+"incremental_keys": [
+  {
+    "table": "sales.customer_status_history",
+    "columns": ["history_id"]
+  }
+]
+```
+
+The selected columns must be a stable row identity; changing an identity value
+is treated as inserting a different row. Other unique indexes remain secondary
+constraints. Partial indexes such as “one active row per customer” are never
+eligible identities. Tables without any safe identity, ambiguous tables without
+an explicit selection, and deferrable identity constraints fail before data is
+transferred.
+
+Incremental runs reject enabled destination user triggers, table inheritance,
+declarative partitioning, and PostgreSQL 18 temporal `PERIOD`/`WITHOUT
+OVERLAPS` constraints rather than loading them with unsafe semantics. Use
+`fk_augmentation` to describe history ownership that is logical but not backed
+by a physical foreign key.
+
+The destination is protected by an advisory lock. A failed run retains its
+`_condenser` delta journal and FK definitions, and the same effective
+configuration resumes it on the next run. A different configuration or
+identity selection is rejected until the original run is resumed or the
+destination is recreated. `SQL/incremental_fk_backup.sql` is also written as a
+manual recovery copy. Adding `fk_augmentation` entries between successful
+incremental runs may require one `"recreate"` run, since previously imported
+rows are not re-checked against new implicit relationships.
 
 ## Post-processing
 

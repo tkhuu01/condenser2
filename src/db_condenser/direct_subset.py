@@ -115,6 +115,7 @@ def main():
     subsetter = Subset(source_dbc, destination_dbc, all_tables)
 
     total_start_time = time.time()
+    succeeded = False
     try:
         subsetter.prep_temp_dbs()
         subsetter.run_middle_out()
@@ -159,12 +160,15 @@ def main():
         result_tabulator.tabulate(
             source_dbc, destination_dbc, all_tables, total_elapsed
         )
+        succeeded = True
     except KeyboardInterrupt:
         print("\nInterrupted — closing connections...")
         raise
     finally:
-        subsetter.unprep_temp_dbs()
-        subsetter.close_connections()
+        try:
+            subsetter.unprep_temp_dbs(succeeded=succeeded)
+        finally:
+            subsetter.close_connections()
 
 
 if __name__ == "__main__":

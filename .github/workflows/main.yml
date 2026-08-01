@@ -18,9 +18,12 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        postgres-version: [14, 18]
     services:
       postgres:
-        image: postgres:18
+        image: postgres:${{ matrix.postgres-version }}
         env:
           POSTGRES_USER: test
           POSTGRES_PASSWORD: test
@@ -33,11 +36,12 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@v4
-      - name: Copy PostgreSQL 18 client tools from service container
+      - name: Copy matching PostgreSQL client tools from service container
         run: |
-          PG_CONTAINER=$(docker ps -q -f "ancestor=postgres:18")
-          docker cp "$PG_CONTAINER":/usr/lib/postgresql/18/bin/pg_dump /usr/local/bin/pg_dump
-          docker cp "$PG_CONTAINER":/usr/lib/postgresql/18/bin/pg_restore /usr/local/bin/pg_restore
+          PG_VERSION=${{ matrix.postgres-version }}
+          PG_CONTAINER=$(docker ps -q -f "ancestor=postgres:$PG_VERSION")
+          docker cp "$PG_CONTAINER":/usr/lib/postgresql/$PG_VERSION/bin/pg_dump /usr/local/bin/pg_dump
+          docker cp "$PG_CONTAINER":/usr/lib/postgresql/$PG_VERSION/bin/pg_restore /usr/local/bin/pg_restore
       - uses: astral-sh/setup-uv@v6
       - run: uv sync
       - run: uv run pytest tests/ -v
