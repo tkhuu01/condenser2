@@ -151,6 +151,31 @@ def _eligible_identity(index):
     )
 
 
+def _reject_deferrable_arbiter(table, indexes, identity, database_label):
+    deferrable = next(
+        (
+            index
+            for index in indexes
+            if index["valid"]
+            and index["ready"]
+            and not index["immediate"]
+            and index["non_partial"]
+            and index["non_expression"]
+            and len(index["columns"]) == len(identity)
+            and set(index["columns"]) == set(identity)
+        ),
+        None,
+    )
+    if deferrable is not None:
+        raise ValueError(
+            "Incremental identity ({}) on {} also matches deferrable unique index"
+            " {} in the {} database; PostgreSQL cannot use that column set as an"
+            " ON CONFLICT arbiter".format(
+                ", ".join(identity), table, deferrable["name"], database_label
+            )
+        )
+
+
 def _resolve_incremental_keys(conn, tables, configured_keys, database_label):
     relations = _relation_map(conn)
     indexes = _unique_index_metadata(conn)
@@ -184,6 +209,9 @@ def _resolve_incremental_keys(conn, tables, configured_keys, database_label):
                         table
                     )
                 )
+            _reject_deferrable_arbiter(
+                table, table_indexes, primary["columns"], database_label
+            )
             resolved[table] = primary["columns"]
             continue
 
@@ -209,9 +237,9 @@ def _resolve_incremental_keys(conn, tables, configured_keys, database_label):
                     " columns are all NOT NULL and non-generated in the {}"
                     " database".format(table, database_label)
                 )
-            resolved[table] = configured
+            identity = configured
         elif len(eligible_by_columns) == 1:
-            resolved[table] = list(next(iter(eligible_by_columns)))
+            identity = list(next(iter(eligible_by_columns)))
         elif not eligible_by_columns:
             raise ValueError(
                 "Incremental table {} has no primary key or eligible unique key;"
@@ -228,6 +256,8 @@ def _resolve_incremental_keys(conn, tables, configured_keys, database_label):
                 "Incremental table {} has multiple eligible unique keys: {};"
                 " select one with incremental_keys".format(table, candidates)
             )
+        _reject_deferrable_arbiter(table, table_indexes, identity, database_label)
+        resolved[table] = identity
     return resolved
 
 
@@ -318,6 +348,10 @@ def _incremental_config_hash(identity_map):
     raw = asdict(get_config())
     for name in ("source_db_connection_info", "destination_db_connection_info"):
         raw[name].pop("password", None)
+    for name in ("excluded_tables", "passthrough_tables"):
+        raw[name] = sorted(set(raw[name]))
+    for name in ("dependency_breaks", "fk_augmentation", "incremental_keys"):
+        raw[name] = sorted(raw[name], key=lambda item: json.dumps(item, sort_keys=True))
     raw["resolved_incremental_keys"] = {
         table: identity_map[table] for table in sorted(identity_map)
     }

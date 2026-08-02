@@ -231,9 +231,7 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
     ]
 
     excluded_tables = [table for table in raw_config.get("excluded_tables", [])]
-    passthrough_tables = list(
-        set([table for table in raw_config.get("passthrough_tables", [])])
-    )
+    passthrough_tables = list(dict.fromkeys(raw_config.get("passthrough_tables", [])))
     dependency_breaks = [
         DependencyBreak(**relation)
         for relation in raw_config.get("dependency_breaks", [])

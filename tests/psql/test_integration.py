@@ -1000,6 +1000,63 @@ def test_incremental_keys_parse_and_validate():
         config_reader._raw_dict_to_config(raw)
 
 
+def test_incremental_config_hash_canonicalizes_unordered_lists():
+    with open(CONFIG_JSON, "r") as fp:
+        raw = json.load(fp)
+    raw["passthrough_tables"] = [
+        "public.regions",
+        "public.feature_flags",
+        "public.regions",
+    ]
+    raw["excluded_tables"] = ["sales.order_lines", "sales.order_transfers"]
+    raw["dependency_breaks"].append(
+        {"fk_table": "sales.orders", "target_table": "sales.customers"}
+    )
+    raw["fk_augmentation"] = [
+        {
+            "fk_table": "sales.unique_history",
+            "fk_columns": ["customer_id"],
+            "target_table": "sales.customers",
+            "target_columns": ["id"],
+        },
+        {
+            "fk_table": "sales.orders",
+            "fk_columns": ["warehouse_id"],
+            "target_table": "inventory.warehouses",
+            "target_columns": ["id"],
+        },
+    ]
+    raw["incremental_keys"] = [
+        {"table": "sales.unique_history", "columns": ["history_id"]},
+        {"table": "sales.other_history", "columns": ["owner_id", "version"]},
+    ]
+
+    config_reader.config = config_reader._raw_dict_to_config(raw)
+    assert config_reader.config.passthrough_tables == [
+        "public.regions",
+        "public.feature_flags",
+    ]
+    helper = database_helper.get_specific_helper()
+    identity_map = {"sales.customers": ["id"]}
+    first_hash = helper._incremental_config_hash(identity_map)
+
+    raw["passthrough_tables"] = [
+        "public.feature_flags",
+        "public.regions",
+        "public.feature_flags",
+    ]
+    for name in (
+        "excluded_tables",
+        "dependency_breaks",
+        "fk_augmentation",
+        "incremental_keys",
+    ):
+        raw[name].reverse()
+    config_reader.config = config_reader._raw_dict_to_config(raw)
+
+    assert helper._incremental_config_hash(identity_map) == first_hash
+
+
 # ============================================================
 # UNIQUE-KEY INCREMENTAL IDENTITY (NO PRIMARY KEY)
 # ============================================================
@@ -1247,6 +1304,19 @@ def test_single_unique_key_is_inferred_and_generated_columns_refresh():
                 "INSERT INTO sales.deferrable_history VALUES (600, 6)",
             ],
             "Primary key.*cannot be used",
+        ),
+        (
+            "_duplicate_deferrable_arbiter",
+            [
+                "CREATE TABLE sales.duplicate_arbiter_history ("
+                " history_id INT NOT NULL,"
+                " customer_id INT NOT NULL REFERENCES sales.customers(id),"
+                " CONSTRAINT duplicate_arbiter_immediate UNIQUE (history_id),"
+                " CONSTRAINT duplicate_arbiter_deferred UNIQUE (history_id)"
+                " DEFERRABLE INITIALLY IMMEDIATE)",
+                "INSERT INTO sales.duplicate_arbiter_history VALUES (600, 6)",
+            ],
+            "also matches deferrable unique index",
         ),
         (
             "_partitioned",

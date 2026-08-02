@@ -178,7 +178,9 @@ is treated as inserting a different row. Other unique indexes remain secondary
 constraints. Partial indexes such as “one active row per customer” are never
 eligible identities. Tables without any safe identity, ambiguous tables without
 an explicit selection, and deferrable identity constraints fail before data is
-transferred.
+transferred. A deferrable unique constraint matching the same columns as an
+otherwise eligible identity is also rejected because PostgreSQL cannot use
+that column set as an `ON CONFLICT` arbiter.
 
 Incremental runs reject enabled destination user triggers, table inheritance,
 declarative partitioning, and PostgreSQL 18 temporal `PERIOD`/`WITHOUT
