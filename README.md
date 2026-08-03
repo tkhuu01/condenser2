@@ -3,14 +3,14 @@
 A config-driven database subsetting tool for PostgreSQL and MySQL, forked from
 Tonic's Condenser.
 
-Major changes from the original Condenser implementaion:
+Major changes from the original Condenser implementation:
 
-* Supports subsettings databases larger than 10 GB, which the original implementaion struggled to process
+* Supports subsetting databases larger than 10 GB, which the original implementation struggled to process
 * Designed to run against read-only instances and replicas, reducing load on the primary database
 * Supports incremental top-ups, allowing existing subsets to grow without rebuilding the destination database
 * Handles dense and complex FK relationship graphs
 * Uses concurrent worker pools throughout the subsetting process to improve performance
-* Postgres COPY protocol for faster transfer set on by default
+* Postgres COPY protocol for faster transfer enabled by default
 * Automatic sequence reset after subsetting
 * Built with psycopg3 and managed with Astral's uv
 
