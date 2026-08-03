@@ -627,22 +627,28 @@ def restore_fk_constraints(conn, fks):
             for nsp, rel, name, defn in fks:
                 cur.execute(
                     """
-                    SELECT EXISTS (
-                        SELECT 1
-                          FROM pg_constraint con
-                          JOIN pg_class cl ON cl.oid = con.conrelid
-                          JOIN pg_namespace ns ON ns.oid = cl.relnamespace
-                         WHERE ns.nspname = %s
-                           AND cl.relname = %s
-                           AND con.conname = %s
-                    )
+                    SELECT con.contype, pg_get_constraintdef(con.oid)
+                      FROM pg_constraint con
+                      JOIN pg_class cl ON cl.oid = con.conrelid
+                      JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+                     WHERE ns.nspname = %s
+                       AND cl.relname = %s
+                       AND con.conname = %s
                     """,
                     (nsp, rel, name),
                 )
-                if not cur.fetchone()[0]:
+                existing = cur.fetchone()
+                if existing is None:
                     cur.execute(
                         'ALTER TABLE "{}"."{}" ADD CONSTRAINT "{}" {}'.format(
                             nsp, rel, name, defn
+                        )
+                    )
+                elif existing != ("f", defn):
+                    raise RuntimeError(
+                        "Cannot restore foreign key {}.{} {}; an existing"
+                        " constraint with that name has a different definition".format(
+                            nsp, rel, name
                         )
                     )
         conn.commit()
@@ -678,7 +684,7 @@ def _wrap_insert_with_delta(insert_query, destination_table):
     )
 
 
-def _conflict_clause(destination_table, insert_columns):
+def _conflict_clause(destination_table, update_columns):
     """ON CONFLICT clause for destination inserts. Incremental runs upsert on
     the selected identity so re-read rows refresh in place; the guard skips
     rows whose values are unchanged. Recreate runs and tables outside the
@@ -691,7 +697,7 @@ def _conflict_clause(destination_table, insert_columns):
     if not delta:
         return " ON CONFLICT DO NOTHING", None
     _, identity = delta
-    non_identity = [c for c in insert_columns if c not in identity]
+    non_identity = [c for c in update_columns if c not in identity]
     if not non_identity:
         return " ON CONFLICT DO NOTHING", None
     sets = ", ".join('"{0}" = EXCLUDED."{0}"'.format(c) for c in non_identity)
@@ -733,6 +739,7 @@ def copy_rows(
     non_generated_columns = [
         (dt[0], dt[1]) for _, dt in enumerate(datatypes) if not dt[2]
     ]
+    updatable_columns = [dt[0] for dt in datatypes if not dt[2] and dt[3] != "a"]
     generated_columns_positions = {i for i, dt in enumerate(datatypes) if dt[2]}
     always_generated_id = any([dt[3] == "a" for dt in datatypes])
 
@@ -776,7 +783,7 @@ def copy_rows(
         cursor.execute(query, params)
 
         conflict_clause, upsert_pk = _conflict_clause(
-            destination_table, [dt[0] for dt in non_generated_columns]
+            destination_table, updatable_columns
         )
         if upsert_pk is not None:
             # incremental upsert: per-batch ordering cannot cover a
@@ -844,6 +851,7 @@ def _copy_metadata(destination_table, destination):
         table_name(destination_table), schema_name(destination_table), destination
     )
     non_generated_columns = [dt[0] for dt in datatypes if not dt[2]]
+    updatable_columns = [dt[0] for dt in datatypes if not dt[2] and dt[3] != "a"]
     column_list = ", ".join('"' + col + '"' for col in non_generated_columns)
     always_generated_id = any(dt[3] == "a" for dt in datatypes)
     dest_table = fully_qualified_table(destination_table)
@@ -853,7 +861,7 @@ def _copy_metadata(destination_table, destination):
         _prefixed_identifier("_copy_staging_", destination_table)
     )
     return (
-        non_generated_columns,
+        updatable_columns,
         column_list,
         always_generated_id,
         dest_table,
@@ -918,13 +926,13 @@ def apply_staged(destination, destination_table, phase):
     is what lets new rows land under a live secondary unique index.
     """
     (
-        non_generated_columns,
+        updatable_columns,
         column_list,
         always_generated_id,
         dest_table,
         temp_table,
     ) = _copy_metadata(destination_table, destination)
-    conflict_clause, _ = _conflict_clause(destination_table, non_generated_columns)
+    conflict_clause, _ = _conflict_clause(destination_table, updatable_columns)
     # Classify rows by the delta identity, not _conflict_clause's upsert key:
     # the latter is None for identity-only tables (nothing to refresh, so the
     # clause is DO NOTHING), but the phase split still needs the key. The
@@ -966,7 +974,7 @@ def copy_rows_copy_protocol(
     # batch_size is accepted for interface parity with copy_rows (both are used
     # as self.__copy_rows) but is unused here: the COPY stream self-chunks.
     (
-        non_generated_columns,
+        updatable_columns,
         column_list,
         always_generated_id,
         dest_table,
@@ -1002,7 +1010,7 @@ def copy_rows_copy_protocol(
 
         if not direct_copy:
             conflict_clause, upsert_pk = _conflict_clause(
-                destination_table, non_generated_columns
+                destination_table, updatable_columns
             )
             if upsert_pk is not None:
                 # dedupe on the identity (an upsert cannot affect the same

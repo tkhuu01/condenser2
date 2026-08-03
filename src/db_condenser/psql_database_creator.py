@@ -84,17 +84,18 @@ class PsqlDatabaseCreator:
             self.run_psql(pre_data_sql)
 
     def teardown(self):
-        user_schemas = database_helper.get_specific_helper().list_all_user_schemas(
-            self.__source_db_connection
-        )
+        helper = database_helper.get_specific_helper()
+        user_schemas = helper.list_all_user_schemas(self.__source_db_connection)
 
         if len(user_schemas) == 0:
             raise Exception("Couldn't find any non system schemas.")
 
         drop_statements = [
+            'DROP SCHEMA IF EXISTS "{}" CASCADE'.format(helper.DELTA_SCHEMA)
+        ] + [
             'DROP SCHEMA IF EXISTS "{}" CASCADE'.format(s)
             for s in user_schemas
-            if s != "public"
+            if s not in ("public", helper.DELTA_SCHEMA)
         ]
 
         q = ";".join(drop_statements)
