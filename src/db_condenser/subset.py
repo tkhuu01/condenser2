@@ -291,9 +291,6 @@ class Subset:
     def prep_temp_dbs(self):
         self.__db_helper.prep_temp_dbs(self.__source_conn, self.__destination_conn)
         if self.__incremental:
-            self.__db_helper.validate_incremental_schemas(
-                self.__source_conn, self.__destination_conn
-            )
             relationships = self.__db_helper.get_unredacted_fk_relationships(
                 self.__all_tables, self.__source_conn
             )

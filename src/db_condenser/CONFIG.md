@@ -158,9 +158,11 @@ index live. Rows the run never re-reads keep their old values, and rows
 hard-deleted in the source are never removed — if a hard-deleted row blocks
 a unique index that a replacement row needs, the run fails with a unique
 violation and a `"recreate"` run is the fix.
-By default, the incremental identity is the table's primary key. A table with
-no primary key may use a unique index when it is valid, immediate, non-partial,
-non-expression, and all of its key columns are `NOT NULL` and non-generated.
+By default, the incremental identity is the table's primary key.
+`incremental_keys` applies only to tables without a primary key and cannot
+override a table's primary key. A table with no primary key may use a unique
+index when it is valid, immediate, non-partial, non-expression, and all of its
+key columns are `NOT NULL` and non-generated.
 If exactly one such unique key exists it is inferred. If several exist, select
 one explicitly with `incremental_keys`:
 

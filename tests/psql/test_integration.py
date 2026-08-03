@@ -1031,30 +1031,33 @@ def test_incremental_config_hash_canonicalizes_unordered_lists():
         {"table": "sales.other_history", "columns": ["owner_id", "version"]},
     ]
 
-    config_reader.config = config_reader._raw_dict_to_config(raw)
-    assert config_reader.config.passthrough_tables == [
-        "public.regions",
-        "public.feature_flags",
-    ]
-    helper = database_helper.get_specific_helper()
-    identity_map = {"sales.customers": ["id"]}
-    first_hash = helper._incremental_config_hash(identity_map)
+    try:
+        config_reader.config = config_reader._raw_dict_to_config(raw)
+        assert config_reader.config.passthrough_tables == [
+            "public.regions",
+            "public.feature_flags",
+        ]
+        helper = database_helper.get_specific_helper()
+        identity_map = {"sales.customers": ["id"]}
+        first_hash = helper._incremental_config_hash(identity_map)
 
-    raw["passthrough_tables"] = [
-        "public.feature_flags",
-        "public.regions",
-        "public.feature_flags",
-    ]
-    for name in (
-        "excluded_tables",
-        "dependency_breaks",
-        "fk_augmentation",
-        "incremental_keys",
-    ):
-        raw[name].reverse()
-    config_reader.config = config_reader._raw_dict_to_config(raw)
+        raw["passthrough_tables"] = [
+            "public.feature_flags",
+            "public.regions",
+            "public.feature_flags",
+        ]
+        for name in (
+            "excluded_tables",
+            "dependency_breaks",
+            "fk_augmentation",
+            "incremental_keys",
+        ):
+            raw[name].reverse()
+        config_reader.config = config_reader._raw_dict_to_config(raw)
 
-    assert helper._incremental_config_hash(identity_map) == first_hash
+        assert helper._incremental_config_hash(identity_map) == first_hash
+    finally:
+        config_reader.reset_config()
 
 
 # ============================================================
@@ -1369,6 +1372,53 @@ def test_incremental_preflight_rejects_unsafe_schemas(suffix, setup_sql, error):
         source_db, dest_db = _run_subsetter(**param)
         with pytest.raises(ValueError, match=error):
             _run_subsetter(**param, mode="grow")
+    finally:
+        _drop_test_databases(source_db, dest_db)
+
+
+def test_incremental_preflight_ignores_tables_outside_run_scope():
+    admin = _admin_conn()
+    version = int(_query_one(admin, "SHOW server_version_num"))
+    admin.close()
+    setup_sql = [
+        "CREATE TABLE public.unrelated_events (id INT PRIMARY KEY)",
+        "CREATE TABLE public.unrelated_events_archive ()"
+        " INHERITS (public.unrelated_events)",
+        "CREATE TABLE sales.excluded_triggered ("
+        " id INT PRIMARY KEY,"
+        " customer_id INT NOT NULL REFERENCES sales.customers(id))",
+        "CREATE FUNCTION sales.excluded_trigger_probe()"
+        " RETURNS trigger LANGUAGE plpgsql AS $$"
+        " BEGIN RETURN NEW; END $$",
+        "CREATE TRIGGER excluded_trigger_probe"
+        " BEFORE INSERT OR UPDATE ON sales.excluded_triggered"
+        " FOR EACH ROW EXECUTE FUNCTION sales.excluded_trigger_probe()",
+    ]
+    if version >= 180000:
+        setup_sql.extend(
+            [
+                "CREATE EXTENSION btree_gist",
+                "CREATE TABLE public.unrelated_temporal ("
+                " entity_id INT, valid_at daterange,"
+                " PRIMARY KEY (entity_id, valid_at WITHOUT OVERLAPS))",
+            ]
+        )
+
+    param = {
+        "use_temp_tables": False,
+        "use_copy_protocol": True,
+        "suffix_override": "_unrelated_unsafe",
+        "setup_sql": setup_sql,
+        "config_overrides": {
+            "keep_disconnected_tables": False,
+            "excluded_tables": ["sales.excluded_triggered"],
+        },
+    }
+    source_db = SOURCE_DB + "_unrelated_unsafe"
+    dest_db = DEST_DB + "_unrelated_unsafe"
+    try:
+        source_db, dest_db = _run_subsetter(**param)
+        _run_subsetter(**param, mode="grow")
     finally:
         _drop_test_databases(source_db, dest_db)
 

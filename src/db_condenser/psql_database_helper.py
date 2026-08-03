@@ -261,7 +261,7 @@ def _resolve_incremental_keys(conn, tables, configured_keys, database_label):
     return resolved
 
 
-def _validate_incremental_schema(conn, database_label, reject_triggers=False):
+def _validate_incremental_schema(conn, database_label, tables, reject_triggers=False):
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -274,8 +274,13 @@ def _validate_incremental_schema(conn, database_label, reject_triggers=False):
               JOIN pg_class child ON child.oid = inh.inhrelid
               JOIN pg_namespace cn ON cn.oid = child.relnamespace
              WHERE pn.nspname NOT IN ('pg_catalog', 'information_schema')
-               AND pn.nspname NOT LIKE 'pg\\_%'
-            """
+               AND pn.nspname NOT LIKE 'pg\\_%%'
+               AND (
+                   pn.nspname || '.' || parent.relname = ANY(%s)
+                   OR cn.nspname || '.' || child.relname = ANY(%s)
+               )
+            """,
+            (tables, tables),
         )
         inherited = cur.fetchall()
         if inherited:
@@ -304,7 +309,9 @@ def _validate_incremental_schema(conn, database_label, reject_triggers=False):
                   JOIN pg_namespace ns ON ns.oid = cl.relnamespace
                  WHERE con.conperiod
                    AND ns.nspname NOT IN ('pg_catalog', 'information_schema')
-                """
+                   AND ns.nspname || '.' || cl.relname = ANY(%s)
+                """,
+                (tables,),
             )
             temporal = cur.fetchone()
             if temporal:
@@ -328,8 +335,10 @@ def _validate_incremental_schema(conn, database_label, reject_triggers=False):
                    AND ns.nspname NOT IN (
                        'pg_catalog', 'information_schema', '_condenser'
                    )
+                   AND ns.nspname || '.' || cl.relname = ANY(%s)
                  LIMIT 1
-                """
+                """,
+                (tables,),
             )
             trigger = cur.fetchone()
             if trigger:
@@ -337,11 +346,6 @@ def _validate_incremental_schema(conn, database_label, reject_triggers=False):
                     "Incremental refresh cannot safely write {} while destination"
                     " trigger {} is enabled".format(trigger[0], trigger[1])
                 )
-
-
-def validate_incremental_schemas(source_conn, destination_conn):
-    _validate_incremental_schema(source_conn, "source")
-    _validate_incremental_schema(destination_conn, "destination", reject_triggers=True)
 
 
 def _incremental_config_hash(identity_map):
@@ -474,9 +478,9 @@ def prep_incremental(source_conn, destination_conn, tables):
     _secondary_unique_tables.clear()
     acquire_incremental_lock(destination_conn)
     try:
-        _validate_incremental_schema(source_conn, "source")
+        _validate_incremental_schema(source_conn, "source", tables)
         _validate_incremental_schema(
-            destination_conn, "destination", reject_triggers=True
+            destination_conn, "destination", tables, reject_triggers=True
         )
         configured_keys = {
             table: columns
