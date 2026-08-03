@@ -1216,21 +1216,15 @@ def test_multiple_unique_keys_require_explicit_identity():
         _drop_test_databases(source_db, dest_db)
 
 
-@pytest.mark.parametrize(
-    ("use_copy_protocol", "suffix"),
-    [(False, "_unique_inferred_rows"), (True, "_unique_inferred_copy")],
-)
-def test_single_unique_key_is_inferred_and_generated_columns_refresh(
-    use_copy_protocol, suffix
-):
+def test_single_unique_key_is_inferred_and_generated_columns_refresh():
     admin = _admin_conn()
     version = _query_one(admin, "SHOW server_version_num")
     admin.close()
     generated_kind = "VIRTUAL" if int(version) >= 180000 else "STORED"
     param = {
         "use_temp_tables": False,
-        "use_copy_protocol": use_copy_protocol,
-        "suffix_override": suffix,
+        "use_copy_protocol": True,
+        "suffix_override": "_unique_inferred",
         "setup_sql": [
             "CREATE TABLE sales.inferred_history ("
             " history_id INT NOT NULL UNIQUE,"
@@ -1244,17 +1238,10 @@ def test_single_unique_key_is_inferred_and_generated_columns_refresh(
             " doubled INT GENERATED ALWAYS AS (raw_value * 2) " + generated_kind + ")",
             "INSERT INTO sales.generated_values (id, customer_id, raw_value)"
             " VALUES (1, 6, 3)",
-            "CREATE TABLE sales.unique_identity_values ("
-            " generated_id INT GENERATED ALWAYS AS IDENTITY,"
-            " natural_key TEXT NOT NULL UNIQUE,"
-            " customer_id INT NOT NULL REFERENCES sales.customers(id),"
-            " payload TEXT NOT NULL)",
-            "INSERT INTO sales.unique_identity_values"
-            " (natural_key, customer_id, payload) VALUES ('existing', 6, 'old')",
         ],
     }
-    source_db = SOURCE_DB + suffix
-    dest_db = DEST_DB + suffix
+    source_db = SOURCE_DB + "_unique_inferred"
+    dest_db = DEST_DB + "_unique_inferred"
     try:
         source_db, dest_db = _run_subsetter(**param)
         source = psycopg.connect(
@@ -1271,14 +1258,6 @@ def test_single_unique_key_is_inferred_and_generated_columns_refresh(
             )
             cur.execute("INSERT INTO sales.inferred_history VALUES (601, 6, 'new')")
             cur.execute("UPDATE sales.generated_values SET raw_value = 4 WHERE id = 1")
-            cur.execute(
-                "UPDATE sales.unique_identity_values SET payload = 'refreshed'"
-                " WHERE natural_key = 'existing'"
-            )
-            cur.execute(
-                "INSERT INTO sales.unique_identity_values"
-                " (natural_key, customer_id, payload) VALUES ('new', 6, 'new')"
-            )
         source.commit()
         source.close()
 
@@ -1301,22 +1280,6 @@ def test_single_unique_key_is_inferred_and_generated_columns_refresh(
         assert (
             _query_one(dest, "SELECT doubled FROM sales.generated_values WHERE id = 1")
             == 8
-        )
-        assert (
-            _query_one(
-                dest,
-                "SELECT generated_id FROM sales.unique_identity_values"
-                " WHERE natural_key = 'existing' AND payload = 'refreshed'",
-            )
-            == 1
-        )
-        assert (
-            _query_one(
-                dest,
-                "SELECT generated_id FROM sales.unique_identity_values"
-                " WHERE natural_key = 'new' AND payload = 'new'",
-            )
-            == 2
         )
         dest.close()
     finally:
@@ -1358,6 +1321,18 @@ def test_single_unique_key_is_inferred_and_generated_columns_refresh(
                 "INSERT INTO sales.duplicate_arbiter_history VALUES (600, 6)",
             ],
             "also matches deferrable unique index",
+        ),
+        (
+            "_non_key_always_identity",
+            [
+                "CREATE TABLE sales.non_key_always_identity ("
+                " generated_id INT GENERATED ALWAYS AS IDENTITY,"
+                " natural_key TEXT NOT NULL UNIQUE,"
+                " customer_id INT NOT NULL REFERENCES sales.customers(id))",
+                "INSERT INTO sales.non_key_always_identity"
+                " (natural_key, customer_id) VALUES ('existing', 6)",
+            ],
+            "non-key GENERATED ALWAYS AS IDENTITY",
         ),
         (
             "_partitioned",
@@ -1668,9 +1643,16 @@ def test_fk_restore_rejects_same_name_with_different_definition():
         source_db, dest_db = _run_subsetter(**param)
         collision = (
             'ALTER TABLE sales.orders ADD CONSTRAINT "orders_customer_id_fkey"'
-            " CHECK (customer_id > 0)"
+            " FOREIGN KEY (warehouse_id) REFERENCES inventory.warehouses(id)"
         )
         with pytest.raises(RuntimeError, match="different definition"):
+            _run_subsetter(
+                **param,
+                mode="grow",
+                config_overrides={"post_subset_sql": [collision]},
+            )
+
+        with pytest.raises(RuntimeError, match="Retained foreign key definition"):
             _run_subsetter(
                 **param,
                 mode="grow",
@@ -1685,14 +1667,12 @@ def test_fk_restore_rejects_same_name_with_different_definition():
             port=DB_PORT,
         )
         assert _query_one(dest, "SELECT to_regnamespace('_condenser') IS NOT NULL")
-        assert (
-            _query_one(
-                dest,
-                "SELECT contype = 'c' FROM pg_constraint"
-                " WHERE conrelid = 'sales.orders'::regclass"
-                " AND conname = 'orders_customer_id_fkey'",
-            )
-            is True
+        assert _query_one(
+            dest,
+            "SELECT definition LIKE 'FOREIGN KEY (customer_id)%'"
+            " FROM _condenser.fk_backup WHERE schema_name = 'sales'"
+            " AND table_name = 'orders'"
+            " AND constraint_name = 'orders_customer_id_fkey'",
         )
         dest.close()
     finally:

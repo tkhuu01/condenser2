@@ -184,6 +184,7 @@ When `destination_mode` is `"topup"` or `"grow"` (PostgreSQL only; default is `"
 - Downstream subsetting (both modes) joins each child scan against the child's delta — including upsert-refreshed rows, since an update can repoint an FK column at a parent not yet present — so the missing-parent scan also costs O(new rows). Children with empty deltas are skipped; a parent whose children all have empty deltas is skipped entirely.
 - Top-up semantics: new initial-target matches and their descendants arrive; already-imported entities stay frozen (new children of old parents are not picked up). Grow semantics: frozen entities are unfrozen — new children/descendants of resident rows arrive too. Hard deletes never propagate in either mode.
 - `_resolve_incremental_keys` raises an error when an incremental table has neither a primary key nor an eligible unique key; it does not fall back to non-incremental behavior.
+- Incremental preflight rejects a `GENERATED ALWAYS AS IDENTITY` column outside the resolved identity because PostgreSQL cannot update it to the source's explicit value.
 
 ### Database Support
 - **PostgreSQL:** Full support including sequence reset, named cursors, JSON casting

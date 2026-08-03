@@ -261,6 +261,25 @@ def _resolve_incremental_keys(conn, tables, configured_keys, database_label):
     return resolved
 
 
+def _validate_incremental_identity_columns(conn, identity_map, database_label):
+    for table, identity in identity_map.items():
+        non_key_always_identities = [
+            column
+            for column, _, _, identity_kind in get_table_datatypes(
+                table_name(table), schema_name(table), conn
+            )
+            if identity_kind == "a" and column not in identity
+        ]
+        if non_key_always_identities:
+            raise ValueError(
+                "Incremental table {} has non-key GENERATED ALWAYS AS IDENTITY"
+                " column(s) {} in the {} database; PostgreSQL cannot refresh"
+                " these columns to their source values".format(
+                    table, ", ".join(non_key_always_identities), database_label
+                )
+            )
+
+
 def _validate_incremental_schema(conn, database_label, tables, reject_triggers=False):
     with conn.cursor() as cur:
         cur.execute(
@@ -503,6 +522,10 @@ def prep_incremental(source_conn, destination_conn, tables):
                 "Source and destination incremental identities differ for: "
                 + ", ".join(mismatched)
             )
+        _validate_incremental_identity_columns(source_conn, source_keys, "source")
+        _validate_incremental_identity_columns(
+            destination_conn, destination_keys, "destination"
+        )
 
         resume = _prepare_incremental_state(destination_conn, destination_keys)
         destination_indexes = _unique_index_metadata(destination_conn)
@@ -586,11 +609,25 @@ def drop_fk_constraints(conn):
         fks = cur.fetchall()
         for nsp, rel, name, defn in fks:
             cur.execute(
-                'INSERT INTO "{}"."fk_backup" VALUES (%s, %s, %s, %s)'
-                " ON CONFLICT (schema_name, table_name, constraint_name)"
-                " DO UPDATE SET definition = EXCLUDED.definition".format(DELTA_SCHEMA),
-                (nsp, rel, name, defn),
+                "SELECT definition FROM"
+                ' "{}"."fk_backup" WHERE schema_name = %s AND table_name = %s'
+                " AND constraint_name = %s".format(DELTA_SCHEMA),
+                (nsp, rel, name),
             )
+            retained = cur.fetchone()
+            if retained is None:
+                cur.execute(
+                    'INSERT INTO "{}"."fk_backup" VALUES (%s, %s, %s, %s)'.format(
+                        DELTA_SCHEMA
+                    ),
+                    (nsp, rel, name, defn),
+                )
+            elif retained[0] != defn:
+                raise RuntimeError(
+                    "Retained foreign key definition for {}.{} {} differs from"
+                    " the current constraint; remove the conflicting constraint"
+                    " before retrying".format(nsp, rel, name)
+                )
         cur.execute(
             "SELECT schema_name, table_name, constraint_name, definition FROM"
             ' "{}"."fk_backup" ORDER BY schema_name, table_name, constraint_name'.format(

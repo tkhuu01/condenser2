@@ -183,6 +183,9 @@ an explicit selection, and deferrable identity constraints fail before data is
 transferred. A deferrable unique constraint matching the same columns as an
 otherwise eligible identity is also rejected because PostgreSQL cannot use
 that column set as an `ON CONFLICT` arbiter.
+Tables with a `GENERATED ALWAYS AS IDENTITY` column outside the resolved
+incremental identity are also rejected because PostgreSQL cannot update that
+column to the source's explicit value.
 
 Incremental runs reject enabled destination user triggers, table inheritance,
 declarative partitioning, and PostgreSQL 18 temporal `PERIOD`/`WITHOUT
