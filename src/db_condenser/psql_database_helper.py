@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import uuid
 from dataclasses import asdict
@@ -35,15 +36,15 @@ def _conn_cache_key(conn):
 
 
 # Incremental state: when destination_mode is "topup" or "grow", each
-# destination table with a primary key gets a delta table in the _condenser
-# schema that records the PKs inserted during this run. Upstream subsetting
+# destination table gets a delta table in the _condenser schema keyed by its
+# primary key or selected unique identity. Upstream subsetting
 # (topup only) and downstream subsetting join against these deltas instead of
 # full tables, so re-runs cost O(new rows). Incremental inserts also upsert on
-# the PK so re-read rows refresh in place.
+# the selected identity so re-read rows refresh in place.
 DELTA_SCHEMA = "_condenser"
 _incremental_deltas: dict = {}
-# destination tables carrying a secondary unique index (or exclusion
-# constraint): their incremental copies need refreshes to land before
+# destination tables carrying a unique index beyond their selected identity
+# (or an exclusion constraint): their incremental copies need refreshes before
 # new-row inserts, so ctid-parallel splits run in two phases (stage_rows /
 # apply_staged with a barrier) instead of a single pass — page-range
 # workers can't order across connections. Populated by prep_incremental.
@@ -60,88 +61,528 @@ def _prefixed_identifier(prefix, qualified_table):
     return name
 
 
-def get_tables_primary_keys(tables, conn):
-    """Map each fully-qualified table to its ordered PK column list ([] if none)."""
+def _relation_map(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT ns.nspname || '.' || cl.relname, cl.relkind
+              FROM pg_class cl
+              JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+             WHERE ns.nspname NOT IN ('pg_catalog', 'information_schema')
+               AND ns.nspname NOT LIKE 'pg\\_%'
+            """
+        )
+        return dict(cur.fetchall())
+
+
+def _unique_index_metadata(conn):
     q = """
         SELECT ns.nspname || '.' || cl.relname,
+               idx.relname,
+               i.indisprimary,
+               i.indisvalid,
+               i.indisready,
+               i.indimmediate,
+               i.indpred IS NULL,
+               i.indexprs IS NULL,
+               i.indisexclusion,
                array_agg(att.attname ORDER BY x.ord)
+                   FILTER (WHERE x.ord <= i.indnkeyatts),
+               bool_and(COALESCE(att.attnotnull, false))
+                   FILTER (WHERE x.ord <= i.indnkeyatts),
+               bool_and(COALESCE(att.attgenerated = '', false))
+                   FILTER (WHERE x.ord <= i.indnkeyatts)
           FROM pg_index i
           JOIN pg_class cl ON cl.oid = i.indrelid
+          JOIN pg_class idx ON idx.oid = i.indexrelid
           JOIN pg_namespace ns ON ns.oid = cl.relnamespace
           JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS x(attnum, ord) ON true
-          JOIN pg_attribute att ON att.attrelid = cl.oid AND att.attnum = x.attnum
-         WHERE i.indisprimary
-         GROUP BY 1
+          LEFT JOIN pg_attribute att
+            ON att.attrelid = cl.oid AND att.attnum = x.attnum
+         WHERE i.indisunique OR i.indisprimary
+         GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9
     """
     with conn.cursor() as cur:
         cur.execute(q)
-        pk_map = dict(cur.fetchall())
-    return {t: pk_map.get(t, []) for t in tables}
-
-
-def prep_incremental(conn, tables):
-    _incremental_deltas.clear()
-    _secondary_unique_tables.clear()
-    with conn.cursor() as cur:
-        cur.execute('DROP SCHEMA IF EXISTS "{}" CASCADE'.format(DELTA_SCHEMA))
-        cur.execute('CREATE SCHEMA "{}"'.format(DELTA_SCHEMA))
-        cur.execute(
-            """
-            SELECT ns.nspname || '.' || cl.relname
-              FROM pg_index i
-              JOIN pg_class cl ON cl.oid = i.indrelid
-              JOIN pg_namespace ns ON ns.oid = cl.relnamespace
-             WHERE i.indisunique AND NOT i.indisprimary
-            UNION
-            SELECT ns.nspname || '.' || cl.relname
-              FROM pg_constraint con
-              JOIN pg_class cl ON cl.oid = con.conrelid
-              JOIN pg_namespace ns ON ns.oid = cl.relnamespace
-             WHERE con.contype = 'x'
-            """
+        rows = cur.fetchall()
+    metadata = {}
+    for row in rows:
+        metadata.setdefault(row[0], []).append(
+            {
+                "name": row[1],
+                "primary": row[2],
+                "valid": row[3],
+                "ready": row[4],
+                "immediate": row[5],
+                "non_partial": row[6],
+                "non_expression": row[7],
+                "exclusion": row[8],
+                "columns": list(row[9] or []),
+                "not_null": bool(row[10]),
+                "not_generated": bool(row[11]),
+            }
         )
-        _secondary_unique_tables.update(row[0] for row in cur.fetchall())
-    pk_map = get_tables_primary_keys(tables, conn)
-    no_pk = []
-    for t in tables:
-        pk = pk_map.get(t) or []
-        if not pk:
-            no_pk.append(t)
-            continue
-        name = _prefixed_identifier("new_ids_", t)
-        qualified = '"{}"."{}"'.format(DELTA_SCHEMA, name)
-        # _inserted distinguishes rows inserted this run from rows refreshed
-        # by an upsert: upstream (frozen) semantics join only inserted rows,
-        # downstream scans both since an update can repoint an FK column
-        q = (
-            "CREATE UNLOGGED TABLE {} AS SELECT {}, false AS _inserted"
-            " FROM {} WITH NO DATA".format(
-                qualified, columns_joined(pk), fully_qualified_table(t)
+    return metadata
+
+
+def get_tables_primary_keys(tables, conn):
+    """Map each fully-qualified table to its ordered PK column list ([] if none)."""
+    indexes = _unique_index_metadata(conn)
+    result = {}
+    for table in tables:
+        primary = next(
+            (index for index in indexes.get(table, []) if index["primary"]), None
+        )
+        result[table] = primary["columns"] if primary else []
+    return result
+
+
+def _eligible_identity(index):
+    return (
+        index["valid"]
+        and index["ready"]
+        and index["immediate"]
+        and index["non_partial"]
+        and index["non_expression"]
+        and not index["exclusion"]
+        and index["not_null"]
+        and index["not_generated"]
+        and bool(index["columns"])
+    )
+
+
+def _reject_deferrable_arbiter(table, indexes, identity, database_label):
+    deferrable = next(
+        (
+            index
+            for index in indexes
+            if index["valid"]
+            and index["ready"]
+            and not index["immediate"]
+            and index["non_partial"]
+            and index["non_expression"]
+            and len(index["columns"]) == len(identity)
+            and set(index["columns"]) == set(identity)
+        ),
+        None,
+    )
+    if deferrable is not None:
+        raise ValueError(
+            "Incremental identity ({}) on {} also matches deferrable unique index"
+            " {} in the {} database; PostgreSQL cannot use that column set as an"
+            " ON CONFLICT arbiter".format(
+                ", ".join(identity), table, deferrable["name"], database_label
             )
         )
-        with conn.cursor() as cur:
-            cur.execute(q)
-        _incremental_deltas[t] = (qualified, pk)
-    conn.commit()
-    if no_pk:
-        print(
-            "WARNING: tables without a primary key are processed"
-            " non-incrementally and may accumulate duplicate rows on re-runs: "
-            + ", ".join(no_pk)
+
+
+def _resolve_incremental_keys(conn, tables, configured_keys, database_label):
+    relations = _relation_map(conn)
+    indexes = _unique_index_metadata(conn)
+    resolved = {}
+    for table in tables:
+        if table not in relations:
+            raise ValueError(
+                "Incremental table {} does not exist in the {} database".format(
+                    table, database_label
+                )
+            )
+        if relations[table] != "r":
+            raise ValueError(
+                "Incremental table {} has unsupported relation kind {!r} in the {}"
+                " database".format(table, relations[table], database_label)
+            )
+
+        table_indexes = indexes.get(table, [])
+        primary = next((index for index in table_indexes if index["primary"]), None)
+        configured = configured_keys.get(table)
+        if primary is not None:
+            if not _eligible_identity(primary):
+                raise ValueError(
+                    "Primary key on {} cannot be used for incremental refresh; it"
+                    " must be valid, immediate, non-expression, non-partial, and"
+                    " backed by NOT NULL, non-generated columns".format(table)
+                )
+            if configured is not None and set(configured) != set(primary["columns"]):
+                raise ValueError(
+                    "incremental_keys cannot override the primary key on {}".format(
+                        table
+                    )
+                )
+            _reject_deferrable_arbiter(
+                table, table_indexes, primary["columns"], database_label
+            )
+            resolved[table] = primary["columns"]
+            continue
+
+        eligible_by_columns = {
+            tuple(index["columns"]): index
+            for index in table_indexes
+            if _eligible_identity(index)
+        }
+        if configured is not None:
+            match = next(
+                (
+                    columns
+                    for columns in eligible_by_columns
+                    if len(columns) == len(configured)
+                    and set(columns) == set(configured)
+                ),
+                None,
+            )
+            if match is None:
+                raise ValueError(
+                    "Configured incremental key for {} is not backed by a valid,"
+                    " immediate, non-partial, non-expression unique index whose"
+                    " columns are all NOT NULL and non-generated in the {}"
+                    " database".format(table, database_label)
+                )
+            identity = configured
+        elif len(eligible_by_columns) == 1:
+            identity = list(next(iter(eligible_by_columns)))
+        elif not eligible_by_columns:
+            raise ValueError(
+                "Incremental table {} has no primary key or eligible unique key;"
+                " add a primary key or configure a NOT NULL unique identity".format(
+                    table
+                )
+            )
+        else:
+            candidates = ", ".join(
+                "({})".format(", ".join(columns))
+                for columns in sorted(eligible_by_columns)
+            )
+            raise ValueError(
+                "Incremental table {} has multiple eligible unique keys: {};"
+                " select one with incremental_keys".format(table, candidates)
+            )
+        _reject_deferrable_arbiter(table, table_indexes, identity, database_label)
+        resolved[table] = identity
+    return resolved
+
+
+def _validate_incremental_identity_columns(conn, identity_map, database_label):
+    for table, identity in identity_map.items():
+        non_key_always_identities = [
+            column
+            for column, _, _, identity_kind in get_table_datatypes(
+                table_name(table), schema_name(table), conn
+            )
+            if identity_kind == "a" and column not in identity
+        ]
+        if non_key_always_identities:
+            raise ValueError(
+                "Incremental table {} has non-key GENERATED ALWAYS AS IDENTITY"
+                " column(s) {} in the {} database; PostgreSQL cannot refresh"
+                " these columns to their source values".format(
+                    table, ", ".join(non_key_always_identities), database_label
+                )
+            )
+
+
+def _validate_incremental_schema(conn, database_label, tables, reject_triggers=False):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT pn.nspname || '.' || parent.relname,
+                   cn.nspname || '.' || child.relname,
+                   child.relispartition
+              FROM pg_inherits inh
+              JOIN pg_class parent ON parent.oid = inh.inhparent
+              JOIN pg_namespace pn ON pn.oid = parent.relnamespace
+              JOIN pg_class child ON child.oid = inh.inhrelid
+              JOIN pg_namespace cn ON cn.oid = child.relnamespace
+             WHERE pn.nspname NOT IN ('pg_catalog', 'information_schema')
+               AND pn.nspname NOT LIKE 'pg\\_%%'
+               AND (
+                   pn.nspname || '.' || parent.relname = ANY(%s)
+                   OR cn.nspname || '.' || child.relname = ANY(%s)
+               )
+            """,
+            (tables, tables),
         )
+        inherited = cur.fetchall()
+        if inherited:
+            parent, child, is_partition = inherited[0]
+            kind = "partitioning" if is_partition else "table inheritance"
+            raise ValueError(
+                "Incremental refresh does not support {} in the {} database"
+                " ({} -> {})".format(kind, database_label, parent, child)
+            )
+
+        cur.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM pg_attribute
+                 WHERE attrelid = 'pg_constraint'::regclass
+                   AND attname = 'conperiod'
+            )
+            """
+        )
+        if cur.fetchone()[0]:
+            cur.execute(
+                """
+                SELECT ns.nspname || '.' || cl.relname, con.conname
+                  FROM pg_constraint con
+                  JOIN pg_class cl ON cl.oid = con.conrelid
+                  JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+                 WHERE con.conperiod
+                   AND ns.nspname NOT IN ('pg_catalog', 'information_schema')
+                   AND ns.nspname || '.' || cl.relname = ANY(%s)
+                """,
+                (tables,),
+            )
+            temporal = cur.fetchone()
+            if temporal:
+                raise ValueError(
+                    "PostgreSQL temporal constraint {} on {} is not supported by"
+                    " the PostgreSQL 14+ incremental refresh contract".format(
+                        temporal[1], temporal[0]
+                    )
+                )
+
+        if reject_triggers:
+            cur.execute(
+                """
+                SELECT ns.nspname || '.' || cl.relname, trg.tgname
+                  FROM pg_trigger trg
+                  JOIN pg_class cl ON cl.oid = trg.tgrelid
+                  JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+                 WHERE NOT trg.tgisinternal
+                   AND trg.tgenabled <> 'D'
+                   AND (trg.tgtype & 60) <> 0
+                   AND ns.nspname NOT IN (
+                       'pg_catalog', 'information_schema', '_condenser'
+                   )
+                   AND ns.nspname || '.' || cl.relname = ANY(%s)
+                 LIMIT 1
+                """,
+                (tables,),
+            )
+            trigger = cur.fetchone()
+            if trigger:
+                raise ValueError(
+                    "Incremental refresh cannot safely write {} while destination"
+                    " trigger {} is enabled".format(trigger[0], trigger[1])
+                )
+
+
+def _incremental_config_hash(identity_map):
+    raw = asdict(get_config())
+    for name in ("source_db_connection_info", "destination_db_connection_info"):
+        raw[name].pop("password", None)
+    for name in ("excluded_tables", "passthrough_tables"):
+        raw[name] = sorted(set(raw[name]))
+    for name in ("dependency_breaks", "fk_augmentation", "incremental_keys"):
+        raw[name] = sorted(raw[name], key=lambda item: json.dumps(item, sort_keys=True))
+    raw["resolved_incremental_keys"] = {
+        table: identity_map[table] for table in sorted(identity_map)
+    }
+    payload = json.dumps(raw, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def acquire_incremental_lock(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT pg_try_advisory_lock("
+            "hashtextextended(current_database() || ':db-condenser:incremental', 0))"
+        )
+        acquired = cur.fetchone()[0]
+    if not acquired:
+        raise RuntimeError(
+            "Another incremental db-condenser run is active for this destination"
+        )
+
+
+def release_incremental_lock(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT pg_advisory_unlock("
+            "hashtextextended(current_database() || ':db-condenser:incremental', 0))"
+        )
+
+
+def _prepare_incremental_state(conn, identity_map):
+    config_hash = _incremental_config_hash(identity_map)
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regnamespace(%s)", (DELTA_SCHEMA,))
+        schema_exists = cur.fetchone()[0] is not None
+        if not schema_exists:
+            cur.execute('CREATE SCHEMA "{}"'.format(DELTA_SCHEMA))
+            cur.execute(
+                'CREATE TABLE "{}"."run_state" (config_hash text NOT NULL)'.format(
+                    DELTA_SCHEMA
+                )
+            )
+            cur.execute(
+                'INSERT INTO "{}"."run_state" VALUES (%s)'.format(DELTA_SCHEMA),
+                (config_hash,),
+            )
+            cur.execute(
+                'CREATE TABLE "{}"."fk_backup" ('
+                "schema_name text NOT NULL, table_name text NOT NULL, "
+                "constraint_name text NOT NULL, definition text NOT NULL, "
+                "PRIMARY KEY (schema_name, table_name, constraint_name))".format(
+                    DELTA_SCHEMA
+                )
+            )
+            return False
+
+        cur.execute(
+            "SELECT to_regclass(%s)",
+            ('"{}"."run_state"'.format(DELTA_SCHEMA),),
+        )
+        if cur.fetchone()[0] is None:
+            raise RuntimeError(
+                "Reserved schema _condenser exists without incremental run metadata;"
+                " move or remove it before retrying"
+            )
+        cur.execute('SELECT config_hash FROM "{}"."run_state"'.format(DELTA_SCHEMA))
+        rows = cur.fetchall()
+        if len(rows) != 1 or rows[0][0] != config_hash:
+            raise RuntimeError(
+                "Retained incremental journal was created with a different"
+                " configuration or row identity; resume with the original"
+                " configuration or perform a recreate run"
+            )
+    return True
+
+
+def _prepare_delta_table(conn, table, key, resume):
+    name = _prefixed_identifier("new_ids_", table)
+    qualified = '"{}"."{}"'.format(DELTA_SCHEMA, name)
+    if resume:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass(%s)", (qualified,))
+            if cur.fetchone()[0] is None:
+                raise RuntimeError(
+                    "Retained incremental journal is missing the delta for {}".format(
+                        table
+                    )
+                )
+            cur.execute(
+                "SELECT attname FROM pg_attribute"
+                " WHERE attrelid = %s::regclass AND attnum > 0 AND NOT attisdropped"
+                " ORDER BY attnum",
+                (qualified,),
+            )
+            columns = [row[0] for row in cur.fetchall()]
+        if columns != key + ["_inserted"]:
+            raise RuntimeError(
+                "Retained incremental delta for {} has incompatible columns".format(
+                    table
+                )
+            )
+        return qualified
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "CREATE TABLE {} AS SELECT {}, false AS _inserted"
+            " FROM {} WITH NO DATA".format(
+                qualified, columns_joined(key), fully_qualified_table(table)
+            )
+        )
+        cur.execute(
+            "ALTER TABLE {} ADD PRIMARY KEY ({})".format(qualified, columns_joined(key))
+        )
+        cur.execute(
+            'ALTER TABLE {} ALTER COLUMN "_inserted" SET NOT NULL'.format(qualified)
+        )
+    return qualified
+
+
+def prep_incremental(source_conn, destination_conn, tables):
+    _incremental_deltas.clear()
+    _secondary_unique_tables.clear()
+    acquire_incremental_lock(destination_conn)
+    try:
+        _validate_incremental_schema(source_conn, "source", tables)
+        _validate_incremental_schema(
+            destination_conn, "destination", tables, reject_triggers=True
+        )
+        configured_keys = {
+            table: columns
+            for table, columns in get_config().incremental_key_map.items()
+            if table in tables
+        }
+        source_keys = _resolve_incremental_keys(
+            source_conn, tables, configured_keys, "source"
+        )
+        destination_keys = _resolve_incremental_keys(
+            destination_conn, tables, configured_keys, "destination"
+        )
+        mismatched = [
+            table
+            for table in tables
+            if set(source_keys[table]) != set(destination_keys[table])
+        ]
+        if mismatched:
+            raise ValueError(
+                "Source and destination incremental identities differ for: "
+                + ", ".join(mismatched)
+            )
+        _validate_incremental_identity_columns(source_conn, source_keys, "source")
+        _validate_incremental_identity_columns(
+            destination_conn, destination_keys, "destination"
+        )
+
+        resume = _prepare_incremental_state(destination_conn, destination_keys)
+        destination_indexes = _unique_index_metadata(destination_conn)
+        for table in tables:
+            identity = destination_keys[table]
+            if any(
+                not index["primary"]
+                and not (
+                    _eligible_identity(index)
+                    and len(index["columns"]) == len(identity)
+                    and set(index["columns"]) == set(identity)
+                )
+                for index in destination_indexes.get(table, [])
+            ):
+                _secondary_unique_tables.add(table)
+        with destination_conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT ns.nspname || '.' || cl.relname
+                  FROM pg_constraint con
+                  JOIN pg_class cl ON cl.oid = con.conrelid
+                  JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+                 WHERE con.contype = 'x'
+                """
+            )
+            _secondary_unique_tables.update(row[0] for row in cur.fetchall())
+        for table in tables:
+            key = destination_keys[table]
+            qualified = _prepare_delta_table(destination_conn, table, key, resume)
+            _incremental_deltas[table] = (qualified, key)
+        destination_conn.commit()
+    except BaseException:
+        destination_conn.connection.rollback()
+        release_incremental_lock(destination_conn)
+        raise
 
 
 def unprep_incremental(conn):
     _incremental_deltas.clear()
     _secondary_unique_tables.clear()
-    with conn.cursor() as cur:
-        cur.execute('DROP SCHEMA IF EXISTS "{}" CASCADE'.format(DELTA_SCHEMA))
-    conn.commit()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('DROP SCHEMA IF EXISTS "{}" CASCADE'.format(DELTA_SCHEMA))
+        conn.commit()
+    finally:
+        release_incremental_lock(conn)
+
+
+def retain_incremental(conn):
+    """Leave the durable journal in place after a failed run, then unlock."""
+    _incremental_deltas.clear()
+    _secondary_unique_tables.clear()
+    release_incremental_lock(conn)
 
 
 def has_secondary_unique(table):
-    """True when the destination table has a unique index beyond its PK
-    (or an exclusion constraint), so incremental copy order matters."""
+    """True when the table has uniqueness beyond its incremental identity."""
     return table in _secondary_unique_tables
 
 
@@ -166,13 +607,42 @@ def drop_fk_constraints(conn):
     with conn.cursor() as cur:
         cur.execute(q)
         fks = cur.fetchall()
+        for nsp, rel, name, defn in fks:
+            cur.execute(
+                "SELECT definition FROM"
+                ' "{}"."fk_backup" WHERE schema_name = %s AND table_name = %s'
+                " AND constraint_name = %s".format(DELTA_SCHEMA),
+                (nsp, rel, name),
+            )
+            retained = cur.fetchone()
+            if retained is None:
+                cur.execute(
+                    'INSERT INTO "{}"."fk_backup" VALUES (%s, %s, %s, %s)'.format(
+                        DELTA_SCHEMA
+                    ),
+                    (nsp, rel, name, defn),
+                )
+            elif retained[0] != defn:
+                raise RuntimeError(
+                    "Retained foreign key definition for {}.{} {} differs from"
+                    " the current constraint; remove the conflicting constraint"
+                    " before retrying".format(nsp, rel, name)
+                )
+        cur.execute(
+            "SELECT schema_name, table_name, constraint_name, definition FROM"
+            ' "{}"."fk_backup" ORDER BY schema_name, table_name, constraint_name'.format(
+                DELTA_SCHEMA
+            )
+        )
+        all_fks = cur.fetchall()
+    conn.commit()
 
-    if fks:
+    if all_fks:
         backup_dir = os.path.join(os.getcwd(), "SQL")
         os.makedirs(backup_dir, exist_ok=True)
         backup_path = os.path.join(backup_dir, "incremental_fk_backup.sql")
         with open(backup_path, "w") as fp:
-            for nsp, rel, name, defn in fks:
+            for nsp, rel, name, defn in all_fks:
                 fp.write(
                     'ALTER TABLE "{}"."{}" ADD CONSTRAINT "{}" {};\n'.format(
                         nsp, rel, name, defn
@@ -185,22 +655,47 @@ def drop_fk_constraints(conn):
                 'ALTER TABLE "{}"."{}" DROP CONSTRAINT "{}"'.format(nsp, rel, name)
             )
     conn.commit()
-    return fks
+    return all_fks
 
 
 def restore_fk_constraints(conn, fks):
-    with conn.cursor() as cur:
-        for nsp, rel, name, defn in fks:
-            cur.execute(
-                'ALTER TABLE "{}"."{}" ADD CONSTRAINT "{}" {}'.format(
-                    nsp, rel, name, defn
+    try:
+        with conn.cursor() as cur:
+            for nsp, rel, name, defn in fks:
+                cur.execute(
+                    """
+                    SELECT con.contype, pg_get_constraintdef(con.oid)
+                      FROM pg_constraint con
+                      JOIN pg_class cl ON cl.oid = con.conrelid
+                      JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+                     WHERE ns.nspname = %s
+                       AND cl.relname = %s
+                       AND con.conname = %s
+                    """,
+                    (nsp, rel, name),
                 )
-            )
-    conn.commit()
+                existing = cur.fetchone()
+                if existing is None:
+                    cur.execute(
+                        'ALTER TABLE "{}"."{}" ADD CONSTRAINT "{}" {}'.format(
+                            nsp, rel, name, defn
+                        )
+                    )
+                elif existing != ("f", defn):
+                    raise RuntimeError(
+                        "Cannot restore foreign key {}.{} {}; an existing"
+                        " constraint with that name has a different definition".format(
+                            nsp, rel, name
+                        )
+                    )
+        conn.commit()
+    except BaseException:
+        conn.connection.rollback()
+        raise
 
 
 def delta_for(table):
-    """Return (qualified_delta_table, pk_columns) or None."""
+    """Return (qualified_delta_table, identity_columns) or None."""
     return _incremental_deltas.get(table)
 
 
@@ -208,23 +703,29 @@ def _wrap_insert_with_delta(insert_query, destination_table):
     delta = _incremental_deltas.get(destination_table)
     if not delta:
         return insert_query
-    qualified, pk = delta
+    qualified, identity = delta
     # upserts RETURN updated rows too; xmax = 0 identifies genuine inserts
     # (updates whose values were unchanged are skipped by the upsert guard
     # and don't appear at all)
     return (
         "WITH ins AS ({} RETURNING {}, (xmax = 0) AS _inserted)"
-        " INSERT INTO {} SELECT {}, _inserted FROM ins".format(
-            insert_query, columns_joined(pk), qualified, columns_joined(pk)
+        " INSERT INTO {} AS _delta SELECT {}, _inserted FROM ins"
+        " ON CONFLICT ({}) DO UPDATE SET _inserted ="
+        " _delta._inserted OR EXCLUDED._inserted".format(
+            insert_query,
+            columns_joined(identity),
+            qualified,
+            columns_joined(identity),
+            columns_joined(identity),
         )
     )
 
 
-def _conflict_clause(destination_table, insert_columns):
+def _conflict_clause(destination_table, update_columns):
     """ON CONFLICT clause for destination inserts. Incremental runs upsert on
-    the PK so re-read rows refresh in place; the IS DISTINCT FROM guard skips
-    rows whose values are unchanged. Recreate runs (no deltas registered) and
-    untracked (no-PK) tables keep DO NOTHING.
+    the selected identity so re-read rows refresh in place; the guard skips
+    rows whose values are unchanged. Recreate runs and tables outside the
+    incremental traversal (no delta registered) keep DO NOTHING.
 
     Returns (clause, pk_columns); pk_columns is None unless upserting.
     Upsert clauses reference the insert target via the alias _dest.
@@ -232,18 +733,18 @@ def _conflict_clause(destination_table, insert_columns):
     delta = _incremental_deltas.get(destination_table)
     if not delta:
         return " ON CONFLICT DO NOTHING", None
-    _, pk = delta
-    non_pk = [c for c in insert_columns if c not in pk]
-    if not non_pk:
+    _, identity = delta
+    non_identity = [c for c in update_columns if c not in identity]
+    if not non_identity:
         return " ON CONFLICT DO NOTHING", None
-    sets = ", ".join('"{0}" = EXCLUDED."{0}"'.format(c) for c in non_pk)
-    dest_row = ", ".join('_dest."{}"'.format(c) for c in non_pk)
-    excl_row = ", ".join('EXCLUDED."{}"'.format(c) for c in non_pk)
+    sets = ", ".join('"{0}" = EXCLUDED."{0}"'.format(c) for c in non_identity)
+    dest_row = ", ".join('_dest."{}"'.format(c) for c in non_identity)
+    excl_row = ", ".join('EXCLUDED."{}"'.format(c) for c in non_identity)
     return (
         " ON CONFLICT ({}) DO UPDATE SET {} WHERE ({}) IS DISTINCT FROM ({})".format(
-            columns_joined(pk), sets, dest_row, excl_row
+            columns_joined(identity), sets, dest_row, excl_row
         ),
-        pk,
+        identity,
     )
 
 
@@ -273,9 +774,10 @@ def copy_rows(
         batch_size = compute_batch_size(len(datatypes))
 
     non_generated_columns = [
-        (dt[0], dt[1]) for _, dt in enumerate(datatypes) if dt[2] != "s"
+        (dt[0], dt[1]) for _, dt in enumerate(datatypes) if not dt[2]
     ]
-    generated_columns_positions = {i for i, dt in enumerate(datatypes) if "s" in dt[2]}
+    updatable_columns = [dt[0] for dt in datatypes if not dt[2] and dt[3] != "a"]
+    generated_columns_positions = {i for i, dt in enumerate(datatypes) if dt[2]}
     always_generated_id = any([dt[3] == "a" for dt in datatypes])
 
     def template_piece(dt):
@@ -318,7 +820,7 @@ def copy_rows(
         cursor.execute(query, params)
 
         conflict_clause, upsert_pk = _conflict_clause(
-            destination_table, [dt[0] for dt in non_generated_columns]
+            destination_table, updatable_columns
         )
         if upsert_pk is not None:
             # incremental upsert: per-batch ordering cannot cover a
@@ -385,7 +887,8 @@ def _copy_metadata(destination_table, destination):
     datatypes = get_table_datatypes(
         table_name(destination_table), schema_name(destination_table), destination
     )
-    non_generated_columns = [dt[0] for dt in datatypes if dt[2] != "s"]
+    non_generated_columns = [dt[0] for dt in datatypes if not dt[2]]
+    updatable_columns = [dt[0] for dt in datatypes if not dt[2] and dt[3] != "a"]
     column_list = ", ".join('"' + col + '"' for col in non_generated_columns)
     always_generated_id = any(dt[3] == "a" for dt in datatypes)
     dest_table = fully_qualified_table(destination_table)
@@ -395,7 +898,7 @@ def _copy_metadata(destination_table, destination):
         _prefixed_identifier("_copy_staging_", destination_table)
     )
     return (
-        non_generated_columns,
+        updatable_columns,
         column_list,
         always_generated_id,
         dest_table,
@@ -452,7 +955,7 @@ def stage_rows(source, destination, query, destination_table, params=None):
 def apply_staged(destination, destination_table, phase):
     """Two-phase parallel copy, step 2: apply this session's staged rows.
 
-    phase='refresh' upserts only rows whose PKs already exist (any order is
+    phase='refresh' upserts only rows whose identities already exist (any order is
     safe: each refresh moves its own row toward the source's valid state);
     phase='insert' adds the remaining rows and clears the staging table.
     Callers must run every worker's refresh phase to completion (and commit,
@@ -460,15 +963,15 @@ def apply_staged(destination, destination_table, phase):
     is what lets new rows land under a live secondary unique index.
     """
     (
-        non_generated_columns,
+        updatable_columns,
         column_list,
         always_generated_id,
         dest_table,
         temp_table,
     ) = _copy_metadata(destination_table, destination)
-    conflict_clause, _ = _conflict_clause(destination_table, non_generated_columns)
-    # classify rows by the delta's PK, not _conflict_clause's upsert_pk: the
-    # latter is None for all-PK-column tables (nothing to refresh, so the
+    conflict_clause, _ = _conflict_clause(destination_table, updatable_columns)
+    # Classify rows by the delta identity, not _conflict_clause's upsert key:
+    # the latter is None for identity-only tables (nothing to refresh, so the
     # clause is DO NOTHING), but the phase split still needs the key. The
     # two-phase caller gate guarantees the delta exists.
     _, pk = _incremental_deltas[destination_table]
@@ -508,7 +1011,7 @@ def copy_rows_copy_protocol(
     # batch_size is accepted for interface parity with copy_rows (both are used
     # as self.__copy_rows) but is unused here: the COPY stream self-chunks.
     (
-        non_generated_columns,
+        updatable_columns,
         column_list,
         always_generated_id,
         dest_table,
@@ -544,10 +1047,10 @@ def copy_rows_copy_protocol(
 
         if not direct_copy:
             conflict_clause, upsert_pk = _conflict_clause(
-                destination_table, non_generated_columns
+                destination_table, updatable_columns
             )
             if upsert_pk is not None:
-                # dedupe on the PK (an upsert statement cannot affect the same
+                # dedupe on the identity (an upsert cannot affect the same
                 # row twice), then arbitrate refreshes of existing rows before
                 # new-row inserts: a new row may only satisfy a secondary
                 # unique index (e.g. one active history row per entity) once

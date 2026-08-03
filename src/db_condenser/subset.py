@@ -54,17 +54,28 @@ class Subset:
         destination_dbc: DbConnect,
         all_tables: list[str],
     ):
+        self.config = get_config()
+        self.__all_tables = all_tables
+        self.__incremental = (
+            self.config.is_incremental and self.config.db_type == DbType.POSTGRES
+        )
+        unknown_incremental_keys = set(self.config.incremental_key_map) - set(
+            self.__all_tables
+        )
+        if self.__incremental and unknown_incremental_keys:
+            raise ValueError(
+                "incremental_keys references unknown or excluded tables: "
+                + ", ".join(sorted(unknown_incremental_keys))
+            )
+
         self.__source_dbc = source_dbc
         self.__destination_dbc = destination_dbc
         self.__source_conn = source_dbc.get_db_connection(read_repeatable=True)
         self.__destination_conn = destination_dbc.get_db_connection()
 
-        self.__all_tables = all_tables
-
         self.__db_helper = database_helper.get_specific_helper()
 
         self.__db_helper.turn_off_constraints(self.__destination_conn)
-        self.config = get_config()
 
         if self.config.use_copy_protocol and self.config.db_type == DbType.POSTGRES:
             self.__copy_rows = self.__db_helper.copy_rows_copy_protocol
@@ -74,12 +85,8 @@ class Subset:
         if self.config.use_temp_tables:
             self.__check_source_writable()
 
-        # topup/grow mean the destination already exists: track PKs inserted
-        # this run in per-table delta tables and drop/restore FKs around the
-        # run
-        self.__incremental = (
-            self.config.is_incremental and self.config.db_type == DbType.POSTGRES
-        )
+        # topup/grow mean the destination already exists: track selected row
+        # identities in per-table delta tables and drop/restore FKs around the run
         # topup restricts upstream parent ID reads to this run's deltas
         # (already-imported entities stay frozen); grow reads full destination
         # parent ID sets so new source children of old parents are picked up
@@ -87,6 +94,7 @@ class Subset:
             self.__incremental and self.config.destination_mode == DestinationMode.TOPUP
         )
         self.__dropped_fks = []
+        self.__incremental_prepared = False
 
         # export one snapshot from the main source connection; every other
         # source connection imports it so all reads see the database as of
@@ -283,29 +291,48 @@ class Subset:
     def prep_temp_dbs(self):
         self.__db_helper.prep_temp_dbs(self.__source_conn, self.__destination_conn)
         if self.__incremental:
-            self.__db_helper.prep_incremental(
-                self.__destination_conn, self.__all_tables
+            relationships = self.__db_helper.get_unredacted_fk_relationships(
+                self.__all_tables, self.__source_conn
             )
+            disconnected = compute_disconnected_tables(
+                self.config.initial_target_tables,
+                self.config.passthrough_tables,
+                self.__all_tables,
+                relationships,
+            )
+            incremental_tables = self.__all_tables
+            if not self.config.keep_disconnected_tables:
+                incremental_tables = [
+                    table for table in self.__all_tables if table not in disconnected
+                ]
+            self.__db_helper.prep_incremental(
+                self.__source_conn, self.__destination_conn, incremental_tables
+            )
+            self.__incremental_prepared = True
             # constraints are live on an existing destination, but middle-out
             # load order inserts referencing rows before referenced ones
             self.__dropped_fks = self.__db_helper.drop_fk_constraints(
                 self.__destination_conn
             )
 
-    def unprep_temp_dbs(self):
+    def unprep_temp_dbs(self, succeeded=True):
         self.__db_helper.unprep_temp_dbs(self.__source_conn, self.__destination_conn)
-        if self.__incremental:
-            self.__db_helper.unprep_incremental(self.__destination_conn)
+        if self.__incremental_prepared:
             try:
+                self.__destination_conn.connection.rollback()
                 self.__db_helper.restore_fk_constraints(
                     self.__destination_conn, self.__dropped_fks
                 )
-            except Exception as ex:
-                print(
-                    "WARNING: failed to restore destination FK constraints ({})."
-                    " Definitions were saved to SQL/incremental_fk_backup.sql;"
-                    " re-apply them manually once the data is consistent.".format(ex)
-                )
+                if succeeded:
+                    self.__db_helper.unprep_incremental(self.__destination_conn)
+                else:
+                    self.__db_helper.retain_incremental(self.__destination_conn)
+            except BaseException:
+                self.__destination_conn.connection.rollback()
+                self.__db_helper.retain_incremental(self.__destination_conn)
+                raise
+            finally:
+                self.__incremental_prepared = False
 
     def close_connections(self):
         self.__source_conn.close()
@@ -500,13 +527,13 @@ class Subset:
             return False
         # incremental upserts rely on refreshes landing before new-row
         # inserts (see _conflict_clause), and page-range workers give no
-        # cross-worker ordering. Tables with a unique index beyond the PK
+        # cross-worker ordering. Tables with uniqueness beyond their identity
         # split in two phases instead: every worker stages its rows and
         # applies its refreshes, all workers meet at a barrier, then the
         # inserts run — same guarantee as a sequential copy, full worker
-        # count. Needs the staging machinery and a PK-tracked delta;
-        # otherwise fall back to the sequential path. PK-only tables keep
-        # the single-pass split: ON CONFLICT arbitrates PK collisions
+        # count. Needs the staging machinery and an identity-tracked delta;
+        # otherwise fall back to the sequential path. Identity-only tables
+        # keep the single-pass split: ON CONFLICT arbitrates collisions
         # regardless of order.
         two_phase = False
         if self.__incremental and self.__db_helper.has_secondary_unique(table):
@@ -741,10 +768,8 @@ class Subset:
         - delta_plan: {parent_table: (delta_table, pk_cols)} for parents with
           rows inserted this run (upserted rows don't count: their children
           were already considered when they first arrived). None means full
-          (non-incremental) behavior, either because this run doesn't
-          delta-restrict upstream reads (recreate, or grow which scans all
-          resident parents) or a parent has no PK so its inserts weren't
-          tracked.
+          (non-incremental) behavior because this run doesn't delta-restrict
+          upstream reads (recreate, or grow which scans all resident parents).
         """
         if not self.__upstream_delta_reads:
             return False, None
@@ -769,7 +794,7 @@ class Subset:
         """Build the destination-side query for a parent's referenced columns.
 
         With a delta plan entry for the parent, reads only the rows added this
-        run (parent joined to its delta table on PK); otherwise the full table.
+        run (joined to its delta table on row identity); otherwise the full table.
         """
         qualified = fully_qualified_table(mysql_db_name_hack(kc_target, dest_conn))
         delta = delta_plan.get(kc_target) if delta_plan else None
@@ -792,9 +817,9 @@ class Subset:
         Returns (skip, child_plan):
         - skip=True: every referencing child tracked a delta and all are
           empty, so no row inserted this run can reference a missing parent
-        - child_plan: {fk_table: (delta_table, pk_cols) or None}. None means
-          scan the child fully (no PK, its inserts weren't tracked); a child
-          with an empty delta is left out entirely (nothing new to scan).
+        - child_plan: {fk_table: (delta_table, identity_cols) or None}. None
+          means scan the child fully; a child with an empty delta is left out
+          entirely (nothing new to scan).
           child_plan=None means full (non-incremental) behavior.
 
         Unlike upstream, children contribute missing-parent IDs independently

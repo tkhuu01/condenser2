@@ -40,6 +40,19 @@ def _query_one(conn, sql):
         return cur.fetchone()[0]
 
 
+def _drop_test_databases(*databases):
+    admin = _admin_conn()
+    with admin.cursor() as cur:
+        for database in databases:
+            cur.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid()",
+                (database,),
+            )
+            cur.execute(f"DROP DATABASE IF EXISTS {database}")
+    admin.close()
+
+
 def _run_subsetter(
     use_temp_tables: bool,
     use_copy_protocol: bool = False,
@@ -48,6 +61,7 @@ def _run_subsetter(
     parallel_read_workers: int = 1,
     config_overrides: dict | None = None,
     setup_sql: list[str] | None = None,
+    reset_databases: bool = True,
 ) -> tuple[str, str]:
     if suffix_override is not None:
         suffix = suffix_override
@@ -57,7 +71,7 @@ def _run_subsetter(
     dest_db = DEST_DB + suffix
 
     fresh = mode == "recreate"
-    if fresh:
+    if fresh and reset_databases:
         admin = _admin_conn()
         with admin.cursor() as cur:
             cur.execute(f"DROP DATABASE IF EXISTS {source_db}")
@@ -102,6 +116,7 @@ def _run_subsetter(
     all_tables = [x for x in all_tables if x not in config.excluded_tables]
 
     subsetter = Subset(source_dbc, destination_dbc, all_tables)
+    succeeded = False
     try:
         subsetter.prep_temp_dbs()
         subsetter.run_middle_out()
@@ -119,9 +134,12 @@ def _run_subsetter(
         dest_conn = destination_dbc.get_db_connection()
         assert isinstance(dest_conn, PsqlConnection)
         db_helper.update_sequence_numbering(dest_conn, all_tables_no_pg)
+        succeeded = True
     finally:
-        subsetter.unprep_temp_dbs()
-        subsetter.close_connections()
+        try:
+            subsetter.unprep_temp_dbs(succeeded=succeeded)
+        finally:
+            subsetter.close_connections()
 
     return source_db, dest_db
 
@@ -908,16 +926,7 @@ def test_incremental_report_handles_new_disconnected_source_table(capsys):
         )
         dest.close()
     finally:
-        admin = _admin_conn()
-        with admin.cursor() as cur:
-            for db in (source_db, dest_db):
-                cur.execute(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                    "WHERE datname = %s AND pid <> pg_backend_pid()",
-                    (db,),
-                )
-                cur.execute(f"DROP DATABASE IF EXISTS {db}")
-        admin.close()
+        _drop_test_databases(source_db, dest_db)
 
 
 def test_skip_schema_setup_alias_maps_to_destination_mode():
@@ -966,6 +975,708 @@ def test_grow_mode_rejected_on_mysql():
     # topup keeps its historical degraded-but-allowed behavior on MySQL
     raw["destination_mode"] = "topup"
     config_reader._raw_dict_to_config(raw)
+
+
+def test_incremental_keys_parse_and_validate():
+    with open(CONFIG_JSON, "r") as fp:
+        raw = json.load(fp)
+    raw["incremental_keys"] = [
+        {"table": "sales.history", "columns": ["history_id", "version"]}
+    ]
+
+    cfg = config_reader._raw_dict_to_config(raw)
+    assert cfg.incremental_key_map == {"sales.history": ["history_id", "version"]}
+
+    raw["incremental_keys"].append({"table": "sales.history", "columns": ["other_id"]})
+    with pytest.raises(ValueError, match="at most one"):
+        config_reader._raw_dict_to_config(raw)
+
+    raw["incremental_keys"] = [{"table": "sales.history", "columns": []}]
+    with pytest.raises(ValueError, match="non-empty string list"):
+        config_reader._raw_dict_to_config(raw)
+
+    raw["incremental_keys"] = [{"table": "sales.history", "columns": ["history_id"]}]
+    raw["db_type"] = "mysql"
+    with pytest.raises(ValueError, match="only supported on PostgreSQL"):
+        config_reader._raw_dict_to_config(raw)
+
+
+def test_incremental_config_hash_canonicalizes_unordered_lists():
+    with open(CONFIG_JSON, "r") as fp:
+        raw = json.load(fp)
+    raw["passthrough_tables"] = [
+        "public.regions",
+        "public.feature_flags",
+        "public.regions",
+    ]
+    raw["excluded_tables"] = ["sales.order_lines", "sales.order_transfers"]
+    raw["dependency_breaks"].append(
+        {"fk_table": "sales.orders", "target_table": "sales.customers"}
+    )
+    raw["fk_augmentation"] = [
+        {
+            "fk_table": "sales.unique_history",
+            "fk_columns": ["customer_id"],
+            "target_table": "sales.customers",
+            "target_columns": ["id"],
+        },
+        {
+            "fk_table": "sales.orders",
+            "fk_columns": ["warehouse_id"],
+            "target_table": "inventory.warehouses",
+            "target_columns": ["id"],
+        },
+    ]
+    raw["incremental_keys"] = [
+        {"table": "sales.unique_history", "columns": ["history_id"]},
+        {"table": "sales.other_history", "columns": ["owner_id", "version"]},
+    ]
+
+    try:
+        config_reader.config = config_reader._raw_dict_to_config(raw)
+        assert config_reader.config.passthrough_tables == [
+            "public.regions",
+            "public.feature_flags",
+        ]
+        helper = database_helper.get_specific_helper()
+        identity_map = {"sales.customers": ["id"]}
+        first_hash = helper._incremental_config_hash(identity_map)
+
+        raw["passthrough_tables"] = [
+            "public.feature_flags",
+            "public.regions",
+            "public.feature_flags",
+        ]
+        for name in (
+            "excluded_tables",
+            "dependency_breaks",
+            "fk_augmentation",
+            "incremental_keys",
+        ):
+            raw[name].reverse()
+        config_reader.config = config_reader._raw_dict_to_config(raw)
+
+        assert helper._incremental_config_hash(identity_map) == first_hash
+    finally:
+        config_reader.reset_config()
+
+
+# ============================================================
+# UNIQUE-KEY INCREMENTAL IDENTITY (NO PRIMARY KEY)
+# ============================================================
+
+
+UNIQUE_HISTORY_SETUP = [
+    "CREATE TABLE sales.unique_history ("
+    " history_id INT NOT NULL,"
+    " customer_id INT NOT NULL REFERENCES sales.customers(id),"
+    " version_number INT NOT NULL,"
+    " status TEXT NOT NULL,"
+    " active BOOLEAN NOT NULL,"
+    " UNIQUE (history_id),"
+    " UNIQUE (customer_id, version_number))",
+    "CREATE UNIQUE INDEX unique_history_active"
+    " ON sales.unique_history (customer_id) WHERE active",
+    "INSERT INTO sales.unique_history VALUES"
+    " (600, 6, 1, 'silver', true),"
+    " (700, 7, 1, 'bronze', true)",
+]
+
+
+@pytest.fixture(
+    scope="module",
+    params=[
+        {
+            "use_temp_tables": False,
+            "use_copy_protocol": False,
+            "suffix_override": "_unique_grow",
+            "mode": "grow",
+        },
+        {
+            "use_temp_tables": True,
+            "use_copy_protocol": False,
+            "suffix_override": "_unique_tt",
+            "mode": "grow",
+        },
+        {
+            "use_temp_tables": False,
+            "use_copy_protocol": True,
+            "suffix_override": "_unique_cp",
+            "mode": "grow",
+        },
+        {
+            "use_temp_tables": False,
+            "use_copy_protocol": True,
+            "suffix_override": "_unique_topup",
+            "mode": "topup",
+        },
+    ],
+    ids=["unnest_grow", "temp_tables_grow", "copy_grow", "copy_topup"],
+)
+def unique_identity_dbs(request):
+    param = dict(request.param)
+    mode = param.pop("mode")
+    config_overrides = {
+        "incremental_keys": [
+            {"table": "sales.unique_history", "columns": ["history_id"]}
+        ]
+    }
+    if mode == "topup":
+        config_overrides["initial_targets"] = [
+            {"table": "sales.customers", "where": "created_at >= '2025-01-01'"},
+            {"table": "sales.unique_history", "where": "customer_id = 6"},
+        ]
+    param["config_overrides"] = config_overrides
+    param["setup_sql"] = UNIQUE_HISTORY_SETUP
+    source_db, dest_db = _run_subsetter(**param)
+
+    source = psycopg.connect(
+        dbname=source_db,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT,
+    )
+    with source.cursor() as cur:
+        cur.execute(
+            "UPDATE sales.unique_history SET active = false WHERE history_id = 600"
+        )
+        cur.execute("INSERT INTO sales.unique_history VALUES (601, 6, 2, 'gold', true)")
+        cur.execute(
+            "UPDATE sales.unique_history SET status = 'silver-retired'"
+            " WHERE history_id = 600"
+        )
+    source.commit()
+    source.close()
+
+    _run_subsetter(**param, mode=mode)
+
+    dest = psycopg.connect(
+        dbname=dest_db,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT,
+    )
+    yield dest
+    dest.close()
+
+    admin = _admin_conn()
+    with admin.cursor() as cur:
+        for db in (source_db, dest_db):
+            cur.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid()",
+                (db,),
+            )
+            cur.execute(f"DROP DATABASE IF EXISTS {db}")
+    admin.close()
+
+
+def test_unique_identity_refreshes_and_inserts_history(unique_identity_dbs):
+    dest = unique_identity_dbs
+    assert (
+        _query_one(
+            dest,
+            "SELECT COUNT(*) FROM sales.unique_history WHERE customer_id = 6",
+        )
+        == 2
+    )
+    assert (
+        _query_one(
+            dest,
+            "SELECT status FROM sales.unique_history WHERE customer_id = 6 AND active",
+        )
+        == "gold"
+    )
+    assert (
+        _query_one(
+            dest,
+            "SELECT COUNT(*) FROM sales.unique_history"
+            " WHERE history_id = 600 AND status = 'silver-retired' AND NOT active",
+        )
+        == 1
+    )
+
+
+def test_multiple_unique_keys_require_explicit_identity():
+    param = {
+        "use_temp_tables": False,
+        "use_copy_protocol": True,
+        "suffix_override": "_unique_ambiguous",
+        "setup_sql": UNIQUE_HISTORY_SETUP,
+    }
+    source_db = SOURCE_DB + "_unique_ambiguous"
+    dest_db = DEST_DB + "_unique_ambiguous"
+    try:
+        source_db, dest_db = _run_subsetter(**param)
+        with pytest.raises(ValueError, match="multiple eligible unique keys"):
+            _run_subsetter(**param, mode="grow")
+    finally:
+        _drop_test_databases(source_db, dest_db)
+
+
+def test_single_unique_key_is_inferred_and_generated_columns_refresh():
+    admin = _admin_conn()
+    version = _query_one(admin, "SHOW server_version_num")
+    admin.close()
+    generated_kind = "VIRTUAL" if int(version) >= 180000 else "STORED"
+    param = {
+        "use_temp_tables": False,
+        "use_copy_protocol": True,
+        "suffix_override": "_unique_inferred",
+        "setup_sql": [
+            "CREATE TABLE sales.inferred_history ("
+            " history_id INT NOT NULL UNIQUE,"
+            " customer_id INT NOT NULL REFERENCES sales.customers(id),"
+            " payload TEXT NOT NULL)",
+            "INSERT INTO sales.inferred_history VALUES (600, 6, 'old')",
+            "CREATE TABLE sales.generated_values ("
+            " id INT PRIMARY KEY,"
+            " customer_id INT NOT NULL REFERENCES sales.customers(id),"
+            " raw_value INT NOT NULL,"
+            " doubled INT GENERATED ALWAYS AS (raw_value * 2) " + generated_kind + ")",
+            "INSERT INTO sales.generated_values (id, customer_id, raw_value)"
+            " VALUES (1, 6, 3)",
+        ],
+    }
+    source_db = SOURCE_DB + "_unique_inferred"
+    dest_db = DEST_DB + "_unique_inferred"
+    try:
+        source_db, dest_db = _run_subsetter(**param)
+        source = psycopg.connect(
+            dbname=source_db,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        with source.cursor() as cur:
+            cur.execute(
+                "UPDATE sales.inferred_history SET payload = 'refreshed'"
+                " WHERE history_id = 600"
+            )
+            cur.execute("INSERT INTO sales.inferred_history VALUES (601, 6, 'new')")
+            cur.execute("UPDATE sales.generated_values SET raw_value = 4 WHERE id = 1")
+        source.commit()
+        source.close()
+
+        _run_subsetter(**param, mode="grow")
+        dest = psycopg.connect(
+            dbname=dest_db,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        assert (
+            _query_one(
+                dest,
+                "SELECT COUNT(*) FROM sales.inferred_history"
+                " WHERE payload IN ('refreshed', 'new')",
+            )
+            == 2
+        )
+        assert (
+            _query_one(dest, "SELECT doubled FROM sales.generated_values WHERE id = 1")
+            == 8
+        )
+        dest.close()
+    finally:
+        _drop_test_databases(source_db, dest_db)
+
+
+@pytest.mark.parametrize(
+    ("suffix", "setup_sql", "error"),
+    [
+        (
+            "_no_identity",
+            [
+                "CREATE TABLE sales.no_identity_history ("
+                " history_id INT UNIQUE,"
+                " customer_id INT NOT NULL REFERENCES sales.customers(id))",
+                "INSERT INTO sales.no_identity_history VALUES (600, 6)",
+            ],
+            "no primary key or eligible unique key",
+        ),
+        (
+            "_deferrable_identity",
+            [
+                "CREATE TABLE sales.deferrable_history ("
+                " history_id INT PRIMARY KEY DEFERRABLE,"
+                " customer_id INT NOT NULL REFERENCES sales.customers(id))",
+                "INSERT INTO sales.deferrable_history VALUES (600, 6)",
+            ],
+            "Primary key.*cannot be used",
+        ),
+        (
+            "_duplicate_deferrable_arbiter",
+            [
+                "CREATE TABLE sales.duplicate_arbiter_history ("
+                " history_id INT NOT NULL,"
+                " customer_id INT NOT NULL REFERENCES sales.customers(id),"
+                " CONSTRAINT duplicate_arbiter_immediate UNIQUE (history_id),"
+                " CONSTRAINT duplicate_arbiter_deferred UNIQUE (history_id)"
+                " DEFERRABLE INITIALLY IMMEDIATE)",
+                "INSERT INTO sales.duplicate_arbiter_history VALUES (600, 6)",
+            ],
+            "also matches deferrable unique index",
+        ),
+        (
+            "_non_key_always_identity",
+            [
+                "CREATE TABLE sales.non_key_always_identity ("
+                " generated_id INT GENERATED ALWAYS AS IDENTITY,"
+                " natural_key TEXT NOT NULL UNIQUE,"
+                " customer_id INT NOT NULL REFERENCES sales.customers(id))",
+                "INSERT INTO sales.non_key_always_identity"
+                " (natural_key, customer_id) VALUES ('existing', 6)",
+            ],
+            "non-key GENERATED ALWAYS AS IDENTITY",
+        ),
+        (
+            "_partitioned",
+            [
+                "CREATE TABLE public.partitioned_events ("
+                " id INT NOT NULL, occurred_on DATE NOT NULL,"
+                " PRIMARY KEY (id, occurred_on))"
+                " PARTITION BY RANGE (occurred_on)",
+                "CREATE TABLE public.partitioned_events_2025"
+                " PARTITION OF public.partitioned_events"
+                " FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')",
+                "INSERT INTO public.partitioned_events VALUES (1, '2025-06-01')",
+            ],
+            "partitioning",
+        ),
+        (
+            "_inherited",
+            [
+                "CREATE TABLE public.inherited_events (id INT PRIMARY KEY)",
+                "CREATE TABLE public.inherited_events_archive ()"
+                " INHERITS (public.inherited_events)",
+                "INSERT INTO public.inherited_events_archive VALUES (1)",
+            ],
+            "table inheritance",
+        ),
+        (
+            "_triggered",
+            [
+                "CREATE FUNCTION sales.incremental_trigger_probe()"
+                " RETURNS trigger LANGUAGE plpgsql AS $$"
+                " BEGIN RETURN NEW; END $$",
+                "CREATE TRIGGER incremental_trigger_probe"
+                " BEFORE INSERT OR UPDATE ON sales.customers"
+                " FOR EACH ROW EXECUTE FUNCTION sales.incremental_trigger_probe()",
+            ],
+            "destination trigger",
+        ),
+    ],
+)
+def test_incremental_preflight_rejects_unsafe_schemas(suffix, setup_sql, error):
+    param = {
+        "use_temp_tables": False,
+        "use_copy_protocol": True,
+        "suffix_override": suffix,
+        "setup_sql": setup_sql,
+    }
+    source_db = SOURCE_DB + suffix
+    dest_db = DEST_DB + suffix
+    try:
+        source_db, dest_db = _run_subsetter(**param)
+        with pytest.raises(ValueError, match=error):
+            _run_subsetter(**param, mode="grow")
+    finally:
+        _drop_test_databases(source_db, dest_db)
+
+
+def test_incremental_preflight_ignores_tables_outside_run_scope():
+    admin = _admin_conn()
+    version = int(_query_one(admin, "SHOW server_version_num"))
+    admin.close()
+    setup_sql = [
+        "CREATE TABLE public.unrelated_events (id INT PRIMARY KEY)",
+        "CREATE TABLE public.unrelated_events_archive ()"
+        " INHERITS (public.unrelated_events)",
+        "CREATE TABLE sales.excluded_triggered ("
+        " id INT PRIMARY KEY,"
+        " customer_id INT NOT NULL REFERENCES sales.customers(id))",
+        "CREATE FUNCTION sales.excluded_trigger_probe()"
+        " RETURNS trigger LANGUAGE plpgsql AS $$"
+        " BEGIN RETURN NEW; END $$",
+        "CREATE TRIGGER excluded_trigger_probe"
+        " BEFORE INSERT OR UPDATE ON sales.excluded_triggered"
+        " FOR EACH ROW EXECUTE FUNCTION sales.excluded_trigger_probe()",
+    ]
+    if version >= 180000:
+        setup_sql.extend(
+            [
+                "CREATE EXTENSION btree_gist",
+                "CREATE TABLE public.unrelated_temporal ("
+                " entity_id INT, valid_at daterange,"
+                " PRIMARY KEY (entity_id, valid_at WITHOUT OVERLAPS))",
+            ]
+        )
+
+    param = {
+        "use_temp_tables": False,
+        "use_copy_protocol": True,
+        "suffix_override": "_unrelated_unsafe",
+        "setup_sql": setup_sql,
+        "config_overrides": {
+            "keep_disconnected_tables": False,
+            "excluded_tables": ["sales.excluded_triggered"],
+        },
+    }
+    source_db = SOURCE_DB + "_unrelated_unsafe"
+    dest_db = DEST_DB + "_unrelated_unsafe"
+    try:
+        source_db, dest_db = _run_subsetter(**param)
+        _run_subsetter(**param, mode="grow")
+    finally:
+        _drop_test_databases(source_db, dest_db)
+
+
+def test_postgres_18_temporal_identity_is_rejected():
+    admin = _admin_conn()
+    version = int(_query_one(admin, "SHOW server_version_num"))
+    admin.close()
+    if version < 180000:
+        pytest.skip("WITHOUT OVERLAPS requires PostgreSQL 18")
+
+    param = {
+        "use_temp_tables": False,
+        "use_copy_protocol": True,
+        "suffix_override": "_temporal_identity",
+        "setup_sql": [
+            "CREATE EXTENSION btree_gist",
+            "CREATE TABLE public.temporal_identity ("
+            " entity_id INT, valid_at daterange, payload TEXT NOT NULL,"
+            " PRIMARY KEY (entity_id, valid_at WITHOUT OVERLAPS))",
+            "INSERT INTO public.temporal_identity VALUES"
+            " (1, '[2025-01-01,2025-02-01)', 'value')",
+        ],
+    }
+    source_db = SOURCE_DB + "_temporal_identity"
+    dest_db = DEST_DB + "_temporal_identity"
+    try:
+        source_db, dest_db = _run_subsetter(**param)
+        with pytest.raises(ValueError, match="temporal constraint"):
+            _run_subsetter(**param, mode="grow")
+    finally:
+        _drop_test_databases(source_db, dest_db)
+
+
+def test_failed_topup_resumes_retained_journal(monkeypatch):
+    param = {
+        "use_temp_tables": False,
+        "use_copy_protocol": True,
+        "suffix_override": "_resume_topup",
+    }
+    source_db = SOURCE_DB + "_resume_topup"
+    dest_db = DEST_DB + "_resume_topup"
+    try:
+        source_db, dest_db = _run_subsetter(**param)
+        source = psycopg.connect(
+            dbname=source_db,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        with source.cursor() as cur:
+            cur.execute(
+                "INSERT INTO sales.customers (name, email, region, created_at)"
+                " VALUES ('Resume', 'resume@example.com', 'US-W', '2025-10-01')"
+            )
+        source.commit()
+        source.close()
+
+        helper = database_helper.get_specific_helper()
+        real_update_sequences = helper.update_sequence_numbering
+
+        def fail_after_transfer(*args, **kwargs):
+            raise RuntimeError("late test failure")
+
+        monkeypatch.setattr(helper, "update_sequence_numbering", fail_after_transfer)
+        with pytest.raises(RuntimeError, match="late test failure"):
+            _run_subsetter(**param, mode="topup")
+        monkeypatch.setattr(helper, "update_sequence_numbering", real_update_sequences)
+
+        dest = psycopg.connect(
+            dbname=dest_db,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        assert _query_one(dest, "SELECT to_regnamespace('_condenser') IS NOT NULL")
+        assert (
+            _query_one(
+                dest,
+                "SELECT COUNT(*) FROM pg_constraint WHERE contype = 'f'",
+            )
+            > 0
+        )
+        dest.close()
+
+        with pytest.raises(RuntimeError, match="different configuration"):
+            _run_subsetter(**param, mode="topup", parallel_read_workers=2)
+
+        _run_subsetter(**param, mode="topup")
+        dest = psycopg.connect(
+            dbname=dest_db,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        assert _query_one(dest, "SELECT to_regnamespace('_condenser') IS NULL")
+        assert (
+            _query_one(
+                dest,
+                "SELECT COUNT(*) FROM sales.customers"
+                " WHERE email = 'resume@example.com'",
+            )
+            == 1
+        )
+        dest.close()
+    finally:
+        _drop_test_databases(source_db, dest_db)
+
+
+def test_recreate_clears_retained_incremental_journal(monkeypatch):
+    param = {
+        "use_temp_tables": False,
+        "use_copy_protocol": True,
+        "suffix_override": "_recreate_journal",
+    }
+    source_db = SOURCE_DB + "_recreate_journal"
+    dest_db = DEST_DB + "_recreate_journal"
+    try:
+        source_db, dest_db = _run_subsetter(**param)
+        helper = database_helper.get_specific_helper()
+        real_update_sequences = helper.update_sequence_numbering
+
+        def fail_after_transfer(*args, **kwargs):
+            raise RuntimeError("late test failure")
+
+        monkeypatch.setattr(helper, "update_sequence_numbering", fail_after_transfer)
+        with pytest.raises(RuntimeError, match="late test failure"):
+            _run_subsetter(**param, mode="grow")
+        monkeypatch.setattr(helper, "update_sequence_numbering", real_update_sequences)
+
+        _run_subsetter(**param, mode="recreate", reset_databases=False)
+        dest = psycopg.connect(
+            dbname=dest_db,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        assert _query_one(dest, "SELECT to_regnamespace('_condenser') IS NULL")
+        dest.close()
+    finally:
+        _drop_test_databases(source_db, dest_db)
+
+
+def test_fk_restore_failure_retains_journal(monkeypatch):
+    param = {
+        "use_temp_tables": False,
+        "use_copy_protocol": True,
+        "suffix_override": "_resume_fk",
+    }
+    source_db = SOURCE_DB + "_resume_fk"
+    dest_db = DEST_DB + "_resume_fk"
+    try:
+        source_db, dest_db = _run_subsetter(**param)
+        helper = database_helper.get_specific_helper()
+        real_restore = helper.restore_fk_constraints
+
+        def fail_restore(*args, **kwargs):
+            raise RuntimeError("restore test failure")
+
+        monkeypatch.setattr(helper, "restore_fk_constraints", fail_restore)
+        with pytest.raises(RuntimeError, match="restore test failure"):
+            _run_subsetter(**param, mode="grow")
+        monkeypatch.setattr(helper, "restore_fk_constraints", real_restore)
+
+        dest = psycopg.connect(
+            dbname=dest_db,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        assert _query_one(dest, "SELECT to_regnamespace('_condenser') IS NOT NULL")
+        dest.close()
+
+        _run_subsetter(**param, mode="grow")
+        dest = psycopg.connect(
+            dbname=dest_db,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        assert _query_one(dest, "SELECT to_regnamespace('_condenser') IS NULL")
+        assert (
+            _query_one(
+                dest,
+                "SELECT COUNT(*) FROM pg_constraint WHERE contype = 'f'",
+            )
+            > 0
+        )
+        dest.close()
+    finally:
+        _drop_test_databases(source_db, dest_db)
+
+
+def test_fk_restore_rejects_same_name_with_different_definition():
+    param = {
+        "use_temp_tables": False,
+        "use_copy_protocol": True,
+        "suffix_override": "_fk_name_collision",
+    }
+    source_db = SOURCE_DB + "_fk_name_collision"
+    dest_db = DEST_DB + "_fk_name_collision"
+    try:
+        source_db, dest_db = _run_subsetter(**param)
+        collision = (
+            'ALTER TABLE sales.orders ADD CONSTRAINT "orders_customer_id_fkey"'
+            " FOREIGN KEY (warehouse_id) REFERENCES inventory.warehouses(id)"
+        )
+        with pytest.raises(RuntimeError, match="different definition"):
+            _run_subsetter(
+                **param,
+                mode="grow",
+                config_overrides={"post_subset_sql": [collision]},
+            )
+
+        with pytest.raises(RuntimeError, match="Retained foreign key definition"):
+            _run_subsetter(
+                **param,
+                mode="grow",
+                config_overrides={"post_subset_sql": [collision]},
+            )
+
+        dest = psycopg.connect(
+            dbname=dest_db,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        assert _query_one(dest, "SELECT to_regnamespace('_condenser') IS NOT NULL")
+        assert _query_one(
+            dest,
+            "SELECT definition LIKE 'FOREIGN KEY (customer_id)%'"
+            " FROM _condenser.fk_backup WHERE schema_name = 'sales'"
+            " AND table_name = 'orders'"
+            " AND constraint_name = 'orders_customer_id_fkey'",
+        )
+        dest.close()
+    finally:
+        _drop_test_databases(source_db, dest_db)
 
 
 # ============================================================

@@ -50,6 +50,12 @@
     "use_temp_tables": false,
     "use_copy_protocol": true,
     "destination_mode": "recreate",
+    "incremental_keys": [
+        {
+            "table": "public.event_history",
+            "columns": ["event_id", "version"]
+        }
+    ],
     "parallel_read_workers": 4,
     "excluded_tables": [
         "public.table_to_ignore", "public.spatial_ref_sys"
