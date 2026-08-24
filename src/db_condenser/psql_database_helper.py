@@ -1181,6 +1181,50 @@ def get_unredacted_fk_relationships(tables: list[str], conn: PsqlConnection):
     GROUP BY 1, 3, sub.constraint_nsp, sub.constraint_name;
     """
 
+    config = get_config()
+    configured_tables = set(tables)
+    augmented_tables = {
+        table
+        for fka in config.fk_augmentation
+        for table in (fka.fk_table, fka.target_table)
+    }
+    unavailable = sorted(augmented_tables - configured_tables)
+    if unavailable:
+        raise ValueError(
+            "fk_augmentation references unknown or excluded tables: "
+            + ", ".join(unavailable)
+        )
+
+    if augmented_tables:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT ns.nspname || '.' || cl.relname, att.attname
+                  FROM pg_attribute att
+                  JOIN pg_class cl ON cl.oid = att.attrelid
+                  JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+                 WHERE ns.nspname || '.' || cl.relname = ANY(%s)
+                   AND att.attnum > 0
+                   AND NOT att.attisdropped
+                """,
+                (list(augmented_tables),),
+            )
+            columns_by_table = {}
+            for qualified_table, column in cur.fetchall():
+                columns_by_table.setdefault(qualified_table, set()).add(column)
+        for fka in config.fk_augmentation:
+            for table, columns in (
+                (fka.fk_table, fka.fk_columns),
+                (fka.target_table, fka.target_columns),
+            ):
+                missing = sorted(set(columns) - columns_by_table.get(table, set()))
+                if missing:
+                    raise ValueError(
+                        "fk_augmentation references unknown columns on {}: {}".format(
+                            table, ", ".join(missing)
+                        )
+                    )
+
     relationships = list()
 
     with conn.cursor() as cur:
@@ -1195,7 +1239,6 @@ def get_unredacted_fk_relationships(tables: list[str], conn: PsqlConnection):
             if d["fk_table"] in tables and d["target_table"] in tables:
                 relationships.append(d)
 
-    config = get_config()
     for fka in config.fk_augmentation:
         augment = asdict(fka)
         not_present = True
@@ -1318,7 +1361,7 @@ def list_all_user_schemas(conn):
             """
             SELECT nspname
               FROM pg_catalog.pg_namespace
-             WHERE nspname NOT LIKE 'pg\_%'
+             WHERE nspname NOT LIKE 'pg\\_%'
                AND nspname != 'information_schema';
             """
         )

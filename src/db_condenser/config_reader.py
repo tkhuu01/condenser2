@@ -94,8 +94,33 @@ class FkAugmentation:
     target_columns: list[str]
 
     def __post_init__(self):
+        for name, value in (
+            ("fk_table", self.fk_table),
+            ("target_table", self.target_table),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string")
+        if not isinstance(self.fk_columns, list) or not isinstance(
+            self.target_columns, list
+        ):
+            raise ValueError("fk_columns and target_columns must be lists")
         if len(self.fk_columns) != len(self.target_columns):
             raise ValueError("fk_columns and target_columns must be the same length")
+        for name, columns in (
+            ("fk_columns", self.fk_columns),
+            ("target_columns", self.target_columns),
+        ):
+            if (
+                not isinstance(columns, list)
+                or not columns
+                or any(
+                    not isinstance(column, str) or not column.strip()
+                    for column in columns
+                )
+            ):
+                raise ValueError(f"{name} must be a non-empty string list")
+            if len(columns) != len(set(columns)):
+                raise ValueError(f"{name} must not contain duplicate columns")
 
 
 @dataclass

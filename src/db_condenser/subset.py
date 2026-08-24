@@ -873,6 +873,7 @@ class Subset:
             table_name(target), schema_name(target), source_conn
         )
         upstream_filters = upstream_filter_match(target, table_columns)
+        columns_query = columns_to_copy(target, relationships, source_conn)
 
         if self.config.use_temp_tables:
             self.__subset_upstream_temp_tables(
@@ -882,6 +883,7 @@ class Subset:
                 source_conn,
                 dest_conn,
                 delta_plan,
+                columns_query,
             )
         else:
             self.__subset_upstream_unnest(
@@ -892,6 +894,7 @@ class Subset:
                 dest_conn,
                 delta_plan,
                 allow_chunk,
+                columns_query,
             )
 
         return True
@@ -904,6 +907,7 @@ class Subset:
         source_conn,
         dest_conn,
         delta_plan=None,
+        columns_query="*",
     ):
         fk_datatypes = {
             col: typ
@@ -953,6 +957,8 @@ class Subset:
         fqt = fully_qualified_table(target)
         for pass_j in passes:
             joins = ""
+            match_conditions = []
+            nullable_conditions = []
             for idx, kc in enumerate(kcs):
                 key = (kc["target_table"], tuple(kc["target_columns"]))
                 if pass_j is not None and pass_j == idx:
@@ -967,13 +973,31 @@ class Subset:
                     )
                     for i, col in enumerate(fk_cols)
                 )
-                joins += ' JOIN "{}" AS {} ON {}'.format(
+                joins += ' LEFT JOIN "{}" AS {} ON {}'.format(
                     id_temp, alias, join_conditions
                 )
+                match_conditions.append("{}.col0 IS NOT NULL".format(alias))
+                nullable_conditions.append(
+                    " OR ".join(
+                        "{}.{} IS NULL".format(fqt, quoter(col)) for col in fk_cols
+                    )
+                )
 
-            q = "SELECT {}.* FROM {}{}".format(fqt, fqt, joins)
-            if upstream_filters:
-                q += " WHERE {}".format(" AND ".join(upstream_filters))
+            q = "SELECT {} FROM {}{}".format(columns_query, fqt, joins)
+            conditions = [
+                "({} OR {})".format(nullable, matched)
+                for nullable, matched in zip(nullable_conditions, match_conditions)
+            ]
+            # NULL foreign keys are neutral (PostgreSQL MATCH SIMPLE), but a
+            # row still needs at least one selected parent to enter the
+            # subset. In topup, that match specifically must be the parent
+            # delta driving this pass.
+            if pass_j is None:
+                conditions.append("({})".format(" OR ".join(match_conditions)))
+            else:
+                conditions.append(match_conditions[pass_j])
+            conditions.extend(upstream_filters)
+            q += " WHERE {}".format(" AND ".join(conditions))
             if self.config.max_rows_per_table is not None:
                 q += " LIMIT {}".format(self.config.max_rows_per_table)
             self.__copy_rows(
@@ -985,11 +1009,19 @@ class Subset:
             )
 
     def __build_upstream_unnest_query(
-        self, fqt, kc_rows, fk_datatypes, upstream_filters
+        self,
+        fqt,
+        kc_rows,
+        fk_datatypes,
+        upstream_filters,
+        required_join=None,
+        columns_query=None,
     ):
         """Build the source-side join for (constraint, id_rows) pairs."""
         joins = ""
         all_params = []
+        match_conditions = []
+        nullable_conditions = []
         for join_idx, (kc, rows) in enumerate(kc_rows):
             fk_cols = kc["fk_columns"]
             unnest_args = ", ".join(
@@ -1001,7 +1033,8 @@ class Subset:
                 for i, col in enumerate(fk_cols)
             )
             joins += (
-                " JOIN unnest({unnest}) AS ids{idx}({join_cols}) ON {conds}".format(
+                " LEFT JOIN unnest({unnest}) AS ids{idx}({join_cols})"
+                " ON {conds}".format(
                     unnest=unnest_args,
                     idx=join_idx,
                     join_cols=join_cols,
@@ -1009,10 +1042,22 @@ class Subset:
                 )
             )
             all_params.extend([row[i] for row in rows] for i in range(len(fk_cols)))
+            match_conditions.append("ids{}.col0 IS NOT NULL".format(join_idx))
+            nullable_conditions.append(
+                " OR ".join("{}.{} IS NULL".format(fqt, quoter(col)) for col in fk_cols)
+            )
 
-        q = "SELECT {}.* FROM {}{}".format(fqt, fqt, joins)
-        if upstream_filters:
-            q += " WHERE {}".format(" AND ".join(upstream_filters))
+        q = "SELECT {} FROM {}{}".format(columns_query or fqt + ".*", fqt, joins)
+        conditions = [
+            "({} OR {})".format(nullable, matched)
+            for nullable, matched in zip(nullable_conditions, match_conditions)
+        ]
+        if required_join is None:
+            conditions.append("({})".format(" OR ".join(match_conditions)))
+        else:
+            conditions.append(match_conditions[required_join])
+        conditions.extend(upstream_filters)
+        q += " WHERE {}".format(" AND ".join(conditions))
         return q, all_params
 
     def __subset_upstream_unnest(
@@ -1024,6 +1069,7 @@ class Subset:
         dest_conn,
         delta_plan=None,
         allow_chunk=False,
+        columns_query="*",
     ):
         fk_datatypes = {
             col: typ
@@ -1062,6 +1108,7 @@ class Subset:
                 dest_conn,
                 delta_plan,
                 allow_chunk,
+                columns_query,
             )
             return
 
@@ -1075,6 +1122,7 @@ class Subset:
             source_conn,
             dest_conn,
             delta_plan,
+            columns_query,
         )
 
     def __fetch_dest_rows(self, query, batch_size, dest_conn):
@@ -1104,6 +1152,7 @@ class Subset:
         dest_conn,
         delta_plan=None,
         allow_chunk=False,
+        columns_query="*",
     ):
         group_key = next(iter(groups))
         kc_target, target_cols = group_key
@@ -1118,6 +1167,8 @@ class Subset:
                 [(kc, valid_rows) for kc in groups[group_key]],
                 fk_datatypes,
                 upstream_filters,
+                required_join=0,
+                columns_query=columns_query,
             )
             self.__copy_rows(
                 batch_source_conn,
@@ -1156,7 +1207,9 @@ class Subset:
                         )
                     ] + list(upstream_filters)
                     ids = [row[0] for row in valid_first]
-                    if self.__copy_table_ctid_parallel(target, "*", conditions, [ids]):
+                    if self.__copy_table_ctid_parallel(
+                        target, columns_query, conditions, [ids]
+                    ):
                         return
                     copy_batch(valid_first, source_conn, dest_conn)
                     return
@@ -1186,6 +1239,7 @@ class Subset:
         source_conn,
         dest_conn,
         delta_plan=None,
+        columns_query="*",
     ):
         kcs = [kc for group in groups.values() for kc in group]
 
@@ -1247,9 +1301,14 @@ class Subset:
 
         copy_batch = compute_batch_size(len(fk_datatypes))
 
-        def copy_kc_rows(kc_rows, single_shot):
+        def copy_kc_rows(kc_rows, single_shot, required_join):
             q, params = self.__build_upstream_unnest_query(
-                fqt, kc_rows, fk_datatypes, upstream_filters
+                fqt,
+                kc_rows,
+                fk_datatypes,
+                upstream_filters,
+                required_join=required_join,
+                columns_query=columns_query,
             )
             if single_shot and self.config.max_rows_per_table is not None:
                 q += " LIMIT {}".format(self.config.max_rows_per_table)
@@ -1286,7 +1345,7 @@ class Subset:
                 largest_idx = max(range(len(kc_rows)), key=lambda i: len(kc_rows[i][1]))
                 largest_rows = kc_rows[largest_idx][1]
                 if len(largest_rows) <= batch_size:
-                    copy_kc_rows(kc_rows, single_shot=True)
+                    copy_kc_rows(kc_rows, single_shot=True, required_join=pass_j)
                     continue
                 for i in range(0, len(largest_rows), batch_size):
                     batch_kc_rows = list(kc_rows)
@@ -1294,7 +1353,7 @@ class Subset:
                         kc_rows[largest_idx][0],
                         largest_rows[i : i + batch_size],
                     )
-                    copy_kc_rows(batch_kc_rows, single_shot=False)
+                    copy_kc_rows(batch_kc_rows, single_shot=False, required_join=pass_j)
                 continue
 
             # stream the largest single-constraint group; everything else
@@ -1326,7 +1385,11 @@ class Subset:
                         (kc, valid_rows if j == stream_idx else rows_for(j, kc))
                         for j, kc in enumerate(kcs)
                     ]
-                    copy_kc_rows(kc_rows, single_shot=single_shot)
+                    copy_kc_rows(
+                        kc_rows,
+                        single_shot=single_shot,
+                        required_join=pass_j,
+                    )
             finally:
                 dest_cursor.close()
 
