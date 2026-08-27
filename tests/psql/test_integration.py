@@ -2852,19 +2852,28 @@ def multi_fk_batch_dbs():
             CREATE TABLE parent (id INT PRIMARY KEY);
             CREATE TABLE link (
                 id INT PRIMARY KEY,
-                from_id INT NOT NULL REFERENCES parent(id),
-                to_id   INT NOT NULL REFERENCES parent(id)
+                from_id INT REFERENCES parent(id),
+                to_id   INT REFERENCES parent(id),
+                priority INT NOT NULL DEFAULT 0
             );
-            INSERT INTO parent SELECT generate_series(1, 6);
+            INSERT INTO parent SELECT generate_series(1, 7);
             INSERT INTO link VALUES
-                (1, 1, 2), (2, 2, 3), (3, 3, 4),
-                (4, 4, 5), (5, 5, 6), (6, 6, 1);
+                (1, 1, 2, 0), (2, 2, 3, 0), (3, 3, 4, 0),
+                (4, 4, 5, 0), (5, 5, 6, 0), (6, 6, 1, 0),
+                (7, NULL, 1, 0), (8, 2, NULL, 0),
+                (100, 7, 7, 1);
         """)
     src.close()
 
     raw_config = {
         "db_type": "postgres",
         "initial_targets": [{"table": "public.parent", "where": "id <= 6"}],
+        "upstream_filters": [
+            {
+                "table": "public.link",
+                "condition": "link.id < 100 OR link.priority = 1",
+            }
+        ],
         "source_db_connection_info": {
             "user_name": DB_USER,
             "password": DB_PASSWORD,
@@ -2933,4 +2942,5 @@ def test_multi_fk_pairs_survive_batch_boundaries(multi_fk_batch_dbs):
     assert _query_one(dest, "SELECT COUNT(*) FROM parent") == 6
     # every link's parents are imported, so every link must be included,
     # regardless of which ID batch each parent landed in
-    assert _query_one(dest, "SELECT COUNT(*) FROM link") == 6
+    assert _query_one(dest, "SELECT COUNT(*) FROM link") == 8
+    assert _query_one(dest, "SELECT COUNT(*) FROM link WHERE id = 100") == 0

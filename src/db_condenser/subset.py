@@ -996,7 +996,9 @@ class Subset:
                 conditions.append("({})".format(" OR ".join(match_conditions)))
             else:
                 conditions.append(match_conditions[pass_j])
-            conditions.extend(upstream_filters)
+            conditions.extend(
+                "({})".format(condition) for condition in upstream_filters
+            )
             q += " WHERE {}".format(" AND ".join(conditions))
             if self.config.max_rows_per_table is not None:
                 q += " LIMIT {}".format(self.config.max_rows_per_table)
@@ -1056,7 +1058,7 @@ class Subset:
             conditions.append("({})".format(" OR ".join(match_conditions)))
         else:
             conditions.append(match_conditions[required_join])
-        conditions.extend(upstream_filters)
+        conditions.extend("({})".format(condition) for condition in upstream_filters)
         q += " WHERE {}".format(" AND ".join(conditions))
         return q, all_params
 
@@ -1316,6 +1318,32 @@ class Subset:
                 source_conn, dest_conn, q, target, params, batch_size=copy_batch
             )
 
+        def copy_neutral_rows(kc_rows, batched_idx, required_join):
+            if required_join == batched_idx:
+                return
+            batched_kc = kc_rows[batched_idx][0]
+            remaining = [row for i, row in enumerate(kc_rows) if i != batched_idx]
+            if not remaining or not any(rows for _, rows in remaining):
+                return
+            remapped_required = required_join
+            if remapped_required is not None and remapped_required > batched_idx:
+                remapped_required -= 1
+            nullable = " OR ".join(
+                "{}.{} IS NULL".format(fqt, quoter(col))
+                for col in batched_kc["fk_columns"]
+            )
+            q, params = self.__build_upstream_unnest_query(
+                fqt,
+                remaining,
+                fk_datatypes,
+                list(upstream_filters) + [nullable],
+                required_join=remapped_required,
+                columns_query=columns_query,
+            )
+            self.__copy_rows(
+                source_conn, dest_conn, q, target, params, batch_size=copy_batch
+            )
+
         for pass_j in passes:
             # groups whose full set this pass doesn't need: the delta
             # constraint's own group, when no other constraint shares it
@@ -1353,7 +1381,12 @@ class Subset:
                         kc_rows[largest_idx][0],
                         largest_rows[i : i + batch_size],
                     )
-                    copy_kc_rows(batch_kc_rows, single_shot=False, required_join=pass_j)
+                    copy_kc_rows(
+                        batch_kc_rows,
+                        single_shot=False,
+                        required_join=(pass_j if pass_j is not None else largest_idx),
+                    )
+                copy_neutral_rows(kc_rows, largest_idx, pass_j)
                 continue
 
             # stream the largest single-constraint group; everything else
@@ -1388,10 +1421,15 @@ class Subset:
                     copy_kc_rows(
                         kc_rows,
                         single_shot=single_shot,
-                        required_join=pass_j,
+                        required_join=(pass_j if pass_j is not None else stream_idx),
                     )
             finally:
                 dest_cursor.close()
+            kc_rows = [
+                (kc, [] if j == stream_idx else rows_for(j, kc))
+                for j, kc in enumerate(kcs)
+            ]
+            copy_neutral_rows(kc_rows, stream_idx, pass_j)
 
     def subset_downstream(
         self,
