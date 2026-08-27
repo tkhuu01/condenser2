@@ -88,6 +88,15 @@ constraints. Each entry is a JSON object with `fk_table`, `fk_columns`,
 `target_table`, and `target_columns`. The column arrays must be the same
 length.
 
+When a candidate child row has several relationships to tables already in the
+subset, every non-NULL relationship must point at a selected row (AND
+semantics). A nullable `MATCH SIMPLE` relationship is neutral when any of its
+columns is NULL, but at least one relationship must actually match for the
+child to be selected. This permits common audit shapes such as an event owned
+by a selected entity with an optional NULL actor. `dependency_breaks` are
+excluded from this membership test, and their columns are nulled on every copy
+path unless `preserve_fk_opportunistically` is enabled.
+
 ## Filtering
 
 `upstream_filters`: Additional filtering applied to tables during upstream
@@ -198,9 +207,25 @@ The destination is protected by an advisory lock. A failed run retains its
 configuration resumes it on the next run. A different configuration or
 identity selection is rejected until the original run is resumed or the
 destination is recreated. `SQL/incremental_fk_backup.sql` is also written as a
-manual recovery copy. Adding `fk_augmentation` entries between successful
-incremental runs may require one `"recreate"` run, since previously imported
-rows are not re-checked against new implicit relationships.
+manual recovery copy. This check includes target predicates,
+`fk_augmentation`, and `incremental_keys`, so do not partially edit a config
+while recovering a failed run.
+
+After a *successful* run the journal is removed, because changing target
+predicates is a normal top-up workflow. Keep the structural parts of the
+config (`fk_augmentation`, `incremental_keys`, exclusions, passthrough tables,
+dependency breaks, and filters) under version control and carry them forward
+as a complete set. db-condenser cannot infer a logical relationship that was
+removed from `fk_augmentation`; omitting it on a later successful run can leave
+new logical history rows out of the subset. Adding or correcting structural
+relationships may require one `"recreate"` run, since previously imported rows
+are not re-checked under the old graph.
+
+For audit/history tables owned by an entity, use `"grow"` when new history for
+already-imported entities must continue to arrive. `"topup"` intentionally
+freezes those entities and only follows history belonging to newly inserted
+direct targets. Also set `destination_mode` explicitly: omitting it defaults to
+`"recreate"`, which rebuilds the destination.
 
 ## Post-processing
 

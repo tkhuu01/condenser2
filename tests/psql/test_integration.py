@@ -4,6 +4,7 @@ from pathlib import Path
 
 import psycopg
 import pytest
+from psycopg.types.json import Json
 
 from db_condenser import config_reader, database_helper, result_tabulator
 from db_condenser.db_connect import DbConnect, PsqlConnection
@@ -999,6 +1000,85 @@ def test_incremental_keys_parse_and_validate():
     raw["db_type"] = "mysql"
     with pytest.raises(ValueError, match="only supported on PostgreSQL"):
         config_reader._raw_dict_to_config(raw)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        (
+            {
+                "fk_table": "",
+                "fk_columns": ["customer_id"],
+                "target_table": "sales.customers",
+                "target_columns": ["id"],
+            },
+            "fk_table must be a non-empty string",
+        ),
+        (
+            {
+                "fk_table": "sales.history",
+                "fk_columns": [],
+                "target_table": "sales.customers",
+                "target_columns": [],
+            },
+            "fk_columns must be a non-empty string list",
+        ),
+        (
+            {
+                "fk_table": "sales.history",
+                "fk_columns": ["customer_id", "customer_id"],
+                "target_table": "sales.customers",
+                "target_columns": ["id", "id"],
+            },
+            "fk_columns must not contain duplicate columns",
+        ),
+    ],
+)
+def test_fk_augmentation_shape_is_validated(kwargs, error):
+    with pytest.raises(ValueError, match=error):
+        config_reader.FkAugmentation(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("suffix", "augmentation", "error"),
+    [
+        (
+            "_fka_unknown_table",
+            {
+                "fk_table": "sales.misspelled_history",
+                "fk_columns": ["customer_id"],
+                "target_table": "sales.customers",
+                "target_columns": ["id"],
+            },
+            "unknown or excluded tables: sales.misspelled_history",
+        ),
+        (
+            "_fka_unknown_column",
+            {
+                "fk_table": "sales.customer_status_history",
+                "fk_columns": ["misspelled_customer_id"],
+                "target_table": "sales.customers",
+                "target_columns": ["id"],
+            },
+            "unknown columns on sales.customer_status_history",
+        ),
+    ],
+)
+def test_fk_augmentation_rejects_stale_config_before_transfer(
+    suffix, augmentation, error
+):
+    source_db = SOURCE_DB + suffix
+    dest_db = DEST_DB + suffix
+    try:
+        with pytest.raises(ValueError, match=error):
+            _run_subsetter(
+                use_temp_tables=False,
+                use_copy_protocol=True,
+                suffix_override=suffix,
+                config_overrides={"fk_augmentation": [augmentation]},
+            )
+    finally:
+        _drop_test_databases(source_db, dest_db)
 
 
 def test_incremental_config_hash_canonicalizes_unordered_lists():
@@ -2216,6 +2296,443 @@ def test_grow_history_pair_across_batch_boundary(grow_batch_boundary_dbs):
 
 
 # ============================================================
+# HISTORY / AUDIT TABLE SHAPES
+# ============================================================
+
+
+AUDIT_HISTORY_SETUP = [
+    "CREATE SCHEMA auth",
+    "CREATE SCHEMA audit",
+    "CREATE TABLE auth.users ( id UUID PRIMARY KEY, display_name TEXT NOT NULL)",
+    "CREATE TABLE audit.accounts ("
+    " tenant_id INT NOT NULL, account_id INT NOT NULL, name TEXT NOT NULL,"
+    " PRIMARY KEY (tenant_id, account_id))",
+    "CREATE TABLE audit.account_versions ("
+    " tenant_id INT NOT NULL, account_id INT NOT NULL, version INT NOT NULL,"
+    " valid_from TIMESTAMPTZ NOT NULL, valid_to TIMESTAMPTZ,"
+    " active BOOLEAN NOT NULL, state JSONB NOT NULL, actor_id UUID,"
+    " PRIMARY KEY (tenant_id, account_id, version),"
+    " FOREIGN KEY (tenant_id, account_id)"
+    " REFERENCES audit.accounts (tenant_id, account_id),"
+    " FOREIGN KEY (actor_id) REFERENCES auth.users (id))",
+    "CREATE UNIQUE INDEX account_versions_one_active"
+    " ON audit.account_versions (tenant_id, account_id) WHERE active",
+    "CREATE TABLE audit.version_comments ("
+    " id BIGINT PRIMARY KEY, tenant_id INT NOT NULL, account_id INT NOT NULL,"
+    " version INT NOT NULL, body TEXT NOT NULL,"
+    " FOREIGN KEY (tenant_id, account_id, version)"
+    " REFERENCES audit.account_versions (tenant_id, account_id, version))",
+    "CREATE TABLE audit.account_events ("
+    " event_id UUID PRIMARY KEY, tenant_id INT NOT NULL, account_id INT NOT NULL,"
+    " occurred_at TIMESTAMPTZ NOT NULL, action TEXT NOT NULL,"
+    " before_state JSONB, after_state JSONB NOT NULL, actor_id UUID,"
+    " FOREIGN KEY (tenant_id, account_id)"
+    " REFERENCES audit.accounts (tenant_id, account_id),"
+    " FOREIGN KEY (actor_id) REFERENCES auth.users (id))",
+    # Deliberately no physical FK: this common audit shape relies on
+    # fk_augmentation for ownership. Its stable unique key is selected as the
+    # incremental identity because the table has no primary key.
+    "CREATE TABLE audit.logical_events ("
+    " event_seq BIGINT NOT NULL UNIQUE, tenant_id INT NOT NULL,"
+    " account_id INT NOT NULL, payload JSONB NOT NULL)",
+    "INSERT INTO auth.users VALUES"
+    " ('00000000-0000-0000-0000-000000000001', 'Initial actor'),"
+    " ('00000000-0000-0000-0000-000000000002', 'Later actor')",
+    "INSERT INTO audit.accounts VALUES"
+    " (1, 10, 'selected account'), (2, 20, 'outside tenant')",
+    "INSERT INTO audit.account_versions VALUES"
+    " (1, 10, 1, '2025-01-01', NULL, true, '{\"tier\": \"silver\"}',"
+    "  '00000000-0000-0000-0000-000000000001'),"
+    " (2, 20, 1, '2025-01-01', NULL, true, '{\"tier\": \"outside\"}',"
+    "  '00000000-0000-0000-0000-000000000001')",
+    "INSERT INTO audit.version_comments VALUES"
+    " (1, 1, 10, 1, 'initial version comment'),"
+    " (2, 2, 20, 1, 'outside version comment')",
+    "INSERT INTO audit.account_events VALUES"
+    " ('10000000-0000-0000-0000-000000000001', 1, 10, '2025-01-02',"
+    "  'created', NULL, '{\"tier\": \"silver\"}',"
+    "  '00000000-0000-0000-0000-000000000001'),"
+    " ('20000000-0000-0000-0000-000000000001', 2, 20, '2025-01-02',"
+    "  'created', NULL, '{\"tier\": \"outside\"}',"
+    "  '00000000-0000-0000-0000-000000000001')",
+    "INSERT INTO audit.logical_events VALUES"
+    ' (1, 1, 10, \'{"source": "initial"}\'),'
+    ' (2, 2, 20, \'{"source": "outside"}\')',
+]
+
+
+def _audit_history_config():
+    return {
+        "initial_targets": [{"table": "audit.accounts", "where": "tenant_id = 1"}],
+        "passthrough_tables": [],
+        "keep_disconnected_tables": False,
+        "fk_augmentation": [
+            {
+                "fk_table": "audit.logical_events",
+                "fk_columns": ["tenant_id", "account_id"],
+                "target_table": "audit.accounts",
+                "target_columns": ["tenant_id", "account_id"],
+            }
+        ],
+        "incremental_keys": [
+            {"table": "audit.logical_events", "columns": ["event_seq"]}
+        ],
+    }
+
+
+def _apply_audit_history_mutations(source_db):
+    source = psycopg.connect(
+        dbname=source_db,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT,
+    )
+    with source.cursor() as cur:
+        # Close the current SCD2 row, then add its replacement under a live
+        # partial unique index (one active version per tenant/account).
+        cur.execute(
+            "UPDATE audit.account_versions"
+            " SET valid_to = '2025-02-01', active = false"
+            " WHERE tenant_id = 1 AND account_id = 10 AND version = 1"
+        )
+        cur.execute(
+            "INSERT INTO audit.account_versions VALUES"
+            " (1, 10, 2, '2025-02-01', NULL, true, %s, %s)",
+            (
+                Json({"tier": "gold", "limits": {"daily": 5000}}),
+                "00000000-0000-0000-0000-000000000002",
+            ),
+        )
+        # One new child points at the old historical version; another points
+        # at the replacement. Grow must find both through exact composite FKs.
+        cur.execute(
+            "INSERT INTO audit.version_comments VALUES"
+            " (3, 1, 10, 1, 'late comment on old version'),"
+            " (4, 1, 10, 2, 'comment on replacement')"
+        )
+        # Refresh an existing wide event and append another UUID-keyed event.
+        cur.execute(
+            "UPDATE audit.account_events SET after_state = %s"
+            " WHERE event_id = '10000000-0000-0000-0000-000000000001'",
+            (Json({"tier": "silver", "reviewed": True}),),
+        )
+        cur.execute(
+            "INSERT INTO audit.account_events VALUES"
+            " ('10000000-0000-0000-0000-000000000002', 1, 10, '2025-02-01',"
+            " 'tier_changed', %s, %s, %s)",
+            (
+                Json({"tier": "silver"}),
+                Json({"tier": "gold"}),
+                "00000000-0000-0000-0000-000000000002",
+            ),
+        )
+        cur.execute(
+            "INSERT INTO audit.logical_events VALUES (3, 1, 10, %s)",
+            (Json({"source": "logical", "revision": 2}),),
+        )
+
+        # A newly matching direct target and all of its audit children should
+        # arrive in both incremental modes.
+        cur.execute("INSERT INTO audit.accounts VALUES (1, 11, 'new account')")
+        cur.execute(
+            "INSERT INTO audit.account_versions VALUES"
+            " (1, 11, 1, '2025-03-01', NULL, true, %s, NULL)",
+            (Json({"tier": "bronze"}),),
+        )
+        cur.execute(
+            "INSERT INTO audit.account_events VALUES"
+            " ('11000000-0000-0000-0000-000000000001', 1, 11, '2025-03-01',"
+            " 'created', NULL, %s, NULL)",
+            (Json({"tier": "bronze"}),),
+        )
+        cur.execute(
+            "INSERT INTO audit.logical_events VALUES (4, 1, 11, %s)",
+            (Json({"source": "new-account"}),),
+        )
+    source.commit()
+    source.close()
+
+
+@pytest.fixture(scope="module", params=["grow", "topup"])
+def audit_history_dbs(request):
+    mode = request.param
+    suffix = "_audit_" + mode
+    param = {
+        "use_temp_tables": False,
+        "use_copy_protocol": True,
+        "suffix_override": suffix,
+        "setup_sql": AUDIT_HISTORY_SETUP,
+        "config_overrides": _audit_history_config(),
+    }
+    source_db, dest_db = _run_subsetter(**param)
+    _apply_audit_history_mutations(source_db)
+    _run_subsetter(**param, mode=mode)
+    # A mutation-free repeat proves all selected identities are idempotent.
+    _run_subsetter(**param, mode=mode)
+
+    dest = psycopg.connect(
+        dbname=dest_db,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT,
+    )
+    yield mode, dest
+    dest.close()
+    _drop_test_databases(source_db, dest_db)
+
+
+def test_history_new_direct_target_arrives_in_both_incremental_modes(
+    audit_history_dbs,
+):
+    _, dest = audit_history_dbs
+    assert (
+        _query_one(
+            dest,
+            "SELECT COUNT(*) FROM audit.accounts"
+            " WHERE tenant_id = 1 AND account_id = 11",
+        )
+        == 1
+    )
+    assert (
+        _query_one(
+            dest,
+            "SELECT COUNT(*) FROM audit.account_versions"
+            " WHERE tenant_id = 1 AND account_id = 11",
+        )
+        == 1
+    )
+    assert (
+        _query_one(
+            dest,
+            "SELECT COUNT(*) FROM audit.account_events"
+            " WHERE tenant_id = 1 AND account_id = 11",
+        )
+        == 1
+    )
+    assert (
+        _query_one(
+            dest,
+            "SELECT COUNT(*) FROM audit.logical_events"
+            " WHERE tenant_id = 1 AND account_id = 11",
+        )
+        == 1
+    )
+
+
+def test_history_existing_parent_follows_mode_contract(audit_history_dbs):
+    mode, dest = audit_history_dbs
+    expected = 2 if mode == "grow" else 1
+    assert (
+        _query_one(
+            dest,
+            "SELECT COUNT(*) FROM audit.account_versions"
+            " WHERE tenant_id = 1 AND account_id = 10",
+        )
+        == expected
+    )
+    assert (
+        _query_one(
+            dest,
+            "SELECT COUNT(*) FROM audit.account_events"
+            " WHERE tenant_id = 1 AND account_id = 10",
+        )
+        == expected
+    )
+    assert (
+        _query_one(
+            dest,
+            "SELECT COUNT(*) FROM audit.logical_events"
+            " WHERE tenant_id = 1 AND account_id = 10",
+        )
+        == expected
+    )
+
+
+def test_history_grow_refreshes_scd2_json_and_exact_version_children(
+    audit_history_dbs,
+):
+    mode, dest = audit_history_dbs
+    if mode == "grow":
+        assert (
+            _query_one(
+                dest,
+                "SELECT state ->> 'tier' FROM audit.account_versions"
+                " WHERE tenant_id = 1 AND account_id = 10 AND active",
+            )
+            == "gold"
+        )
+        assert (
+            _query_one(
+                dest,
+                "SELECT COUNT(*) FROM audit.account_versions"
+                " WHERE tenant_id = 1 AND account_id = 10"
+                " AND version = 1 AND NOT active AND valid_to IS NOT NULL",
+            )
+            == 1
+        )
+        assert (
+            _query_one(
+                dest,
+                "SELECT (after_state ->> 'reviewed')::boolean"
+                " FROM audit.account_events"
+                " WHERE event_id = '10000000-0000-0000-0000-000000000001'",
+            )
+            is True
+        )
+        assert (
+            _query_one(
+                dest,
+                "SELECT COUNT(*) FROM audit.version_comments"
+                " WHERE tenant_id = 1 AND account_id = 10",
+            )
+            == 3
+        )
+        assert (
+            _query_one(
+                dest,
+                "SELECT COUNT(*) FROM auth.users"
+                " WHERE id = '00000000-0000-0000-0000-000000000002'",
+            )
+            == 1
+        )
+    else:
+        # Topup intentionally freezes children of the already resident account.
+        assert (
+            _query_one(
+                dest,
+                "SELECT state ->> 'tier' FROM audit.account_versions"
+                " WHERE tenant_id = 1 AND account_id = 10 AND active",
+            )
+            == "silver"
+        )
+        assert (
+            _query_one(
+                dest,
+                "SELECT after_state ? 'reviewed' FROM audit.account_events"
+                " WHERE event_id = '10000000-0000-0000-0000-000000000001'",
+            )
+            is False
+        )
+        assert (
+            _query_one(
+                dest,
+                "SELECT COUNT(*) FROM audit.version_comments"
+                " WHERE tenant_id = 1 AND account_id = 10",
+            )
+            == 1
+        )
+
+
+def test_history_audit_corpus_has_no_duplicates_or_cross_tenant_leaks(
+    audit_history_dbs,
+):
+    _, dest = audit_history_dbs
+    identities = {
+        "audit.accounts": "tenant_id, account_id",
+        "audit.account_versions": "tenant_id, account_id, version",
+        "audit.version_comments": "id",
+        "audit.account_events": "event_id",
+        "audit.logical_events": "event_seq",
+    }
+    for table, columns in identities.items():
+        total = _query_one(dest, f"SELECT COUNT(*) FROM {table}")
+        distinct = _query_one(dest, f"SELECT COUNT(DISTINCT ({columns})) FROM {table}")
+        assert total == distinct, f"{table}: duplicate history identities"
+    assert (
+        _query_one(dest, "SELECT COUNT(*) FROM audit.accounts WHERE tenant_id = 2") == 0
+    )
+    assert (
+        _query_one(
+            dest, "SELECT COUNT(*) FROM audit.account_events WHERE tenant_id = 2"
+        )
+        == 0
+    )
+    assert _query_one(dest, "SELECT to_regnamespace('_condenser') IS NULL")
+
+
+def test_failed_history_grow_rejects_partial_config_edits(monkeypatch):
+    suffix = "_audit_resume"
+    config_overrides = _audit_history_config()
+    param = {
+        "use_temp_tables": False,
+        "use_copy_protocol": True,
+        "suffix_override": suffix,
+        "setup_sql": AUDIT_HISTORY_SETUP,
+        "config_overrides": config_overrides,
+    }
+    source_db = SOURCE_DB + suffix
+    dest_db = DEST_DB + suffix
+    try:
+        source_db, dest_db = _run_subsetter(**param)
+        _apply_audit_history_mutations(source_db)
+
+        helper = database_helper.get_specific_helper()
+        real_update_sequences = helper.update_sequence_numbering
+
+        def fail_after_transfer(*args, **kwargs):
+            raise RuntimeError("late history test failure")
+
+        monkeypatch.setattr(helper, "update_sequence_numbering", fail_after_transfer)
+        with pytest.raises(RuntimeError, match="late history test failure"):
+            _run_subsetter(**param, mode="grow")
+        monkeypatch.setattr(helper, "update_sequence_numbering", real_update_sequences)
+
+        incomplete_configs = []
+
+        missing_augmentation = _audit_history_config()
+        missing_augmentation["fk_augmentation"] = []
+        incomplete_configs.append(missing_augmentation)
+
+        missing_identity = _audit_history_config()
+        missing_identity["incremental_keys"] = []
+        incomplete_configs.append(missing_identity)
+
+        partially_changed_target = _audit_history_config()
+        partially_changed_target["initial_targets"] = [
+            {"table": "audit.accounts", "where": "tenant_id = 1 AND account_id = 11"}
+        ]
+        incomplete_configs.append(partially_changed_target)
+
+        for incomplete in incomplete_configs:
+            with pytest.raises(RuntimeError, match="different configuration"):
+                _run_subsetter(
+                    **{**param, "config_overrides": incomplete},
+                    mode="grow",
+                )
+
+        # The exact original effective config can still resume and clean up.
+        _run_subsetter(**param, mode="grow")
+        dest = psycopg.connect(
+            dbname=dest_db,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        assert (
+            _query_one(
+                dest,
+                "SELECT COUNT(*) FROM audit.logical_events WHERE event_seq = 3",
+            )
+            == 1
+        )
+        assert (
+            _query_one(
+                dest,
+                "SELECT state ->> 'tier' FROM audit.account_versions"
+                " WHERE tenant_id = 1 AND account_id = 10 AND active",
+            )
+            == "gold"
+        )
+        assert _query_one(dest, "SELECT to_regnamespace('_condenser') IS NULL")
+        dest.close()
+    finally:
+        _drop_test_databases(source_db, dest_db)
+
+
+# ============================================================
 # COMPOSITE-PK DELTA JOIN (downstream restriction)
 # ============================================================
 
@@ -2335,19 +2852,28 @@ def multi_fk_batch_dbs():
             CREATE TABLE parent (id INT PRIMARY KEY);
             CREATE TABLE link (
                 id INT PRIMARY KEY,
-                from_id INT NOT NULL REFERENCES parent(id),
-                to_id   INT NOT NULL REFERENCES parent(id)
+                from_id INT REFERENCES parent(id),
+                to_id   INT REFERENCES parent(id),
+                priority INT NOT NULL DEFAULT 0
             );
-            INSERT INTO parent SELECT generate_series(1, 6);
+            INSERT INTO parent SELECT generate_series(1, 7);
             INSERT INTO link VALUES
-                (1, 1, 2), (2, 2, 3), (3, 3, 4),
-                (4, 4, 5), (5, 5, 6), (6, 6, 1);
+                (1, 1, 2, 0), (2, 2, 3, 0), (3, 3, 4, 0),
+                (4, 4, 5, 0), (5, 5, 6, 0), (6, 6, 1, 0),
+                (7, NULL, 1, 0), (8, 2, NULL, 0),
+                (100, 7, 7, 1);
         """)
     src.close()
 
     raw_config = {
         "db_type": "postgres",
         "initial_targets": [{"table": "public.parent", "where": "id <= 6"}],
+        "upstream_filters": [
+            {
+                "table": "public.link",
+                "condition": "link.id < 100 OR link.priority = 1",
+            }
+        ],
         "source_db_connection_info": {
             "user_name": DB_USER,
             "password": DB_PASSWORD,
@@ -2416,4 +2942,5 @@ def test_multi_fk_pairs_survive_batch_boundaries(multi_fk_batch_dbs):
     assert _query_one(dest, "SELECT COUNT(*) FROM parent") == 6
     # every link's parents are imported, so every link must be included,
     # regardless of which ID batch each parent landed in
-    assert _query_one(dest, "SELECT COUNT(*) FROM link") == 6
+    assert _query_one(dest, "SELECT COUNT(*) FROM link") == 8
+    assert _query_one(dest, "SELECT COUNT(*) FROM link WHERE id = 100") == 0
