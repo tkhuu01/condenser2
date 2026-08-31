@@ -48,7 +48,6 @@
     ],
     "max_rows_per_table": 100000,
     "use_temp_tables": false,
-    "use_copy_protocol": true,
     "destination_mode": "recreate",
     "incremental_keys": [
         {

@@ -77,10 +77,7 @@ class Subset:
 
         self.__db_helper.turn_off_constraints(self.__destination_conn)
 
-        if self.config.use_copy_protocol and self.config.db_type == DbType.POSTGRES:
-            self.__copy_rows = self.__db_helper.copy_rows_copy_protocol
-        else:
-            self.__copy_rows = self.__db_helper.copy_rows
+        self.__copy_rows = self.__db_helper.copy_rows
 
         if self.config.use_temp_tables:
             self.__check_source_writable()
@@ -537,10 +534,7 @@ class Subset:
         # regardless of order.
         two_phase = False
         if self.__incremental and self.__db_helper.has_secondary_unique(table):
-            two_phase = (
-                self.config.use_copy_protocol
-                and self.__db_helper.delta_for(table) is not None
-            )
+            two_phase = self.__db_helper.delta_for(table) is not None
             if not two_phase:
                 return False
         num_workers = len(self.__source_pool)
@@ -1445,76 +1439,82 @@ class Subset:
             r for r in redact_relationships(relationships) if r["target_table"] == table
         ]
 
-        if len(referencing_tables) > 0:
-            pk_columns = referencing_tables[0]["target_columns"]
-        else:
+        if not referencing_tables:
             return
 
         skip, child_plan = self.__downstream_delta_plan(referencing_tables, dest_conn)
         if skip:
             return
 
-        temp_table = self.__db_helper.create_id_temp_table(dest_conn, len(pk_columns))
-
-        for r in referencing_tables:
-            fk_table = r["fk_table"]
-            fk_columns = r["fk_columns"]
-
-            if child_plan is not None and fk_table not in child_plan:
-                # no rows were inserted into this child this run
-                continue
-            delta = child_plan.get(fk_table) if child_plan else None
-
-            fk_qualified = fully_qualified_table(
-                mysql_db_name_hack(fk_table, dest_conn)
-            )
-            target_qualified = fully_qualified_table(
-                mysql_db_name_hack(table, dest_conn)
-            )
-            delta_join = ""
-            if delta is not None:
-                delta_table, child_pk = delta
-                delta_join = " JOIN {} _d ON {}".format(
-                    delta_table,
-                    " AND ".join(
-                        "_fk.{} = _d.{}".format(quoter(c), quoter(c)) for c in child_pk
-                    ),
-                )
-            exists_conditions = " AND ".join(
-                "_t.{} = _fk.{}".format(quoter(pc), quoter(fc))
-                for pc, fc in zip(pk_columns, fk_columns)
-            )
-            select_q = (
-                "SELECT DISTINCT {} FROM {} _fk{}"
-                " WHERE NOT EXISTS (SELECT 1 FROM {} _t WHERE {})".format(
-                    ",".join("_fk.{}".format(quoter(c)) for c in fk_columns),
-                    fk_qualified,
-                    delta_join,
-                    target_qualified,
-                    exists_conditions,
-                )
-            )
-            insert_q = 'INSERT INTO "{}" {}'.format(temp_table, select_q)
-            with dest_conn.cursor() as cur:
-                cur.execute(insert_q)
-            dest_conn.commit()
+        relationship_groups = {}
+        for relationship in referencing_tables:
+            key = tuple(relationship["target_columns"])
+            relationship_groups.setdefault(key, []).append(relationship)
 
         columns_query = columns_to_copy(table, relationships, source_conn)
+        for pk_columns, group in relationship_groups.items():
+            temp_table = self.__db_helper.create_id_temp_table(
+                dest_conn, len(pk_columns)
+            )
 
-        if self.config.use_temp_tables:
-            self.__subset_downstream_temp_tables(
-                table, temp_table, pk_columns, columns_query, source_conn, dest_conn
-            )
-        else:
-            self.__subset_downstream_unnest(
-                table,
-                temp_table,
-                pk_columns,
-                columns_query,
-                source_conn,
-                dest_conn,
-                allow_chunk,
-            )
+            for r in group:
+                fk_table = r["fk_table"]
+                fk_columns = r["fk_columns"]
+
+                if child_plan is not None and fk_table not in child_plan:
+                    # no rows were inserted into this child this run
+                    continue
+                delta = child_plan.get(fk_table) if child_plan else None
+
+                fk_qualified = fully_qualified_table(
+                    mysql_db_name_hack(fk_table, dest_conn)
+                )
+                target_qualified = fully_qualified_table(
+                    mysql_db_name_hack(table, dest_conn)
+                )
+                delta_join = ""
+                if delta is not None:
+                    delta_table, child_pk = delta
+                    delta_join = " JOIN {} _d ON {}".format(
+                        delta_table,
+                        " AND ".join(
+                            "_fk.{} = _d.{}".format(quoter(c), quoter(c))
+                            for c in child_pk
+                        ),
+                    )
+                exists_conditions = " AND ".join(
+                    "_t.{} = _fk.{}".format(quoter(pc), quoter(fc))
+                    for pc, fc in zip(pk_columns, fk_columns)
+                )
+                select_q = (
+                    "SELECT DISTINCT {} FROM {} _fk{}"
+                    " WHERE NOT EXISTS (SELECT 1 FROM {} _t WHERE {})".format(
+                        ",".join("_fk.{}".format(quoter(c)) for c in fk_columns),
+                        fk_qualified,
+                        delta_join,
+                        target_qualified,
+                        exists_conditions,
+                    )
+                )
+                insert_q = 'INSERT INTO "{}" {}'.format(temp_table, select_q)
+                with dest_conn.cursor() as cur:
+                    cur.execute(insert_q)
+                dest_conn.commit()
+
+            if self.config.use_temp_tables:
+                self.__subset_downstream_temp_tables(
+                    table, temp_table, pk_columns, columns_query, source_conn, dest_conn
+                )
+            else:
+                self.__subset_downstream_unnest(
+                    table,
+                    temp_table,
+                    pk_columns,
+                    columns_query,
+                    source_conn,
+                    dest_conn,
+                    allow_chunk,
+                )
 
     def __subset_downstream_temp_tables(
         self, table, dest_temp_table, pk_columns, columns_query, source_conn, dest_conn
