@@ -1451,6 +1451,40 @@ class Subset:
             key = tuple(relationship["target_columns"])
             relationship_groups.setdefault(key, []).append(relationship)
 
+        stage_before_insert = (
+            self.__incremental and self.__db_helper.has_secondary_unique(table)
+        )
+        staged = False
+
+        def transfer_rows(
+            batch_source_conn,
+            batch_dest_conn,
+            query,
+            destination_table,
+            params=None,
+            batch_size=None,
+        ):
+            nonlocal staged
+            if not stage_before_insert:
+                self.__copy_rows(
+                    batch_source_conn,
+                    batch_dest_conn,
+                    query,
+                    destination_table,
+                    params,
+                    batch_size,
+                )
+                return
+            self.__db_helper.stage_rows(
+                batch_source_conn,
+                batch_dest_conn,
+                query,
+                destination_table,
+                params,
+                append=staged,
+            )
+            staged = True
+
         columns_query = columns_to_copy(table, relationships, source_conn)
         for pk_columns, group in relationship_groups.items():
             temp_table = self.__db_helper.create_id_temp_table(
@@ -1503,7 +1537,13 @@ class Subset:
 
             if self.config.use_temp_tables:
                 self.__subset_downstream_temp_tables(
-                    table, temp_table, pk_columns, columns_query, source_conn, dest_conn
+                    table,
+                    temp_table,
+                    pk_columns,
+                    columns_query,
+                    source_conn,
+                    dest_conn,
+                    transfer_rows,
                 )
             else:
                 self.__subset_downstream_unnest(
@@ -1513,11 +1553,23 @@ class Subset:
                     columns_query,
                     source_conn,
                     dest_conn,
-                    allow_chunk,
+                    transfer_rows,
+                    allow_chunk and not stage_before_insert,
                 )
 
+        if staged:
+            self.__db_helper.apply_staged(dest_conn, table, "refresh")
+            self.__db_helper.apply_staged(dest_conn, table, "insert")
+
     def __subset_downstream_temp_tables(
-        self, table, dest_temp_table, pk_columns, columns_query, source_conn, dest_conn
+        self,
+        table,
+        dest_temp_table,
+        pk_columns,
+        columns_query,
+        source_conn,
+        dest_conn,
+        transfer_rows,
     ):
         downstream_datatypes = {
             col: typ
@@ -1534,7 +1586,7 @@ class Subset:
         q = self.__build_temp_table_join(
             table, src_id_temp, pk_columns, downstream_datatypes, columns_query
         )
-        self.__copy_rows(
+        transfer_rows(
             source_conn,
             dest_conn,
             q,
@@ -1550,6 +1602,7 @@ class Subset:
         columns_query,
         source_conn,
         dest_conn,
+        transfer_rows,
         allow_chunk=False,
     ):
         downstream_datatypes = {
@@ -1580,7 +1633,7 @@ class Subset:
                 conditions=join_conditions,
             )
             params = [[row[i] for row in valid_rows] for i in range(len(pk_columns))]
-            self.__copy_rows(
+            transfer_rows(
                 batch_source_conn,
                 batch_dest_conn,
                 q,

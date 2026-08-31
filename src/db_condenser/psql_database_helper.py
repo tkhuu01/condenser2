@@ -810,10 +810,13 @@ def _pipe_copy(source_cursor, dest_cursor, query, params, column_list, copy_targ
                 dest_copy.write(bytes(buf))
 
 
-def stage_rows(source, destination, query, destination_table, params=None):
+def stage_rows(
+    source, destination, query, destination_table, params=None, append=False
+):
     """Two-phase parallel copy, step 1: stream a worker's rows into its
     session-local staging table without applying them. The caller applies
-    them later with apply_staged (refresh phase, barrier, insert phase)."""
+    them later with apply_staged (refresh phase, barrier, insert phase).
+    append=True accumulates multiple queries for one table-level phase split."""
     _, column_list, _, dest_table, temp_table = _copy_metadata(
         destination_table, destination
     )
@@ -825,7 +828,8 @@ def stage_rows(source, destination, query, destination_table, params=None):
                 temp_table, dest_table
             )
         )
-        dest_cursor.execute("TRUNCATE {}".format(temp_table))
+        if not append:
+            dest_cursor.execute("TRUNCATE {}".format(temp_table))
         _pipe_copy(source_cursor, dest_cursor, query, params, column_list, temp_table)
     finally:
         dest_cursor.close()

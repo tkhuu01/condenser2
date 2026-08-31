@@ -380,6 +380,107 @@ def test_downstream_parent_referenced_by_mixed_candidate_keys(
     assert _query_one(dest, "SELECT COUNT(*) FROM mixed_key.watchers") == 1
 
 
+@pytest.mark.parametrize(
+    ("use_temp_tables", "suffix"),
+    [(False, "_mixed_key_refresh"), (True, "_mixed_key_refresh_tt")],
+    ids=["unnest", "temp_tables"],
+)
+def test_incremental_mixed_candidate_keys_refresh_before_insert(
+    use_temp_tables, suffix
+):
+    source_db = SOURCE_DB + suffix
+    dest_db = DEST_DB + suffix
+    param = {
+        "use_temp_tables": use_temp_tables,
+        "suffix_override": suffix,
+        "setup_sql": [
+            "CREATE SCHEMA mixed_refresh",
+            "CREATE TABLE mixed_refresh.history ("
+            " id INT PRIMARY KEY, tenant_id INT NOT NULL, code TEXT NOT NULL,"
+            " alias TEXT NOT NULL, entity_id INT NOT NULL, active BOOLEAN NOT NULL,"
+            " UNIQUE (tenant_id, code), UNIQUE (tenant_id, alias))",
+            "CREATE UNIQUE INDEX history_one_active"
+            " ON mixed_refresh.history (entity_id) WHERE active",
+            "CREATE TABLE mixed_refresh.replacement_refs ("
+            " id INT PRIMARY KEY, tenant_id INT NOT NULL, code TEXT NOT NULL,"
+            " selected BOOLEAN NOT NULL, FOREIGN KEY (tenant_id, code)"
+            " REFERENCES mixed_refresh.history (tenant_id, code))",
+            "CREATE TABLE mixed_refresh.stale_refs ("
+            " id INT PRIMARY KEY, tenant_id INT NOT NULL, alias TEXT NOT NULL,"
+            " selected BOOLEAN NOT NULL)",
+            "INSERT INTO mixed_refresh.history"
+            " VALUES (1, 1, 'old-code', 'old-alias', 10, true)",
+            "INSERT INTO mixed_refresh.stale_refs VALUES (1, 1, 'old-alias', true)",
+        ],
+        "config_overrides": {
+            "initial_targets": [
+                {"table": "mixed_refresh.replacement_refs", "where": "selected"},
+                {"table": "mixed_refresh.stale_refs", "where": "selected"},
+            ],
+            "passthrough_tables": [],
+            "dependency_breaks": [],
+            "fk_augmentation": [
+                {
+                    "fk_table": "mixed_refresh.stale_refs",
+                    "fk_columns": ["tenant_id", "alias"],
+                    "target_table": "mixed_refresh.history",
+                    "target_columns": ["tenant_id", "alias"],
+                }
+            ],
+            "keep_disconnected_tables": False,
+        },
+    }
+    try:
+        _run_subsetter(**param)
+        source = psycopg.connect(
+            dbname=source_db,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        with source.cursor() as cur:
+            cur.execute(
+                "UPDATE mixed_refresh.history"
+                " SET alias = 'retired-alias', active = false WHERE id = 1"
+            )
+            cur.execute(
+                "UPDATE mixed_refresh.stale_refs"
+                " SET alias = 'retired-alias' WHERE id = 1"
+            )
+            cur.execute(
+                "INSERT INTO mixed_refresh.history"
+                " VALUES (2, 1, 'new-code', 'new-alias', 10, true)"
+            )
+            cur.execute(
+                "INSERT INTO mixed_refresh.replacement_refs"
+                " VALUES (2, 1, 'new-code', true)"
+            )
+        source.commit()
+        source.close()
+
+        _run_subsetter(**param, mode="topup")
+
+        dest = psycopg.connect(
+            dbname=dest_db,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        with dest.cursor() as cur:
+            cur.execute(
+                "SELECT id, alias, active FROM mixed_refresh.history ORDER BY id"
+            )
+            assert cur.fetchall() == [
+                (1, "retired-alias", False),
+                (2, "new-alias", True),
+            ]
+        dest.close()
+    finally:
+        _drop_test_databases(source_db, dest_db)
+
+
 def test_upstream_multi_fk_no_orphans(subsetter_dbs):
     """order_transfers has two FKs to orders (from_order_id, to_order_id).
     Verify no orphaned references after subsetting."""
