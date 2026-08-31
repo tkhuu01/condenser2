@@ -56,7 +56,6 @@ def _drop_test_databases(*databases):
 
 def _run_subsetter(
     use_temp_tables: bool,
-    use_copy_protocol: bool = False,
     mode: str = "recreate",
     suffix_override: str | None = None,
     parallel_read_workers: int = 1,
@@ -67,7 +66,7 @@ def _run_subsetter(
     if suffix_override is not None:
         suffix = suffix_override
     else:
-        suffix = "_temp" if use_temp_tables else "_copy" if use_copy_protocol else ""
+        suffix = "_temp" if use_temp_tables else ""
     source_db = SOURCE_DB + suffix
     dest_db = DEST_DB + suffix
 
@@ -93,7 +92,6 @@ def _run_subsetter(
     raw_config["source_db_connection_info"]["db_name"] = source_db
     raw_config["destination_db_connection_info"]["db_name"] = dest_db
     raw_config["use_temp_tables"] = use_temp_tables
-    raw_config["use_copy_protocol"] = use_copy_protocol
     raw_config["destination_mode"] = mode
     raw_config["parallel_read_workers"] = parallel_read_workers
     if config_overrides:
@@ -148,11 +146,10 @@ def _run_subsetter(
 @pytest.fixture(
     scope="module",
     params=[
-        {"use_temp_tables": False, "use_copy_protocol": False},
-        {"use_temp_tables": True, "use_copy_protocol": False},
-        {"use_temp_tables": False, "use_copy_protocol": True},
+        {"use_temp_tables": False},
+        {"use_temp_tables": True},
     ],
-    ids=["unnest", "temp_tables", "copy_protocol"],
+    ids=["unnest", "temp_tables"],
 )
 def subsetter_dbs(request):
     source_db, dest_db = _run_subsetter(**request.param)
@@ -287,6 +284,203 @@ def test_downstream_warehouses_pulled_in(subsetter_dbs):
     assert 0 < wh_count <= 5
 
 
+@pytest.fixture(
+    scope="module",
+    params=[
+        {
+            "suffix_override": "_mixed_key_unnest",
+            "use_temp_tables": False,
+        },
+        {
+            "suffix_override": "_mixed_key_temp",
+            "use_temp_tables": True,
+        },
+    ],
+    ids=["unnest", "temp_tables"],
+)
+def mixed_candidate_key_dbs(request):
+    suffix = request.param["suffix_override"]
+    source_db = SOURCE_DB + suffix
+    dest_db = DEST_DB + suffix
+    dest = None
+    try:
+        _, dest_db = _run_subsetter(
+            **request.param,
+            setup_sql=[
+                """
+                CREATE SCHEMA mixed_key;
+                CREATE TABLE mixed_key.users (
+                    tenant_id INT NOT NULL,
+                    user_no BIGINT NOT NULL,
+                    login TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, user_no),
+                    UNIQUE (tenant_id, login)
+                );
+                CREATE TABLE mixed_key.cases (
+                    case_id BIGINT PRIMARY KEY,
+                    tenant_id INT NOT NULL,
+                    owner_login TEXT NOT NULL,
+                    selected BOOLEAN NOT NULL,
+                    FOREIGN KEY (tenant_id, owner_login)
+                        REFERENCES mixed_key.users (tenant_id, login)
+                );
+                CREATE TABLE mixed_key.watchers (
+                    case_id BIGINT NOT NULL REFERENCES mixed_key.cases (case_id),
+                    user_tenant_id INT NOT NULL,
+                    user_no BIGINT NOT NULL,
+                    PRIMARY KEY (case_id, user_tenant_id, user_no),
+                    FOREIGN KEY (user_tenant_id, user_no)
+                        REFERENCES mixed_key.users (tenant_id, user_no)
+                );
+                INSERT INTO mixed_key.users VALUES
+                    (1, 1, 'alice'),
+                    (1, 2, 'bob'),
+                    (1, 3, 'mallory'),
+                    (2, 1, 'other');
+                INSERT INTO mixed_key.cases VALUES
+                    (100, 1, 'alice', true),
+                    (200, 1, 'mallory', false);
+                INSERT INTO mixed_key.watchers VALUES
+                    (100, 1, 2),
+                    (200, 2, 1);
+                """
+            ],
+            config_overrides={
+                "initial_targets": [{"table": "mixed_key.cases", "where": "selected"}],
+                "passthrough_tables": [],
+                "dependency_breaks": [],
+                "keep_disconnected_tables": False,
+            },
+        )
+        dest = psycopg.connect(
+            dbname=dest_db,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        yield dest
+    finally:
+        if dest is not None:
+            dest.close()
+        _drop_test_databases(source_db, dest_db)
+
+
+def test_downstream_parent_referenced_by_mixed_candidate_keys(
+    mixed_candidate_key_dbs,
+):
+    dest = mixed_candidate_key_dbs
+    with dest.cursor() as cur:
+        cur.execute(
+            "SELECT tenant_id, user_no, login FROM mixed_key.users"
+            " ORDER BY tenant_id, user_no"
+        )
+        assert cur.fetchall() == [(1, 1, "alice"), (1, 2, "bob")]
+    assert _query_one(dest, "SELECT COUNT(*) FROM mixed_key.cases") == 1
+    assert _query_one(dest, "SELECT COUNT(*) FROM mixed_key.watchers") == 1
+
+
+@pytest.mark.parametrize(
+    ("use_temp_tables", "suffix"),
+    [(False, "_mixed_key_refresh"), (True, "_mixed_key_refresh_tt")],
+    ids=["unnest", "temp_tables"],
+)
+def test_incremental_mixed_candidate_keys_refresh_before_insert(
+    use_temp_tables, suffix
+):
+    source_db = SOURCE_DB + suffix
+    dest_db = DEST_DB + suffix
+    param = {
+        "use_temp_tables": use_temp_tables,
+        "suffix_override": suffix,
+        "setup_sql": [
+            "CREATE SCHEMA mixed_refresh",
+            "CREATE TABLE mixed_refresh.history ("
+            " id INT PRIMARY KEY, tenant_id INT NOT NULL, code TEXT NOT NULL,"
+            " alias TEXT NOT NULL, entity_id INT NOT NULL, active BOOLEAN NOT NULL,"
+            " UNIQUE (tenant_id, code), UNIQUE (tenant_id, alias))",
+            "CREATE UNIQUE INDEX history_one_active"
+            " ON mixed_refresh.history (entity_id) WHERE active",
+            "CREATE TABLE mixed_refresh.replacement_refs ("
+            " id INT PRIMARY KEY, tenant_id INT NOT NULL, code TEXT NOT NULL,"
+            " selected BOOLEAN NOT NULL, FOREIGN KEY (tenant_id, code)"
+            " REFERENCES mixed_refresh.history (tenant_id, code))",
+            "CREATE TABLE mixed_refresh.stale_refs ("
+            " id INT PRIMARY KEY, tenant_id INT NOT NULL, alias TEXT NOT NULL,"
+            " selected BOOLEAN NOT NULL)",
+            "INSERT INTO mixed_refresh.history"
+            " VALUES (1, 1, 'old-code', 'old-alias', 10, true)",
+            "INSERT INTO mixed_refresh.stale_refs VALUES (1, 1, 'old-alias', true)",
+        ],
+        "config_overrides": {
+            "initial_targets": [
+                {"table": "mixed_refresh.replacement_refs", "where": "selected"},
+                {"table": "mixed_refresh.stale_refs", "where": "selected"},
+            ],
+            "passthrough_tables": [],
+            "dependency_breaks": [],
+            "fk_augmentation": [
+                {
+                    "fk_table": "mixed_refresh.stale_refs",
+                    "fk_columns": ["tenant_id", "alias"],
+                    "target_table": "mixed_refresh.history",
+                    "target_columns": ["tenant_id", "alias"],
+                }
+            ],
+            "keep_disconnected_tables": False,
+        },
+    }
+    try:
+        _run_subsetter(**param)
+        source = psycopg.connect(
+            dbname=source_db,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        with source.cursor() as cur:
+            cur.execute(
+                "UPDATE mixed_refresh.history"
+                " SET alias = 'retired-alias', active = false WHERE id = 1"
+            )
+            cur.execute(
+                "UPDATE mixed_refresh.stale_refs"
+                " SET alias = 'retired-alias' WHERE id = 1"
+            )
+            cur.execute(
+                "INSERT INTO mixed_refresh.history"
+                " VALUES (2, 1, 'new-code', 'new-alias', 10, true)"
+            )
+            cur.execute(
+                "INSERT INTO mixed_refresh.replacement_refs"
+                " VALUES (2, 1, 'new-code', true)"
+            )
+        source.commit()
+        source.close()
+
+        _run_subsetter(**param, mode="topup")
+
+        dest = psycopg.connect(
+            dbname=dest_db,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        with dest.cursor() as cur:
+            cur.execute(
+                "SELECT id, alias, active FROM mixed_refresh.history ORDER BY id"
+            )
+            assert cur.fetchall() == [
+                (1, "retired-alias", False),
+                (2, "new-alias", True),
+            ]
+        dest.close()
+    finally:
+        _drop_test_databases(source_db, dest_db)
+
+
 def test_upstream_multi_fk_no_orphans(subsetter_dbs):
     """order_transfers has two FKs to orders (from_order_id, to_order_id).
     Verify no orphaned references after subsetting."""
@@ -405,21 +599,14 @@ def test_sequences_reset(subsetter_dbs):
     params=[
         {
             "use_temp_tables": False,
-            "use_copy_protocol": False,
             "suffix_override": "_rerun",
         },
         {
             "use_temp_tables": True,
-            "use_copy_protocol": False,
             "suffix_override": "_rerun_temp_tables",
         },
-        {
-            "use_temp_tables": False,
-            "use_copy_protocol": True,
-            "suffix_override": "_rerun_copy",
-        },
     ],
-    ids=["unnest_rerun", "temp_tables_rerun", "copy_protocol_rerun"],
+    ids=["unnest_rerun", "temp_tables_rerun"],
 )
 def rerun_dbs(request):
     """Run the subsetter twice on the same destination in topup mode."""
@@ -470,21 +657,13 @@ def test_rerun_fk_integrity(rerun_dbs):
     assert orphans == 0
 
 
-@pytest.fixture(
-    scope="module",
-    params=[
-        {"use_copy_protocol": False, "suffix_override": "_parallel"},
-        {"use_copy_protocol": True, "suffix_override": "_parallel_copy"},
-    ],
-    ids=["parallel_unnest", "parallel_copy_protocol"],
-)
-def parallel_dbs(request):
+@pytest.fixture(scope="module")
+def parallel_dbs():
     """Run subsetter with parallel ctid page-range splitting."""
     source_db, dest_db = _run_subsetter(
         use_temp_tables=False,
-        use_copy_protocol=request.param["use_copy_protocol"],
         parallel_read_workers=4,
-        suffix_override=request.param["suffix_override"],
+        suffix_override="_parallel",
     )
 
     source = psycopg.connect(
@@ -654,21 +833,14 @@ def test_pre_filter_limits_rows(pre_filter_dbs):
     params=[
         {
             "use_temp_tables": False,
-            "use_copy_protocol": False,
             "suffix_override": "_incr",
         },
         {
             "use_temp_tables": True,
-            "use_copy_protocol": False,
             "suffix_override": "_incr_tt",
         },
-        {
-            "use_temp_tables": False,
-            "use_copy_protocol": True,
-            "suffix_override": "_incr_cp",
-        },
     ],
-    ids=["unnest_incremental", "temp_tables_incremental", "copy_protocol_incremental"],
+    ids=["unnest_incremental", "temp_tables_incremental"],
 )
 def incremental_dbs(request):
     """Run once, add rows to the source, then re-run in topup mode.
@@ -880,7 +1052,6 @@ def test_incremental_report_handles_new_disconnected_source_table(capsys):
     """A source-only table skipped by topup must not break final reporting."""
     param = {
         "use_temp_tables": False,
-        "use_copy_protocol": False,
         "suffix_override": "_incr_report",
         "config_overrides": {"keep_disconnected_tables": False},
     }
@@ -1073,7 +1244,6 @@ def test_fk_augmentation_rejects_stale_config_before_transfer(
         with pytest.raises(ValueError, match=error):
             _run_subsetter(
                 use_temp_tables=False,
-                use_copy_protocol=True,
                 suffix_override=suffix,
                 config_overrides={"fk_augmentation": [augmentation]},
             )
@@ -1168,30 +1338,21 @@ UNIQUE_HISTORY_SETUP = [
     params=[
         {
             "use_temp_tables": False,
-            "use_copy_protocol": False,
             "suffix_override": "_unique_grow",
             "mode": "grow",
         },
         {
             "use_temp_tables": True,
-            "use_copy_protocol": False,
             "suffix_override": "_unique_tt",
             "mode": "grow",
         },
         {
             "use_temp_tables": False,
-            "use_copy_protocol": True,
-            "suffix_override": "_unique_cp",
-            "mode": "grow",
-        },
-        {
-            "use_temp_tables": False,
-            "use_copy_protocol": True,
             "suffix_override": "_unique_topup",
             "mode": "topup",
         },
     ],
-    ids=["unnest_grow", "temp_tables_grow", "copy_grow", "copy_topup"],
+    ids=["unnest_grow", "temp_tables_grow", "unnest_topup"],
 )
 def unique_identity_dbs(request):
     param = dict(request.param)
@@ -1282,7 +1443,6 @@ def test_unique_identity_refreshes_and_inserts_history(unique_identity_dbs):
 def test_multiple_unique_keys_require_explicit_identity():
     param = {
         "use_temp_tables": False,
-        "use_copy_protocol": True,
         "suffix_override": "_unique_ambiguous",
         "setup_sql": UNIQUE_HISTORY_SETUP,
     }
@@ -1303,7 +1463,6 @@ def test_single_unique_key_is_inferred_and_generated_columns_refresh():
     generated_kind = "VIRTUAL" if int(version) >= 180000 else "STORED"
     param = {
         "use_temp_tables": False,
-        "use_copy_protocol": True,
         "suffix_override": "_unique_inferred",
         "setup_sql": [
             "CREATE TABLE sales.inferred_history ("
@@ -1455,7 +1614,6 @@ def test_single_unique_key_is_inferred_and_generated_columns_refresh():
 def test_incremental_preflight_rejects_unsafe_schemas(suffix, setup_sql, error):
     param = {
         "use_temp_tables": False,
-        "use_copy_protocol": True,
         "suffix_override": suffix,
         "setup_sql": setup_sql,
     }
@@ -1499,7 +1657,6 @@ def test_incremental_preflight_ignores_tables_outside_run_scope():
 
     param = {
         "use_temp_tables": False,
-        "use_copy_protocol": True,
         "suffix_override": "_unrelated_unsafe",
         "setup_sql": setup_sql,
         "config_overrides": {
@@ -1525,7 +1682,6 @@ def test_postgres_18_temporal_identity_is_rejected():
 
     param = {
         "use_temp_tables": False,
-        "use_copy_protocol": True,
         "suffix_override": "_temporal_identity",
         "setup_sql": [
             "CREATE EXTENSION btree_gist",
@@ -1549,7 +1705,6 @@ def test_postgres_18_temporal_identity_is_rejected():
 def test_failed_topup_resumes_retained_journal(monkeypatch):
     param = {
         "use_temp_tables": False,
-        "use_copy_protocol": True,
         "suffix_override": "_resume_topup",
     }
     source_db = SOURCE_DB + "_resume_topup"
@@ -1627,7 +1782,6 @@ def test_failed_topup_resumes_retained_journal(monkeypatch):
 def test_recreate_clears_retained_incremental_journal(monkeypatch):
     param = {
         "use_temp_tables": False,
-        "use_copy_protocol": True,
         "suffix_override": "_recreate_journal",
     }
     source_db = SOURCE_DB + "_recreate_journal"
@@ -1662,7 +1816,6 @@ def test_recreate_clears_retained_incremental_journal(monkeypatch):
 def test_fk_restore_failure_retains_journal(monkeypatch):
     param = {
         "use_temp_tables": False,
-        "use_copy_protocol": True,
         "suffix_override": "_resume_fk",
     }
     source_db = SOURCE_DB + "_resume_fk"
@@ -1714,7 +1867,6 @@ def test_fk_restore_failure_retains_journal(monkeypatch):
 def test_fk_restore_rejects_same_name_with_different_definition():
     param = {
         "use_temp_tables": False,
-        "use_copy_protocol": True,
         "suffix_override": "_fk_name_collision",
     }
     source_db = SOURCE_DB + "_fk_name_collision"
@@ -1831,21 +1983,14 @@ def _apply_grow_mutations(source_db):
     params=[
         {
             "use_temp_tables": False,
-            "use_copy_protocol": False,
             "suffix_override": "_grow",
         },
         {
             "use_temp_tables": True,
-            "use_copy_protocol": False,
             "suffix_override": "_grow_tt",
         },
-        {
-            "use_temp_tables": False,
-            "use_copy_protocol": True,
-            "suffix_override": "_grow_cp",
-        },
     ],
-    ids=["unnest_grow", "temp_tables_grow", "copy_protocol_grow"],
+    ids=["unnest_grow", "temp_tables_grow"],
 )
 def grow_dbs(request):
     """Run once, mutate the source, re-run in grow mode, then grow again.
@@ -2051,7 +2196,6 @@ def grow_parallel_dbs():
     in grow_dbs."""
     param = {
         "use_temp_tables": False,
-        "use_copy_protocol": True,
         "suffix_override": "_grow_par",
         "parallel_read_workers": 4,
         "setup_sql": [
@@ -2182,116 +2326,6 @@ def test_grow_parallel_two_phase_split(grow_parallel_dbs):
             "SELECT COUNT(DISTINCT (customer_id, tag)) FROM sales.customer_tags",
         )
         == 25000
-    )
-
-
-@pytest.fixture(scope="module")
-def grow_batch_boundary_dbs():
-    """Deactivate-and-replace pair straddling a fetchmany boundary.
-
-    With compute_batch_size patched to 2, one copy of customer 6's history
-    rows spans multiple executemany batches, and the retired row's refresh
-    can land in a later batch than the new active row's insert. The
-    executemany path must stage the whole copy and apply refreshes before
-    inserts (like the COPY path) for this grow run to succeed under the
-    live partial unique index."""
-    import db_condenser.psql_database_helper as helper_mod
-    import db_condenser.subset as subset_mod
-
-    param = {
-        "use_temp_tables": False,
-        "use_copy_protocol": False,
-        "suffix_override": "_grow_bb",
-    }
-    source_db, dest_db = _run_subsetter(**param)
-
-    src = psycopg.connect(
-        dbname=source_db,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        host=DB_HOST,
-        port=DB_PORT,
-    )
-    with src.cursor() as cur:
-        cur.execute(
-            "UPDATE sales.customer_status_history SET active = false"
-            " WHERE customer_id = 6 AND active"
-        )
-        cur.execute(
-            "INSERT INTO sales.customer_status_history (customer_id, status, active)"
-            " VALUES (6, 'gold', true)"
-        )
-        # rewrite the retired row so its heap tuple follows the new row:
-        # scan order then yields gold before the refresh that unblocks it
-        cur.execute(
-            "DELETE FROM sales.customer_status_history"
-            " WHERE customer_id = 6 AND status = 'silver'"
-        )
-        cur.execute(
-            "INSERT INTO sales.customer_status_history"
-            " (id, customer_id, status, active)"
-            " VALUES (7, 6, 'silver-retired', false)"
-        )
-    src.commit()
-    src.close()
-
-    real_subset_batch = subset_mod.compute_batch_size
-    real_helper_batch = helper_mod.compute_batch_size
-    subset_mod.compute_batch_size = lambda column_count: 2
-    helper_mod.compute_batch_size = lambda column_count: 2
-    try:
-        _run_subsetter(**param, mode="grow")
-    finally:
-        subset_mod.compute_batch_size = real_subset_batch
-        helper_mod.compute_batch_size = real_helper_batch
-
-    dest = psycopg.connect(
-        dbname=dest_db,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        host=DB_HOST,
-        port=DB_PORT,
-    )
-    yield dest
-    dest.close()
-
-    admin = _admin_conn()
-    with admin.cursor() as cur:
-        for db in (source_db, dest_db):
-            cur.execute(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                "WHERE datname = %s AND pid <> pg_backend_pid()",
-                (db,),
-            )
-            cur.execute(f"DROP DATABASE IF EXISTS {db}")
-    admin.close()
-
-
-def test_grow_history_pair_across_batch_boundary(grow_batch_boundary_dbs):
-    dest = grow_batch_boundary_dbs
-    assert (
-        _query_one(
-            dest,
-            "SELECT COUNT(*) FROM sales.customer_status_history"
-            " WHERE customer_id = 6 AND active",
-        )
-        == 1
-    )
-    assert (
-        _query_one(
-            dest,
-            "SELECT status FROM sales.customer_status_history"
-            " WHERE customer_id = 6 AND active",
-        )
-        == "gold"
-    )
-    assert (
-        _query_one(
-            dest,
-            "SELECT COUNT(*) FROM sales.customer_status_history"
-            " WHERE customer_id = 6 AND status = 'silver-retired' AND NOT active",
-        )
-        == 1
     )
 
 
@@ -2460,7 +2494,6 @@ def audit_history_dbs(request):
     suffix = "_audit_" + mode
     param = {
         "use_temp_tables": False,
-        "use_copy_protocol": True,
         "suffix_override": suffix,
         "setup_sql": AUDIT_HISTORY_SETUP,
         "config_overrides": _audit_history_config(),
@@ -2657,7 +2690,6 @@ def test_failed_history_grow_rejects_partial_config_edits(monkeypatch):
     config_overrides = _audit_history_config()
     param = {
         "use_temp_tables": False,
-        "use_copy_protocol": True,
         "suffix_override": suffix,
         "setup_sql": AUDIT_HISTORY_SETUP,
         "config_overrides": config_overrides,
@@ -2748,7 +2780,6 @@ def incremental_composite_dbs():
     the child and its delta table)."""
     param = {
         "use_temp_tables": False,
-        "use_copy_protocol": False,
         "suffix_override": "_incr_comp",
         "config_overrides": {
             "passthrough_tables": ["public.regions", "inventory.stock_levels"]

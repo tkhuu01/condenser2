@@ -444,7 +444,6 @@ def _admin(database="postgres", autocommit=True):
 
 
 def _run_case(case, source_database, destination_database, mode="grow"):
-    strategy = case.seed % 3
     raw_config = {
         "db_type": "postgres",
         "source_db_connection_info": _connection_info(source_database),
@@ -452,8 +451,7 @@ def _run_case(case, source_database, destination_database, mode="grow"):
         "initial_targets": [{"table": "randomized.organizations", "where": "selected"}],
         "destination_mode": mode,
         "keep_disconnected_tables": False,
-        "use_temp_tables": strategy == 2,
-        "use_copy_protocol": strategy == 0,
+        "use_temp_tables": case.seed % 2 == 0,
         "parallel_read_workers": PARALLEL_READ_WORKERS,
         "dependency_breaks": [
             {

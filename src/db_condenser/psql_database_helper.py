@@ -5,14 +5,13 @@ import uuid
 from dataclasses import asdict
 
 from psycopg import sql
-from psycopg.types.json import Json, set_json_loads
+from psycopg.types.json import set_json_loads
 
 from db_condenser.config_reader import DestinationMode, get_config
 from db_condenser.db_connect import PsqlConnection
 from db_condenser.subset_utils import (
     columns_joined,
     columns_tupled,
-    compute_batch_size,
     fully_qualified_table,
     quoter,
     schema_name,
@@ -764,126 +763,8 @@ def turn_off_constraints(connection):
     pass
 
 
-def copy_rows(
-    source, destination, query, destination_table, params=None, batch_size=None
-):
-    datatypes = get_table_datatypes(
-        table_name(destination_table), schema_name(destination_table), destination
-    )
-    if batch_size is None:
-        batch_size = compute_batch_size(len(datatypes))
-
-    non_generated_columns = [
-        (dt[0], dt[1]) for _, dt in enumerate(datatypes) if not dt[2]
-    ]
-    updatable_columns = [dt[0] for dt in datatypes if not dt[2] and dt[3] != "a"]
-    generated_columns_positions = {i for i, dt in enumerate(datatypes) if dt[2]}
-    always_generated_id = any([dt[3] == "a" for dt in datatypes])
-
-    def template_piece(dt):
-        if dt == "_json":
-            return "%s::json[]"
-        elif dt == "_jsonb":
-            return "%s::jsonb[]"
-        else:
-            return "%s"
-
-    template = (
-        "(" + ",".join([template_piece(dt[1]) for dt in non_generated_columns]) + ")"
-    )
-    columns = '("' + '","'.join([dt[0] for dt in non_generated_columns]) + '")'
-
-    json_positions = {
-        i for i, dt in enumerate(non_generated_columns) if dt[1] in ("json", "jsonb")
-    }
-
-    def _adapt_json(val):
-        if val is None:
-            return None
-        if isinstance(val, bytes):
-            val = val.decode("utf-8")
-        return Json(val)
-
-    def _adapt_row(row):
-        if json_positions:
-            return tuple(
-                _adapt_json(val) if i in json_positions else val
-                for i, val in enumerate(row)
-            )
-        return row
-
-    cursor_name = "table_cursor_" + str(uuid.uuid4()).replace("-", "")
-    cursor = source.cursor(name=cursor_name)
-    # using the inner_cursor means we don't log all the noise
-    destination_cursor = destination.cursor().inner_cursor
-    try:
-        cursor.execute(query, params)
-
-        conflict_clause, upsert_pk = _conflict_clause(
-            destination_table, updatable_columns
-        )
-        if upsert_pk is not None:
-            # incremental upsert: per-batch ordering cannot cover a
-            # deactivate-and-replace pair that straddles a fetchmany
-            # boundary, so stage the whole copy into the session staging
-            # table first, then apply it with the same refresh-then-insert
-            # statements the COPY-protocol path uses
-            dest_table = fully_qualified_table(destination_table)
-            temp_table = '"{}"'.format(
-                _prefixed_identifier("_copy_staging_", destination_table)
-            )
-            destination_cursor.execute(
-                "CREATE TEMPORARY TABLE IF NOT EXISTS {} (LIKE {} INCLUDING DEFAULTS)".format(
-                    temp_table, dest_table
-                )
-            )
-            destination_cursor.execute("TRUNCATE {}".format(temp_table))
-            insert_query = "INSERT INTO {} {} VALUES {}".format(
-                temp_table, columns, template
-            )
-        else:
-            insert_query = "INSERT INTO {} AS _dest {}{} VALUES {}{}".format(
-                fully_qualified_table(destination_table),
-                columns,
-                " OVERRIDING SYSTEM VALUE" if always_generated_id else "",
-                template,
-                conflict_clause,
-            )
-            insert_query = _wrap_insert_with_delta(insert_query, destination_table)
-
-        while True:
-            rows = cursor.fetchmany(batch_size)
-            if not rows:
-                break
-
-            if generated_columns_positions:
-                updated_rows = (
-                    _adapt_row(
-                        tuple(
-                            val
-                            for i, val in enumerate(row)
-                            if i not in generated_columns_positions
-                        )
-                    )
-                    for row in rows
-                )
-            else:
-                updated_rows = (_adapt_row(row) for row in rows)
-
-            destination_cursor.executemany(insert_query, updated_rows)
-
-        if upsert_pk is not None:
-            apply_staged(destination, destination_table, "refresh")
-            apply_staged(destination, destination_table, "insert")
-
-    finally:
-        destination_cursor.close()
-        cursor.close()
-        destination.commit()
-
-
 def _copy_metadata(destination_table, destination):
-    """Shared column/naming metadata for the COPY-protocol paths."""
+    """Shared column/naming metadata for COPY paths."""
     datatypes = get_table_datatypes(
         table_name(destination_table), schema_name(destination_table), destination
     )
@@ -929,10 +810,13 @@ def _pipe_copy(source_cursor, dest_cursor, query, params, column_list, copy_targ
                 dest_copy.write(bytes(buf))
 
 
-def stage_rows(source, destination, query, destination_table, params=None):
+def stage_rows(
+    source, destination, query, destination_table, params=None, append=False
+):
     """Two-phase parallel copy, step 1: stream a worker's rows into its
     session-local staging table without applying them. The caller applies
-    them later with apply_staged (refresh phase, barrier, insert phase)."""
+    them later with apply_staged (refresh phase, barrier, insert phase).
+    append=True accumulates multiple queries for one table-level phase split."""
     _, column_list, _, dest_table, temp_table = _copy_metadata(
         destination_table, destination
     )
@@ -944,7 +828,8 @@ def stage_rows(source, destination, query, destination_table, params=None):
                 temp_table, dest_table
             )
         )
-        dest_cursor.execute("TRUNCATE {}".format(temp_table))
+        if not append:
+            dest_cursor.execute("TRUNCATE {}".format(temp_table))
         _pipe_copy(source_cursor, dest_cursor, query, params, column_list, temp_table)
     finally:
         dest_cursor.close()
@@ -1005,11 +890,11 @@ def apply_staged(destination, destination_table, phase):
         destination.commit()
 
 
-def copy_rows_copy_protocol(
+def copy_rows(
     source, destination, query, destination_table, params=None, batch_size=None
 ):
-    # batch_size is accepted for interface parity with copy_rows (both are used
-    # as self.__copy_rows) but is unused here: the COPY stream self-chunks.
+    # batch_size is accepted for database-helper interface parity but is unused:
+    # the COPY stream self-chunks.
     (
         updatable_columns,
         column_list,

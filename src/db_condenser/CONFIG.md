@@ -115,10 +115,6 @@ This enables server-side JOINs, making subsetting more memory-efficient.
 Requires write access on the source database (for `CREATE TEMPORARY TABLE`).
 Default is `false`.
 
-`use_copy_protocol`: If `true`, uses PostgreSQL's `COPY ... FROM STDIN`
-protocol for row transfer instead of per-row INSERT statements. Significantly
-faster (5-10x for bulk inserts). Postgres only. Default is `true`.
-
 `parallel_read_workers`: Number of parallel connections used to read direct
 target tables from the source. Splits work by physical page ranges (ctid),
 so it works for any table regardless of primary key type. Designed for
