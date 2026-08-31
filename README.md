@@ -90,6 +90,33 @@ pip install db-condenser
 pipx install db-condenser
 ```
 
+## Docker
+
+The Dockerfile provides separate targets for PostgreSQL, MySQL, and an image
+containing both database clients:
+
+```bash
+# PostgreSQL client 18 (set POSTGRES_MAJOR to match another supported major)
+docker build -f docker/Dockerfile --target postgres \
+  --build-arg POSTGRES_MAJOR=18 -t db-condenser:postgres18 .
+
+docker build -f docker/Dockerfile --target mysql \
+  -t db-condenser:mysql .
+
+docker build -f docker/Dockerfile --target full \
+  --build-arg POSTGRES_MAJOR=18 -t db-condenser:latest .
+```
+
+The PostgreSQL client should match the destination server's major version and
+must not be older than the source server. Run the image by mounting the config
+file into its writable working directory:
+
+```bash
+docker run --rm -it \
+  --mount type=bind,src="$PWD/config.json",dst=/work/config.json,readonly \
+  db-condenser:postgres18 -y
+```
+
 ## Running
 
 Almost all the configuration is in the `config.json` file, so running it is as simple as

@@ -3,9 +3,6 @@ import sys
 import time
 from datetime import datetime
 
-import mysql.connector
-import psycopg
-
 from db_condenser.config_reader import DbConnectInfo, DbType
 
 
@@ -50,6 +47,8 @@ class LoggingCursor:
 # method across MySQL and Postgres. This one is for Postgres
 class PsqlConnection(DbConnection):
     def __init__(self, connect, read_repeatable, verbose=False):
+        import psycopg
+
         connection_args = dict(
             dbname=connect.db_name,
             user=connect.user,
@@ -76,9 +75,11 @@ class PsqlConnection(DbConnection):
 # method across MySQL and Postgres. This one is for MySQL
 class MySqlConnection(DbConnection):
     def __init__(self, connect, read_repeatable, verbose=False):
+        from mysql import connector
+
         DbConnection.__init__(
             self,
-            mysql.connector.connect(
+            connector.connect(
                 host=connect.host,
                 port=connect.port,
                 user=connect.user,
