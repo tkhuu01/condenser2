@@ -27,6 +27,12 @@ quite powerful as a productivity enhancer. Another example is copying specific
 rows from one database and placing them into another while maintaining referential
 integrity.
 
+Incremental subsetting can keep a long-lived staging database current without
+rebuilding it. After production data changes, a topup run adds newly targeted
+entities and their related rows, while a grow run also captures new descendants
+such as orders for customers already present in staging. Re-read rows are refreshed,
+but source deletions and schema changes require a recreate or separate migration.
+
 You can find more about the original Condenser details
 [here](https://www.tonic.ai/blog/condenser-a-database-subsetting-tool) and
 [here](https://www.tonic.ai/blog/condenser-v2/).
