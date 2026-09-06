@@ -49,6 +49,17 @@ dev = [
 [tool.ruff.lint]
 extend-select = ["I"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers --import-mode=importlib"
+markers = [
+    "unit: database-free tests (pytest -m unit)",
+    "integration: tests requiring a disposable database service",
+    "postgres: PostgreSQL integration tests",
+    "mysql: MySQL integration tests (set MYSQL_HOST to opt in)",
+    "performance: opt-in measurements (--run-performance)",
+]
+
 [build-system]
 requires = ["uv_build>=0.11.0,<0.12.0"]
 build-backend = "uv_build"
