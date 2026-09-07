@@ -1,3 +1,5 @@
+"""Schema-tool behavior with subprocesses mocked; no database is required."""
+
 import os
 import subprocess
 from types import SimpleNamespace

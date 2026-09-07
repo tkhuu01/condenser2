@@ -4,3 +4,21 @@ __pycache__/
 SQL/
 config.json
 benchmarks/
+
+# Local benchmark configuration and scratch output
+/bench_config*.json
+/new_diff.txt
+/tests/performance/baseline.json
+/baseline*.xml
+/junit*.xml
+
+# Python environments, test caches, and build artifacts
+/.venv/
+/.pytest_cache/
+/.ruff_cache/
+/build/
+/dist/
+*.egg-info/
+/.coverage*
+/coverage.xml
+/htmlcov/
