@@ -4,6 +4,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, TypedDict, runtime_checkable
 
+from db_condenser.config_reader import Config
+
 
 class Relationship(TypedDict):
     """Ordered FK/reference columns; composite pairs must never be flattened.
@@ -57,6 +59,24 @@ class SchemaManager(Protocol):
     def add_constraints(self) -> None: ...
 
 
+class RunSession(Protocol):
+    """Owns main connections and pooled readers for a single run.
+
+    Additional worker connections returned by open_source_connection are
+    caller-owned. finish restores run state; close always releases connections.
+    """
+
+    source: Connection
+    destination: Connection
+    source_pool: list[Connection]
+
+    def open_source_connection(self) -> Connection: ...
+    def prepare(self) -> None: ...
+    def prepare_incremental(self, tables: list[str]) -> None: ...
+    def finish(self, succeeded: bool) -> None: ...
+    def close(self) -> None: ...
+
+
 @dataclass(frozen=True)
 class BackendCapabilities:
     """Descriptive support, not runtime routing or permission checks.
@@ -88,12 +108,19 @@ class Backend(Protocol):
 
     Scratch setup/cleanup retain backend-specific effects: PostgreSQL clears
     metadata caches; MySQL creates/drops its source/destination scratch database.
-    Incremental journals and their failure-retention rules remain on the legacy
-    PostgreSQL helper until the run-session extraction in Stage 3.
+    Run sessions coordinate snapshots, incremental journals, and FK restoration
+    through the existing backend-specific SQL helpers.
     """
 
     @property
     def capabilities(self) -> BackendCapabilities: ...
+
+    def open_run(
+        self,
+        source: ConnectionFactory,
+        destination: ConnectionFactory,
+        config: Config,
+    ) -> RunSession: ...
 
     def schema_manager(
         self, source: ConnectionFactory, destination: ConnectionFactory

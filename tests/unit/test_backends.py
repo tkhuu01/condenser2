@@ -9,6 +9,7 @@ import pytest
 from db_condenser import config_reader, database_helper
 from db_condenser.backends import get_backend
 from db_condenser.backends.contracts import Backend, SchemaManager
+from db_condenser.backends.mysql import MySqlRunSession
 from db_condenser.config_reader import DbType
 from db_condenser.subset import Subset
 
@@ -126,6 +127,9 @@ def test_real_traversal_accepts_a_recording_backend(monkeypatch, fail_copy):
     )
     monkeypatch.setattr(config_reader, "config", config)
     backend = create_autospec(Backend, instance=True, spec_set=True)
+    backend.open_run.side_effect = lambda source, destination, config: MySqlRunSession(
+        backend, source, destination, config
+    )
     backend.get_unredacted_fk_relationships.return_value = []
     backend.get_table_columns.return_value = ["id", "payload"]
     source, destination = Mock(), Mock()
