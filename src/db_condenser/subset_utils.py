@@ -1,4 +1,5 @@
 from db_condenser import database_helper
+from db_condenser.backends.contracts import Backend
 from db_condenser.config_reader import DbType, get_config
 from db_condenser.db_connect import MySqlConnection
 
@@ -6,7 +7,7 @@ from db_condenser.db_connect import MySqlConnection
 # this function generally copies all columns as is, but if the table has been selected as
 # breaking a dependency cycle, then it will insert NULLs instead of that table's foreign keys
 # to the downstream dependency that breaks the cycle
-def columns_to_copy(table, relationships, conn):
+def columns_to_copy(table, relationships, conn, *, backend: Backend | None = None):
     config = get_config()
     target_breaks = set()
     opportunists = config.preserve_fk_opportunistically
@@ -19,9 +20,8 @@ def columns_to_copy(table, relationships, conn):
         if rel["fk_table"] == table and rel["target_table"] in target_breaks:
             columns_to_null.update(rel["fk_columns"])
 
-    columns = database_helper.get_specific_helper().get_table_columns(
-        table_name(table), schema_name(table), conn
-    )
+    helper = backend if backend is not None else database_helper.get_specific_helper()
+    columns = helper.get_table_columns(table_name(table), schema_name(table), conn)
     return ",".join(
         [
             "{}.{}".format(quoter(table_name(table)), quoter(c))

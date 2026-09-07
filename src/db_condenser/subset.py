@@ -4,6 +4,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from db_condenser import database_helper
+from db_condenser.backends import get_backend
+from db_condenser.backends.contracts import Backend
 from db_condenser.config_reader import (
     DbType,
     DestinationMode,
@@ -53,6 +55,8 @@ class Subset:
         source_dbc: DbConnect,
         destination_dbc: DbConnect,
         all_tables: list[str],
+        *,
+        backend: Backend | None = None,
     ):
         self.config = get_config()
         self.__all_tables = all_tables
@@ -73,11 +77,17 @@ class Subset:
         self.__source_conn = source_dbc.get_db_connection(read_repeatable=True)
         self.__destination_conn = destination_dbc.get_db_connection()
 
+        self.__backend = (
+            backend if backend is not None else get_backend(self.config.db_type)
+        )
+        # PostgreSQL-only incremental/parallel operations remain on the old
+        # helper until the run-state and execution extractions. Keep this
+        # compatibility path explicit instead of a catch-all adapter proxy.
         self.__db_helper = database_helper.get_specific_helper()
 
-        self.__db_helper.turn_off_constraints(self.__destination_conn)
+        self.__backend.turn_off_constraints(self.__destination_conn)
 
-        self.__copy_rows = self.__db_helper.copy_rows
+        self.__copy_rows = self.__backend.copy_rows
 
         if self.config.use_temp_tables:
             self.__check_source_writable()
@@ -157,7 +167,7 @@ class Subset:
 
     def run_middle_out(self):
         passthrough_tables = self.config.passthrough_tables
-        relationships = self.__db_helper.get_unredacted_fk_relationships(
+        relationships = self.__backend.get_unredacted_fk_relationships(
             self.__all_tables, self.__source_conn
         )
         disconnected_tables = compute_disconnected_tables(
@@ -286,9 +296,9 @@ class Subset:
             )
 
     def prep_temp_dbs(self):
-        self.__db_helper.prep_temp_dbs(self.__source_conn, self.__destination_conn)
+        self.__backend.prep_temp_dbs(self.__source_conn, self.__destination_conn)
         if self.__incremental:
-            relationships = self.__db_helper.get_unredacted_fk_relationships(
+            relationships = self.__backend.get_unredacted_fk_relationships(
                 self.__all_tables, self.__source_conn
             )
             disconnected = compute_disconnected_tables(
@@ -313,7 +323,7 @@ class Subset:
             )
 
     def unprep_temp_dbs(self, succeeded=True):
-        self.__db_helper.unprep_temp_dbs(self.__source_conn, self.__destination_conn)
+        self.__backend.unprep_temp_dbs(self.__source_conn, self.__destination_conn)
         if self.__incremental_prepared:
             try:
                 self.__destination_conn.connection.rollback()
@@ -444,7 +454,7 @@ class Subset:
         dest_conn = self.__destination_dbc.get_db_connection()
         # no-op on Postgres; preserves prior MySQL behavior where this path
         # used the shared dest connection that had constraints disabled
-        self.__db_helper.turn_off_constraints(dest_conn)
+        self.__backend.turn_off_constraints(dest_conn)
         try:
             q = "SELECT * FROM {}".format(fully_qualified_table(table))
             if self.config.max_rows_per_table is not None:
@@ -484,7 +494,7 @@ class Subset:
             dest_conn = self.__destination_dbc.get_db_connection()
             # no-op on Postgres; preserves prior MySQL behavior where this path
             # used the shared dest connection that had constraints disabled
-            self.__db_helper.turn_off_constraints(dest_conn)
+            self.__backend.turn_off_constraints(dest_conn)
             try:
                 self.__subset_direct(target, relationships, source_conn, dest_conn)
             finally:
@@ -594,7 +604,9 @@ class Subset:
     def __subset_direct_parallel(self, target: InitialTarget, relationships):
         """Subset a direct target using parallel ctid page-range splitting."""
         t = target.table
-        columns_query = columns_to_copy(t, relationships, self.__source_conn)
+        columns_query = columns_to_copy(
+            t, relationships, self.__source_conn, backend=self.__backend
+        )
         fqt = fully_qualified_table(t)
 
         conditions = []
@@ -658,7 +670,7 @@ class Subset:
     ):
         source_conn = source_conn or self.__source_conn
         dest_conn = dest_conn or self.__destination_conn
-        id_temp = self.__db_helper.create_id_temp_table(source_conn, len(columns))
+        id_temp = self.__backend.create_id_temp_table(source_conn, len(columns))
         insert_q = 'INSERT INTO "{}" VALUES ({})'.format(
             id_temp, ",".join(["%s"] * len(columns))
         )
@@ -715,7 +727,9 @@ class Subset:
         source_conn = source_conn or self.__source_conn
         dest_conn = dest_conn or self.__destination_conn
         t = target.table
-        columns_query = columns_to_copy(t, relationships, source_conn)
+        columns_query = columns_to_copy(
+            t, relationships, source_conn, backend=self.__backend
+        )
         if target.where is not None:
             q = "SELECT {} FROM {} WHERE {}".format(
                 columns_query, fully_qualified_table(t), target.where
@@ -863,11 +877,13 @@ class Subset:
         if skip:
             return True
 
-        table_columns = self.__db_helper.get_table_columns(
+        table_columns = self.__backend.get_table_columns(
             table_name(target), schema_name(target), source_conn
         )
         upstream_filters = upstream_filter_match(target, table_columns)
-        columns_query = columns_to_copy(target, relationships, source_conn)
+        columns_query = columns_to_copy(
+            target, relationships, source_conn, backend=self.__backend
+        )
 
         if self.config.use_temp_tables:
             self.__subset_upstream_temp_tables(
@@ -905,7 +921,7 @@ class Subset:
     ):
         fk_datatypes = {
             col: typ
-            for col, typ, _, _ in self.__db_helper.get_table_datatypes(
+            for col, typ, _, _ in self.__backend.get_table_datatypes(
                 table_name(target), schema_name(target), source_conn
             )
         }
@@ -1069,7 +1085,7 @@ class Subset:
     ):
         fk_datatypes = {
             col: typ
-            for col, typ, _, _ in self.__db_helper.get_table_datatypes(
+            for col, typ, _, _ in self.__backend.get_table_datatypes(
                 table_name(target), schema_name(target), source_conn
             )
         }
@@ -1485,11 +1501,11 @@ class Subset:
             )
             staged = True
 
-        columns_query = columns_to_copy(table, relationships, source_conn)
+        columns_query = columns_to_copy(
+            table, relationships, source_conn, backend=self.__backend
+        )
         for pk_columns, group in relationship_groups.items():
-            temp_table = self.__db_helper.create_id_temp_table(
-                dest_conn, len(pk_columns)
-            )
+            temp_table = self.__backend.create_id_temp_table(dest_conn, len(pk_columns))
 
             for r in group:
                 fk_table = r["fk_table"]
@@ -1573,7 +1589,7 @@ class Subset:
     ):
         downstream_datatypes = {
             col: typ
-            for col, typ, _, _ in self.__db_helper.get_table_datatypes(
+            for col, typ, _, _ in self.__backend.get_table_datatypes(
                 table_name(table), schema_name(table), source_conn
             )
         }
@@ -1607,7 +1623,7 @@ class Subset:
     ):
         downstream_datatypes = {
             col: typ
-            for col, typ, _, _ in self.__db_helper.get_table_datatypes(
+            for col, typ, _, _ in self.__backend.get_table_datatypes(
                 table_name(table), schema_name(table), source_conn
             )
         }

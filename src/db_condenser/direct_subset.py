@@ -3,22 +3,18 @@ import sys
 import time
 from importlib import resources
 
-from db_condenser import config_reader, database_helper, result_tabulator
+from db_condenser import config_reader, result_tabulator
+from db_condenser.backends import get_backend
+from db_condenser.backends.contracts import SchemaManager
 from db_condenser.config_reader import DbConnectInfo, DbType, DestinationMode
 from db_condenser.db_connect import DbConnect, MySqlConnection, PsqlConnection
-from db_condenser.mysql_database_creator import MySqlDatabaseCreator
-from db_condenser.psql_database_creator import PsqlDatabaseCreator
 from db_condenser.subset import Subset
 from db_condenser.subset_utils import print_progress
 
 
-def db_creator(
-    db_type: DbType, source: DbConnect, dest: DbConnect
-) -> PsqlDatabaseCreator | MySqlDatabaseCreator:
-    if db_type == DbType.POSTGRES:
-        return PsqlDatabaseCreator(source, dest, False)
-    elif db_type == DbType.MYSQL:
-        return MySqlDatabaseCreator(source, dest)
+def db_creator(db_type: DbType, source: DbConnect, dest: DbConnect) -> SchemaManager:
+    """Compatibility entrypoint; backend selection is explicit."""
+    return get_backend(db_type).schema_manager(source, dest)
 
 
 def _parse_args():
@@ -101,18 +97,18 @@ def main():
 
     destination_dbc = DbConnect(db_type, dest_info, verbose=args.verbose)
 
-    database = db_creator(db_type, source_dbc, destination_dbc)
+    backend = get_backend(db_type)
+    database = backend.schema_manager(source_dbc, destination_dbc)
 
     if config.destination_mode == DestinationMode.RECREATE:
         database.teardown()
         database.create()
 
     # Get list of tables to operate on
-    db_helper = database_helper.get_specific_helper()
-    all_tables = db_helper.list_all_tables(source_dbc)
+    all_tables = backend.list_all_tables(source_dbc)
     all_tables = [x for x in all_tables if x not in config.excluded_tables]
 
-    subsetter = Subset(source_dbc, destination_dbc, all_tables)
+    subsetter = Subset(source_dbc, destination_dbc, all_tables, backend=backend)
 
     total_start_time = time.time()
     succeeded = False
@@ -124,7 +120,7 @@ def main():
         start_time = time.time()
         for idx, sql in enumerate(config.pre_constraint_sql):
             print_progress(sql, idx + 1, len(config.pre_constraint_sql))
-            db_helper.run_query(sql, destination_dbc.get_db_connection())
+            backend.run_query(sql, destination_dbc.get_db_connection())
         print(
             "Pre-constraint SQL completed in {:.1f}s".format(time.time() - start_time)
         )
@@ -140,7 +136,7 @@ def main():
         start_time = time.time()
         for idx, sql in enumerate(config.post_subset_sql):
             print_progress(sql, idx + 1, len(config.post_subset_sql))
-            db_helper.run_query(sql, destination_dbc.get_db_connection())
+            backend.run_query(sql, destination_dbc.get_db_connection())
         print("Post-subset SQL completed in {:.1f}s".format(time.time() - start_time))
 
         print("Resetting sequence numbering")
@@ -148,17 +144,17 @@ def main():
         dest_conn = destination_dbc.get_db_connection()
         if db_type == DbType.POSTGRES:
             assert isinstance(dest_conn, PsqlConnection)
-            db_helper.update_sequence_numbering(dest_conn, all_tables_no_pg)
+            backend.update_sequence_numbering(dest_conn, all_tables_no_pg)
         elif db_type == DbType.MYSQL:
             # TODO update sequencing for mysql
             assert isinstance(dest_conn, MySqlConnection)
-            # db_helper.update_sequence_numbering(
+            # backend.update_sequence_numbering(
             #    dest_conn, all_tables_no_pg
             # )
 
         total_elapsed = time.time() - total_start_time
         result_tabulator.tabulate(
-            source_dbc, destination_dbc, all_tables, total_elapsed
+            source_dbc, destination_dbc, all_tables, total_elapsed, backend=backend
         )
         succeeded = True
     except KeyboardInterrupt:
