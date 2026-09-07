@@ -72,25 +72,19 @@ class Subset:
                 + ", ".join(sorted(unknown_incremental_keys))
             )
 
-        self.__source_dbc = source_dbc
         self.__destination_dbc = destination_dbc
-        self.__source_conn = source_dbc.get_db_connection(read_repeatable=True)
-        self.__destination_conn = destination_dbc.get_db_connection()
-
         self.__backend = (
             backend if backend is not None else get_backend(self.config.db_type)
         )
-        # PostgreSQL-only incremental/parallel operations remain on the old
-        # helper until the run-state and execution extractions. Keep this
-        # compatibility path explicit instead of a catch-all adapter proxy.
+        # SQL execution remains on the legacy helper until its extraction.
         self.__db_helper = database_helper.get_specific_helper()
-
-        self.__backend.turn_off_constraints(self.__destination_conn)
-
+        self.__session = self.__backend.open_run(
+            source_dbc, destination_dbc, self.config
+        )
+        self.__source_conn = self.__session.source
+        self.__destination_conn = self.__session.destination
+        self.__source_pool = self.__session.source_pool
         self.__copy_rows = self.__backend.copy_rows
-
-        if self.config.use_temp_tables:
-            self.__check_source_writable()
 
         # topup/grow mean the destination already exists: track selected row
         # identities in per-table delta tables and drop/restore FKs around the run
@@ -100,19 +94,6 @@ class Subset:
         self.__upstream_delta_reads = (
             self.__incremental and self.config.destination_mode == DestinationMode.TOPUP
         )
-        self.__dropped_fks = []
-        self.__incremental_prepared = False
-
-        # export one snapshot from the main source connection; every other
-        # source connection imports it so all reads see the database as of
-        # the same instant. The main connection's transaction must stay open
-        # for the whole run to keep the snapshot importable.
-        self.__snapshot_id = None
-        if self.config.db_type == DbType.POSTGRES:
-            with self.__source_conn.cursor() as cur:
-                cur.execute("SELECT pg_export_snapshot()")
-                self.__snapshot_id = cur.fetchone()[0]
-
         # table-level concurrency follows parallel_read_workers when set,
         # otherwise keeps the historical 4 threads
         self.__table_workers = (
@@ -121,49 +102,8 @@ class Subset:
             else 4
         )
 
-        self.__source_pool = []
-        if (
-            self.config.parallel_read_workers > 1
-            and self.config.db_type == DbType.POSTGRES
-        ):
-            for _ in range(self.config.parallel_read_workers):
-                self.__source_pool.append(self.__get_source_connection())
-
     def __get_source_connection(self):
-        """Open a source connection pinned to the run's exported snapshot."""
-        conn = self.__source_dbc.get_db_connection(read_repeatable=True)
-        if self.__snapshot_id is not None:
-            with conn.cursor() as cur:
-                cur.execute("SET TRANSACTION SNAPSHOT '{}'".format(self.__snapshot_id))
-        return conn
-
-    def __check_source_writable(self):
-        if self.config.db_type == DbType.POSTGRES:
-            with self.__source_conn.cursor() as cur:
-                cur.execute(
-                    "SELECT pg_is_in_recovery(),"
-                    " has_database_privilege(current_user, current_database(), 'TEMP')"
-                )
-                is_replica, has_temp = cur.fetchone()
-            if is_replica:
-                raise RuntimeError(
-                    "use_temp_tables is enabled but the source database is a"
-                    " read replica (pg_is_in_recovery() = true)"
-                )
-            if not has_temp:
-                raise RuntimeError(
-                    "use_temp_tables is enabled but the source user lacks the"
-                    " TEMP privilege on the source database"
-                )
-        elif self.config.db_type == DbType.MYSQL:
-            with self.__source_conn.cursor() as cur:
-                cur.execute("SELECT @@global.read_only")
-                (read_only,) = cur.fetchone()
-            if read_only:
-                raise RuntimeError(
-                    "use_temp_tables is enabled but the source database is"
-                    " read-only (@@global.read_only = 1)"
-                )
+        return self.__session.open_source_connection()
 
     def run_middle_out(self):
         passthrough_tables = self.config.passthrough_tables
@@ -296,7 +236,7 @@ class Subset:
             )
 
     def prep_temp_dbs(self):
-        self.__backend.prep_temp_dbs(self.__source_conn, self.__destination_conn)
+        self.__session.prepare()
         if self.__incremental:
             relationships = self.__backend.get_unredacted_fk_relationships(
                 self.__all_tables, self.__source_conn
@@ -312,40 +252,13 @@ class Subset:
                 incremental_tables = [
                     table for table in self.__all_tables if table not in disconnected
                 ]
-            self.__db_helper.prep_incremental(
-                self.__source_conn, self.__destination_conn, incremental_tables
-            )
-            self.__incremental_prepared = True
-            # constraints are live on an existing destination, but middle-out
-            # load order inserts referencing rows before referenced ones
-            self.__dropped_fks = self.__db_helper.drop_fk_constraints(
-                self.__destination_conn
-            )
+            self.__session.prepare_incremental(incremental_tables)
 
     def unprep_temp_dbs(self, succeeded=True):
-        self.__backend.unprep_temp_dbs(self.__source_conn, self.__destination_conn)
-        if self.__incremental_prepared:
-            try:
-                self.__destination_conn.connection.rollback()
-                self.__db_helper.restore_fk_constraints(
-                    self.__destination_conn, self.__dropped_fks
-                )
-                if succeeded:
-                    self.__db_helper.unprep_incremental(self.__destination_conn)
-                else:
-                    self.__db_helper.retain_incremental(self.__destination_conn)
-            except BaseException:
-                self.__destination_conn.connection.rollback()
-                self.__db_helper.retain_incremental(self.__destination_conn)
-                raise
-            finally:
-                self.__incremental_prepared = False
+        self.__session.finish(succeeded)
 
     def close_connections(self):
-        self.__source_conn.close()
-        self.__destination_conn.close()
-        for conn in self.__source_pool:
-            conn.close()
+        self.__session.close()
 
     def __process_stratum_upstream(
         self, stratum, processed_tables, relationships, start_idx, total_count

@@ -6,6 +6,9 @@ their existing integration suites; this is not a claim of feature parity.
 
 import pytest
 
+from db_condenser.config_reader import DbType, get_config
+from db_condenser.db_connect import DbConnect
+
 pytestmark = pytest.mark.integration
 
 
@@ -93,3 +96,33 @@ def test_hook_respects_commit_flag(backend_case):
         "INSERT INTO child VALUES (50,1,'alpha','committed')", case.destination
     )
     assert rows(case.observe_destination()) == [(50, 1, "alpha", "committed")]
+
+
+def test_postgres_run_readers_keep_snapshot_after_committed_source_write(backend_case):
+    config = get_config()
+    if config.db_type != DbType.POSTGRES:
+        pytest.skip("shared snapshots are PostgreSQL-specific")
+    config.parallel_read_workers = 2
+    case = backend_case
+    session = case.backend.open_run(
+        DbConnect(config.db_type, config.source_db_connection_info),
+        DbConnect(config.db_type, config.destination_db_connection_info),
+        config,
+    )
+    try:
+        before = rows(session.source)
+        with case.source.cursor() as cur:
+            cur.execute("INSERT INTO child VALUES (30,1,'alpha','committed later')")
+        case.source.commit()
+        assert len(rows(case.source)) == 3
+        assert rows(session.source) == before
+        for reader in session.source_pool:
+            assert rows(reader) == before
+        # A worker opened after the write must still import the original view.
+        worker = session.open_source_connection()
+        try:
+            assert rows(worker) == before
+        finally:
+            worker.close()
+    finally:
+        session.close()
