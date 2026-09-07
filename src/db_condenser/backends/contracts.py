@@ -1,0 +1,134 @@
+"""The shared backend boundary; no database driver imports."""
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, Protocol, TypedDict, runtime_checkable
+
+
+class Relationship(TypedDict):
+    """Ordered FK/reference columns; composite pairs must never be flattened.
+
+    Keep the existing dictionary representation so graph code needs no
+    conversion or duplicate relationship model during this extraction.
+    """
+
+    fk_table: str
+    fk_columns: list[str]
+    target_table: str
+    target_columns: list[str]
+
+
+# Existing catalog result: name, database type, generated flag, identity flag.
+ColumnInfo = tuple[str, str, str, str]
+QueryParameters = Sequence[Any] | Mapping[str, Any] | None
+
+
+class Connection(Protocol):
+    """Borrowed connection. Adapters pass existing wrappers through unchanged."""
+
+    def cursor(self, name: str | None = None, withhold: bool = False) -> Any: ...
+    def commit(self) -> None: ...
+    def close(self) -> None: ...
+
+
+class ConnectionFactory(Protocol):
+    """Existing DbConnect surface, including schema-tool connection options."""
+
+    db_name: str
+    host: str
+    port: int
+    user: str
+    password: str | None
+    ssl_mode: str | None
+
+    def get_db_connection(self, read_repeatable: bool = False) -> Connection: ...
+
+
+@runtime_checkable
+class SchemaManager(Protocol):
+    """Explicit destructive lifecycle, implemented by the existing creators.
+
+    Construction and methods retain the legacy creators' connection and file
+    ownership. No automatic teardown, transaction, or cleanup is added here.
+    """
+
+    def teardown(self) -> None: ...
+    def create(self) -> None: ...
+    def add_constraints(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class BackendCapabilities:
+    """Descriptive support, not runtime routing or permission checks.
+
+    read_only_source applies to the default path, without source temp tables.
+    relationship_selection means end-to-end traversal, not FK discovery.
+    parallel_reads means within-table parallel reads, not table-level threads.
+    MySQL's currently failing relationship paths must not be advertised as
+    supported or silently skipped just because this flag is false.
+    """
+
+    read_only_source: bool
+    relationship_selection: bool
+    incremental: bool
+    shared_snapshot: bool
+    parallel_reads: bool
+    sequence_reset: bool
+
+
+@runtime_checkable
+class Backend(Protocol):
+    """Operations currently common to the two database implementations.
+
+    Supplied connections remain caller-owned; adapters never close them or
+    add commits/rollbacks. Metadata reads leave source transactions open.
+    copy_rows streams through the existing transfer helper, commits destination
+    batches as before, and never commits the source. run_query commits only
+    when requested. Driver/helper exceptions propagate without translation.
+
+    Scratch setup/cleanup retain backend-specific effects: PostgreSQL clears
+    metadata caches; MySQL creates/drops its source/destination scratch database.
+    Incremental journals and their failure-retention rules remain on the legacy
+    PostgreSQL helper until the run-session extraction in Stage 3.
+    """
+
+    @property
+    def capabilities(self) -> BackendCapabilities: ...
+
+    def schema_manager(
+        self, source: ConnectionFactory, destination: ConnectionFactory
+    ) -> SchemaManager: ...
+    def list_all_tables(self, source: ConnectionFactory) -> list[str]: ...
+    def get_unredacted_fk_relationships(
+        self, tables: list[str], connection: Connection
+    ) -> list[Relationship]: ...
+    def get_table_columns(
+        self, table: str, schema: str | None, connection: Connection
+    ) -> list[str]: ...
+    def get_table_datatypes(
+        self, table: str, schema: str | None, connection: Connection
+    ) -> list[ColumnInfo]: ...
+    def get_table_count_estimate(
+        self, table: str, schema: str | None, connection: Connection
+    ) -> int: ...
+    def copy_rows(
+        self,
+        source: Connection,
+        destination: Connection,
+        query: str,
+        destination_table: str,
+        params: QueryParameters = None,
+        batch_size: int | None = None,
+    ) -> None: ...
+    def run_query(
+        self, query: str, connection: Connection, commit: bool = True
+    ) -> None: ...
+    def update_sequence_numbering(
+        self, connection: Connection, tables: list[str]
+    ) -> None: ...
+    def turn_off_constraints(self, connection: Connection) -> None: ...
+    def prep_temp_dbs(self, source: Connection, destination: Connection) -> None: ...
+    def unprep_temp_dbs(self, source: Connection, destination: Connection) -> None: ...
+    def create_id_temp_table(
+        self, connection: Connection, number_of_columns: int
+    ) -> str: ...

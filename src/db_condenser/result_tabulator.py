@@ -1,12 +1,22 @@
 from db_condenser import database_helper
+from db_condenser.backends.contracts import Backend
 from db_condenser.db_connect import MySqlConnection
 
 
-def tabulate(source_dbc, destination_dbc, tables, total_elapsed=None):
+def tabulate(
+    source_dbc,
+    destination_dbc,
+    tables,
+    total_elapsed=None,
+    *,
+    backend: Backend | None = None,
+):
     row_counts = list()
     source_conn = source_dbc.get_db_connection()
     dest_conn = destination_dbc.get_db_connection()
-    db_helper = database_helper.get_specific_helper()
+    db_helper = (
+        backend if backend is not None else database_helper.get_specific_helper()
+    )
     try:
         for table in tables:
             o = db_helper.get_table_count_estimate(
